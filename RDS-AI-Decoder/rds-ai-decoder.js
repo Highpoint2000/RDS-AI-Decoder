@@ -708,7 +708,7 @@
         const obs=new MutationObserver((_,o)=>{
             if (typeof addIconToPluginPanel!=='function') return;
             found=true; o.disconnect();
-            addIconToPluginPanel('rdsm-btn','RDS Decoder','solid','microchip',
+            addIconToPluginPanel('rdsm-btn','RDS Decoder','solid','radio',
                `${pluginName} v${pluginVersion}`);
             const btnObs=new MutationObserver((_,o2)=>{
                 const btn=document.getElementById('rdsm-btn');
