@@ -1,0 +1,779 @@
+///////////////////////////////////////////////////////////////
+//                                                           //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V1.0)  //
+//                                                           //
+//  by Highpoint                last update: 2026-03-15      //
+//                                                           //
+//  https://github.com/Highpoint2000/RDS-AI-Decoder          //
+//                                                           //
+///////////////////////////////////////////////////////////////
+
+(() => {
+	
+    const pluginVersion         = '1.0';
+    const pluginName            = 'RDS AI Decoder';
+    const pluginHomepageUrl     = 'https://github.com/Highpoint2000/RDS-AI-Decoder/releases';
+    const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
+    const pluginSetupOnlyNotify = false;
+    const CHECK_FOR_UPDATES     = true;
+
+    let isAdmin = false;
+    function checkAdminMode() {
+        const bodyText = document.body.textContent || document.body.innerText;
+        isAdmin = bodyText.includes('You are logged in as an administrator.') ||
+                  bodyText.includes('You are logged in as an adminstrator.');
+    }
+    checkAdminMode();
+
+    if (typeof sendToast !== 'function') {
+        window.sendToast = function(cls, src, txt) {
+            console.log(`[TOAST-Fallback] ${src}: ${cls} → ${txt}`);
+        };
+    }
+
+    function checkUpdate(setupOnly, name, urlUpdateLink, urlFetchLink) {
+        const isSetupPath = (window.location.pathname || '/').indexOf('/setup') >= 0;
+        fetch(urlFetchLink + '?t=' + Date.now(), { cache: 'no-store' })
+            .then(r => r.ok ? r.text() : null)
+            .then(txt => {
+                if (!txt) return;
+                const match = txt.match(/const\s+pluginVersion\s*=\s*['"]([^'"]+)['"]/);
+                if (!match) return;
+                const remoteVer = match[1];
+                if (remoteVer === pluginVersion) return;
+                if (!setupOnly || isSetupPath) {
+                    const settings = document.getElementById('plugin-settings');
+                    if (settings && !settings.innerHTML.includes(urlUpdateLink))
+                        settings.innerHTML += `<br><a href="${urlUpdateLink}" target="_blank">[${name}] Update: ${pluginVersion} -> ${remoteVer}</a>`;
+                    const navIcon =
+                        document.querySelector('.wrapper-outer #navigation .sidenav-content .fa-puzzle-piece') ||
+                        document.querySelector('.wrapper-outer .sidenav-content') ||
+                        document.querySelector('.sidenav-content');
+                    const dotClass = name.replace(/\s+/g, '-') + '-update-dot';
+                    if (navIcon && !navIcon.querySelector('.' + dotClass)) {
+                        const dot = document.createElement('span');
+                        dot.className = dotClass;
+                        dot.style.cssText = 'display:block;width:12px;height:12px;border-radius:50%;background-color:#FE0830;margin-left:82px;margin-top:-12px;';
+                        navIcon.appendChild(dot);
+                    }
+                }
+            })
+            .catch(e => console.warn(`[${name}] Update check failed:`, e));
+    }
+    if (CHECK_FOR_UPDATES) checkUpdate(pluginSetupOnlyNotify, pluginName, pluginHomepageUrl, pluginUpdateUrl);
+
+    const CU = new URL(window.location.href);
+    const WP = CU.protocol === 'https:' ? 'wss:' : 'ws:';
+    const WS = `${WP}//${CU.hostname}:${CU.port||(CU.protocol==='https:'?'443':'80')}/data_plugins`;
+
+    const PTY = ['None','News','Current Affairs','Information','Sport','Education','Drama','Culture','Science','Varied','Pop Music','Rock Music','Easy Listening','Light Classical','Serious Classical','Other Music','Weather','Finance',"Children's Programmes",'Social Affairs','Religion','Phone-In','Travel','Leisure','Jazz Music','Country Music','National Music','Oldies Music','Folk Music','Documentary','Alarm Test','Alarm'];
+
+    const RDS_CHARSET = [
+        ' ','!','"','#','¤','%','&',"'",
+        '(',')','+','+',',','-','.','/',
+        '0','1','2','3','4','5','6','7',
+        '8','9',':',';','<','=','>','?',
+        '@','A','B','C','D','E','F','G',
+        'H','I','J','K','L','M','N','O',
+        'P','Q','R','S','T','U','V','W',
+        'X','Y','Z','[','\\',']','―','_',
+        '‖','a','b','c','d','e','f','g',
+        'h','i','j','k','l','m','n','o',
+        'p','q','r','s','t','u','v','w',
+        'x','y','z','{','|','}','¯',' ',
+        'á','à','é','è','í','ì','ó','ò',
+        'ú','ù','Ñ','Ç','Ş','β','¡','Ĳ',
+        'â','ä','ê','ë','î','ï','ô','ö',
+        'û','ü','ñ','ç','ş','ǧ','ı','ĳ',
+        'ª','α','©','‰','Ǧ','ě','ň','ő',
+        'π','€','£','$','←','↑','→','↓',
+        'º','¹','²','³','±','İ','ń','ű',
+        'µ','¿','÷','°','¼','½','¾','§',
+        'Á','À','É','È','Í','Ì','Ó','Ò',
+        'Ú','Ù','Ř','Č','Š','Ž','Ð','Ŀ',
+        'Â','Ä','Ê','Ë','Î','Ï','Ô','Ö',
+        'Û','Ü','ř','č','š','ž','đ','ŀ',
+        'Ã','Å','Æ','Œ','ŷ','Ý','Õ','Ø',
+        'Þ','Ŋ','Ŕ','Ć','Ś','Ź','Ŧ','ð',
+        'ã','å','æ','œ','ŵ','ý','õ','ø',
+        'þ','ŋ','ŕ','ć','ś','ź','ŧ',' ',
+    ];
+    function rCh(b) {
+        if (b === 0x0D) return '\r';
+        if (b < 0x20)   return ' ';
+        return RDS_CHARSET[b - 0x20] || ' ';
+    }
+
+    const CONF = [1.00, 0.90, 0.70, 0.00];
+
+    const mkPS = () => Array.from({length:8}, ()=>({char:' ',conf:0,src:'empty',rawOk:0,rawChar:null}));
+    const mkRT = n   => Array.from({length:n}, ()=>({char:' ',conf:0,src:'empty'}));
+
+    let psSlots = mkPS();
+    let rtSlots = [mkRT(64), mkRT(64)];
+    let rtAB    = -1;
+
+    function fusePS_raw(pos, char, conf, src, errLevel) {
+        const cur = psSlots[pos];
+        if (errLevel <= 1 && char === cur.rawChar) { cur.rawOk = Math.min(cur.rawOk + 1, 4); }
+        else { cur.rawOk = (errLevel <= 1) ? 1 : 0; cur.rawChar = char; }
+        const isVerified = cur.rawOk >= 2;
+        const isEmpty    = cur.src === 'empty';
+        const isBigram   = cur.src === 'ai-bigram';
+        const isAI       = cur.src.startsWith('ai');
+        const isWeakRaw  = cur.src.startsWith('raw') && cur.conf < 0.75;
+        if (isEmpty || isBigram) { psSlots[pos] = {char,conf,src,rawOk:cur.rawOk,rawChar:cur.rawChar}; return; }
+        if (isAI) {
+            if (isVerified) psSlots[pos] = {char,conf,src,rawOk:cur.rawOk,rawChar:cur.rawChar};
+            else cur.rawChar = char;
+            return;
+        }
+        if (isWeakRaw || conf >= cur.conf - 0.05)
+            psSlots[pos] = {char,conf,src,rawOk:cur.rawOk,rawChar:cur.rawChar};
+    }
+    function fusePS_ai(pos, char, conf, src) {
+        const cur = psSlots[pos];
+        if (cur.rawOk >= 2 && cur.src.startsWith('raw')) return;
+        if (cur.src === 'empty' || cur.src === 'ai-bigram' || (cur.src.startsWith('ai') && conf > cur.conf))
+            psSlots[pos] = {char,conf,src,rawOk:cur.rawOk,rawChar:cur.rawChar};
+    }
+    function fuseRT(ab, i, char, conf, src) {
+        if (i < 0 || i >= rtSlots[ab].length) return;
+        const cur     = rtSlots[ab][i];
+        const rawWins = src.startsWith('raw') && cur.src.startsWith('ai') && conf >= cur.conf - 0.05;
+        if (conf > cur.conf || cur.src === 'empty' || rawWins) rtSlots[ab][i] = {char,conf,src};
+    }
+
+    let _ptyCandidate = -1, _ptyCandCount = 0;
+    let _taCandidate  = null, _taCandCount = 0;
+
+    function stableFlag_PTY(pty, a, b) {
+        if (!a||!b) return;
+        if (pty === _ptyCandidate) {
+            _ptyCandCount++;
+            if (_ptyCandCount >= 2 && pty !== st.pty) {
+                st.pty = pty;
+                const el = document.getElementById('rdsm-pty');
+                if (el) el.innerHTML = `${PTY[pty]||'?'} <span class="pty-badge">${pty}</span>`;
+            }
+        } else { _ptyCandidate = pty; _ptyCandCount = 1; }
+    }
+    function stableFlag_TP(tp, a, b)  { if (!a||!b) return; if (tp!==st.tp)    { st.tp=tp;    setFlag('rdsm-tp',tp); } }
+    function stableFlag_TA(ta, a, b)  {
+        if (!a||!b) return;
+        if (ta === _taCandidate) {
+            _taCandCount++;
+            if (_taCandCount >= 2 && ta !== st.ta) { st.ta=ta; setFlag('rdsm-ta',ta); }
+        } else { _taCandidate=ta; _taCandCount=1; }
+    }
+    function stableFlag_Stereo(s, a)  { if (!a) return; if (s!==st.stereo) { st.stereo=s; setFlag('rdsm-st',s); } }
+    function stableFlag_MS(ms, a, b)  {
+        if (!a||!b) return;
+        if (ms !== st.ms) {
+            st.ms = ms;
+            const el = document.getElementById('rdsm-ms');
+            if (el) { el.textContent = ms?'MUSIC':'SPEECH'; el.className='rf on'; }
+        }
+    }
+
+    let st = {
+        pi:'----', piCand:'----', piN:0,
+        psBuf:new Array(8).fill(' '), psGroups:new Set(),
+        pty:-1, tp:false, ta:false, ms:false, stereo:false,
+        rtabFlag:-1, ecc:'',
+        grpTotal:0, ber:[],
+        freq:'—',
+        aiStats:null, aiActive:false,
+        _freqChangeTs:0,
+        rtLine1:'', rtLine2:'',
+        rdsFollow:false,
+    };
+
+    let ws = null, reconn = null;
+    let panelVis = false, statsOpen = false;
+
+    function onMessage(data) {
+        let d; try { d = JSON.parse(data); } catch(e) { return; }
+        switch (d.type) {
+            case 'rdsm_raw':              onRaw(d);            break;
+            case 'rdsm_ai':               onAI(d);             break;
+            case 'rdsm_freq':             onFreq(d);           break;
+            case 'rdsm_rds_follow_state': onRdsFollowState(d); break;
+        }
+    }
+
+    function onRdsFollowState(d) { st.rdsFollow = !!d.enabled; syncFollowUI(); }
+
+    function onFreq(d) {
+        st._freqChangeTs = Date.now();
+        reset();
+        st.freq = d.freq || '—';
+        setEl('rdsm-freq', st.freq !== '—' ? st.freq + ' MHz' : '—');
+    }
+
+    function onRaw(d) {
+        if (d.freq && d.freq !== st.freq) { st.freq=d.freq; setEl('rdsm-freq', d.freq+' MHz'); }
+        if (d.pi) {
+            const pi = d.pi.toUpperCase();
+            if (pi === st.piCand) {
+                st.piN++;
+                if (st.piN >= 2 && pi !== st.pi) { st.pi=pi; setEl('rdsm-pi',pi); }
+            } else { st.piCand=pi; st.piN=1; }
+        }
+        if (!d.b2) { updateBER(d.errB); return; }
+        const g2=parseInt(d.b2,16), g3=d.b3?parseInt(d.b3,16):NaN, g4=d.b4?parseInt(d.b4,16):NaN;
+        const gT=(g2>>12)&0xF, vB=(g2>>11)&1, tp=!!((g2>>10)&1), pty=(g2>>5)&0x1F;
+        const c3=CONF[d.errB[2]], c4=CONF[d.errB[3]];
+        const s3=`raw-${Math.min(d.errB[2],2)}`, s4=`raw-${Math.min(d.errB[3],2)}`;
+        const blkAok=d.errB[0]<=1, blkBok=d.errB[1]<=1;
+        const gc=document.getElementById(`rg-${gT}${vB?'B':'A'}`);
+        if (gc) gc.classList.add('on');
+        st.grpTotal++;
+        stableFlag_TP(tp,blkAok,blkBok);
+        stableFlag_PTY(pty,blkAok,blkBok);
+        if (gT===0) {
+            const ta=!!((g2>>4)&1), ms=!!((g2>>3)&1), seg=g2&3, di=!!((g2>>2)&1);
+            if (seg===3) stableFlag_Stereo(di,blkAok);
+            stableFlag_TA(ta,blkAok,blkBok);
+            stableFlag_MS(ms,blkAok,blkBok);
+            if (d.b4 && c4>0) {
+                const addr=seg*2, c0=rCh((g4>>8)&0xFF), c1=rCh(g4&0xFF);
+                if (c0>=' ') { fusePS_raw(addr,  c0,c4,s4,d.errB[3]); st.psBuf[addr]  =c0; st.psGroups.add(seg); }
+                if (c1>=' ') { fusePS_raw(addr+1,c1,c4,s4,d.errB[3]); st.psBuf[addr+1]=c1; }
+            }
+        }
+        if (gT===2 && vB===0) {
+            const abF=(g2>>4)&1, addr=(g2&0xF)*4;
+            if (abF!==st.rtabFlag) { const o=extractRTText(st.rtabFlag>=0?st.rtabFlag:0); if(o.trim().length>=4)promoteRT(o); st.rtabFlag=abF; rtAB=abF; rtSlots[abF]=mkRT(64); }
+            if (d.b3&&c3>0) { fuseRT(abF,addr,  rCh((g3>>8)&0xFF),c3,s3); fuseRT(abF,addr+1,rCh(g3&0xFF),c3,s3); }
+            if (d.b4&&c4>0) { fuseRT(abF,addr+2,rCh((g4>>8)&0xFF),c4,s4); fuseRT(abF,addr+3,rCh(g4&0xFF),c4,s4); }
+        }
+        if (gT===2 && vB===1) {
+            const abF=(g2>>4)&1, addr=(g2&0xF)*2;
+            if (abF!==st.rtabFlag) { const o=extractRTText(st.rtabFlag>=0?st.rtabFlag:0); if(o.trim().length>=4)promoteRT(o); st.rtabFlag=abF; rtAB=abF; rtSlots[abF]=mkRT(64); }
+            if (d.b4&&c4>0) { fuseRT(abF,addr,  rCh((g4>>8)&0xFF),c4,s4); fuseRT(abF,addr+1,rCh(g4&0xFF),c4,s4); }
+        }
+        if (gT===1 && vB===0 && d.b3 && d.errB[2]<=1 && ((g2>>1)&7)===0) {
+            const eccVal=(g3&0xFF).toString(16).toUpperCase().padStart(2,'0');
+            if (eccVal!==st.ecc) {
+                st.ecc=eccVal;
+                const el=document.getElementById('rdsm-ecc-flag');
+                if (el) { el.textContent='ECC '+eccVal; el.className='rf on'; el.title='Extended Country Code: 0x'+eccVal; }
+            }
+        }
+        updateBER(d.errB);
+        renderAll();
+    }
+
+    function onAI(d) {
+        if (d.ts && d.ts < st._freqChangeTs) return;
+        st.aiActive=true; st.aiStats=d.stats;
+        if (d.ps && Array.isArray(d.ps))
+            for (let i=0;i<Math.min(d.ps.length,8);i++) {
+                const p=d.ps[i];
+                if (!p||!p.char||p.char===' ') continue;
+                fusePS_ai(i,p.char,p.conf||0,p.src||'ai-voted-mid');
+            }
+        if (d.rt?.text) {
+            const ab=rtAB>=0?rtAB:0, sc=Math.min(d.rt.score||0.5,0.85);
+            for (let i=0;i<Math.min(d.rt.text.length,64);i++) {
+                const c=d.rt.text[i]; if(!c||c==='\r') break;
+                if (rtSlots[ab][i].conf<sc) fuseRT(ab,i,c,sc,'ai-rt-match');
+            }
+            if (!st.rtLine1 && d.rt.src==='ai-rt-last') st.rtLine1=d.rt.text;
+        }
+        if (d.pi && d.pi!==st.pi && d.pi!=='----') { st.pi=d.pi; setEl('rdsm-pi',d.pi); }
+        refreshStatsPanel();
+        renderAll();
+    }
+
+    function extractRTText(ab) {
+        let t='';
+        for (let i=0;i<64;i++) {
+            const sl=rtSlots[ab]?.[i];
+            if (!sl||sl.char==='\r') break;
+            if (sl.conf>0) t+=sl.char; else if (t.length>0) break;
+        }
+        return t.trimEnd();
+    }
+    function promoteRT(text) { if (text?.trim().length>=4) st.rtLine1=text; }
+
+    function renderAll() { renderPS(); renderRT(); refreshStats(); }
+
+    // ── Confidence → colour ──────────────────────────────────
+    // Reworked scale: minimum visible grey raised from 42 to 80
+    // so low-confidence characters are clearly darker/dimmer,
+    // and full-confidence (conf=1.0) still reaches near-white
+    // (rgb(240,240,240)).  The gap between "uncertain" and
+    // "validated" is now much more visible.
+    //
+    //  conf = 0.00  →  rgb( 20, 20, 20)   almost black
+    //  conf = 0.50  →  rgb(110,110,110)   medium grey
+    //  conf = 0.75  →  rgb(163,163,163)   light grey
+    //  conf = 1.00  →  rgb(240,240,240)   near-white
+    //
+    // ai-bigram (unverified guess) uses a separate very dark
+    // scale so it is never mistaken for a real character.
+    function confToGray(conf, src) {
+        if (src === 'empty') return 'transparent';
+        if (src === 'ai-bigram') {
+            // Very dark: 15–45 – barely visible, clearly a guess
+            const v = Math.round(15 + conf * 30);
+            return `rgb(${v},${v},${v})`;
+        }
+        // Normal: 20–240 – steep curve so low conf looks dark
+        const v = Math.round(20 + conf * 220);
+        return `rgb(${v},${v},${v})`;
+    }
+
+    function renderPS() {
+        for (let i=0;i<8;i++) {
+            const sl=psSlots[i];
+            const chEl=document.getElementById(`rdsm-c${i}`), bEl=document.getElementById(`rdsm-b${i}`);
+            if (!chEl||!bEl) continue;
+            const q=Math.round(sl.conf*100);
+            chEl.textContent=(sl.src==='empty'||sl.char===' ')?'':sl.char;
+            chEl.className='c'; chEl.style.color=confToGray(sl.conf,sl.src);
+            chEl.parentElement.title=`[${i}] "${sl.char}" ${q}% ${sl.src} ok=${sl.rawOk}`;
+            bEl.style.width=sl.src==='empty'?'0%':q+'%';
+            bEl.style.background='var(--color-main-bright,#4a90d9)';
+            bEl.style.opacity=sl.src==='empty'?'0':String(0.15+sl.conf*0.85);
+            bEl.className='cf';
+        }
+    }
+
+    function renderRT() {
+        const ab=rtAB>=0?rtAB:0;
+        const rt1El=document.getElementById('rdsm-rt1'), rt2El=document.getElementById('rdsm-rt2');
+        if (!rt1El||!rt2El) return;
+        let end=64;
+        for (let i=0;i<64;i++) if (rtSlots[ab][i].conf>0&&rtSlots[ab][i].char==='\r'){end=i;break;}
+        while (end>0&&rtSlots[ab][end-1].conf===0) end--;
+        let html2='';
+        if (end>0) {
+            for (let i=0;i<end;i++) {
+                const sl=rtSlots[ab][i], c=sl.char||' ';
+                const esc=c==='<'?'&lt;':c==='>'?'&gt;':c==='&'?'&amp;':c;
+                html2+=`<span style="color:${confToGray(sl.conf,sl.src)}" title="${Math.round(sl.conf*100)}%">${esc}</span>`;
+            }
+            st.rtLine2=extractRTText(ab);
+        } else html2='<span style="color:#333">—</span>';
+        rt2El.innerHTML=html2;
+        rt1El.innerHTML=st.rtLine1
+            ?`<span style="color:#909090">${st.rtLine1.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>`
+            :'<span style="color:#333">—</span>';
+    }
+
+    function updateBER(errB) {
+        const hasLost=errB&&errB.some(e=>e===3);
+        st.ber.push(hasLost?1:0);
+        if (st.ber.length>60) st.ber.shift();
+        const errs=st.ber.filter(v=>v).length;
+        const q=st.ber.length?Math.round((1-errs/st.ber.length)*100):100;
+        const bar=document.getElementById('rdsm-bf'), pct=document.getElementById('rdsm-bp');
+        if (bar) { bar.style.width=q+'%'; bar.style.background=q>80?'#44cc88':q>50?'#ffaa44':'#ff5555'; }
+        if (pct) pct.textContent=q+'%';
+    }
+    function refreshStats() { setEl('rdsm-gc',`Groups: ${st.grpTotal}`); }
+    function refreshStatsPanel() {
+        if (!statsOpen) return;
+        setEl('ai-cur-pi',st.pi);
+        setEl('ai-active',st.aiActive?'✅ active':'⏳ waiting...');
+        if (st.aiStats) {
+            setEl('ai-seen',   st.aiStats.seenCount?.toLocaleString()||'—');
+            setEl('ai-votes',  st.aiStats.psVoteTotal?.toLocaleString()||'—');
+            setEl('ai-freq',   st.aiStats.freq||'—');
+            setEl('ai-dynamic',st.aiStats.psIsDynamic?'⚡ dynamic':'🔒 static');
+        }
+        const rawN =psSlots.filter(s=>s.src.startsWith('raw')).length;
+        const dbN  =psSlots.filter(s=>s.src==='ai-cached-db').length;
+        const hvote=psSlots.filter(s=>s.src==='ai-voted-high').length;
+        const mvote=psSlots.filter(s=>s.src==='ai-voted-mid').length;
+        const lvote=psSlots.filter(s=>s.src==='ai-voted-low').length;
+        const bigN =psSlots.filter(s=>s.src==='ai-bigram').length;
+        const vN   =psSlots.filter(s=>s.rawOk>=2).length;
+        setEl('ai-ps-breakdown',`raw:${rawN}  DB:${dbN}  ↑:${hvote}  ~:${mvote}  ↓:${lvote}  bigram:${bigN}  ✅:${vN}`);
+    }
+
+    function syncFollowUI() {
+        const panelBtn = document.getElementById('rdsm-follow-btn');
+        if (panelBtn) {
+            panelBtn.classList.toggle('on', st.rdsFollow);
+            panelBtn.title = !isAdmin
+                ? 'Administrator login required to toggle RDS Follow'
+                : st.rdsFollow
+                    ? 'RDS Follow active – AI feeds the web server'
+                    : 'RDS Follow inactive – native decoder active';
+            panelBtn.style.opacity = isAdmin ? '' : '0.5';
+            panelBtn.style.cursor  = isAdmin ? 'pointer' : 'not-allowed';
+        }
+        const navBtn = document.getElementById('rdsm-btn');
+        if (navBtn) {
+            const icon = navBtn.querySelector('i');
+            if (icon) icon.style.color = st.rdsFollow ? '#44ff88' : '';
+        }
+    }
+
+    function toggleRdsFollow() {
+        checkAdminMode();
+        if (!isAdmin) {
+            sendToast('warning', pluginName, 'Administrator login required to toggle RDS Follow.');
+            return;
+        }
+        const next = !st.rdsFollow;
+        if (ws && ws.readyState === WebSocket.OPEN)
+            ws.send(JSON.stringify({ type:'rdsm_set_rds_follow', enabled:next }));
+        st.rdsFollow = next;
+        syncFollowUI();
+    }
+
+    function reset() {
+        st.pi='----'; st.piCand='----'; st.piN=0;
+        st.psBuf.fill(' '); st.psGroups.clear();
+        st.pty=-1; st.tp=false; st.ta=false; st.ms=false; st.stereo=false;
+        st.rtabFlag=-1; st.ecc=''; st.grpTotal=0; st.ber=[];
+        st.aiStats=null; st.aiActive=false; st.rtLine1=''; st.rtLine2='';
+        _ptyCandidate=-1; _ptyCandCount=0; _taCandidate=null; _taCandCount=0;
+        psSlots=mkPS(); rtSlots=[mkRT(64),mkRT(64)]; rtAB=-1;
+        setEl('rdsm-pi','----');
+        for (let i=0;i<8;i++) {
+            const ch=document.getElementById(`rdsm-c${i}`), b=document.getElementById(`rdsm-b${i}`);
+            if (ch){ch.textContent='';ch.style.color='transparent';}
+            if (b) {b.style.width='0%';b.style.background='transparent';b.style.opacity='0';}
+        }
+        const rt1=document.getElementById('rdsm-rt1'), rt2=document.getElementById('rdsm-rt2');
+        if (rt1) rt1.innerHTML='<span style="color:#333">—</span>';
+        if (rt2) rt2.innerHTML='<span style="color:#333">—</span>';
+        const ptyEl=document.getElementById('rdsm-pty');
+        if (ptyEl){ptyEl.textContent='—';ptyEl.title='';}
+        const eccEl=document.getElementById('rdsm-ecc-flag');
+        if (eccEl){eccEl.textContent='ECC';eccEl.className='rf';eccEl.title='';}
+        GA.forEach(g=>{const el=document.getElementById(`rg-${g}`);if(el)el.classList.remove('on');});
+        setFlag('rdsm-tp',false); setFlag('rdsm-ta',false);
+        const ms=document.getElementById('rdsm-ms');
+        if (ms){ms.textContent='MUSIC';ms.className='rf';}
+        setFlag('rdsm-st',false);
+        setEl('rdsm-gc','Groups: 0');
+        const bar=document.getElementById('rdsm-bf'), pct=document.getElementById('rdsm-bp');
+        if (bar){bar.style.width='100%';bar.style.background='#44cc88';}
+        if (pct) pct.textContent='—';
+    }
+
+    function injectCSS() {
+        if (document.getElementById('rdsm-css')) return;
+        const s = document.createElement('style');
+        s.id = 'rdsm-css';
+        s.textContent = `
+        #rdsm-panel{position:fixed;top:70px;right:20px;width:390px;
+            background:var(--color-bg-1,#13151f);
+            border:1px solid var(--color-main-bright,#4a90d9);
+            border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6);
+            z-index:9999;font-family:"Titillium Web",Calibri,sans-serif;
+            color:#e0e0e0;overflow:hidden;display:none;user-select:none;}
+        #rdsm-panel.vis{display:block;}
+        #rdsm-hdr{display:flex;align-items:center;justify-content:space-between;
+            padding:10px 14px 8px;background:var(--color-main-bright,#4a90d9);cursor:move;}
+        .rdsm-ht{font-size:13px;font-weight:700;color:#fff;text-transform:uppercase;
+            letter-spacing:1px;font-family:"Titillium Web",Calibri,sans-serif;}
+        #rdsm-dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+            background:#ff4444;transition:background .4s;vertical-align:middle;margin-right:6px;}
+        #rdsm-dot.ok{background:#44ff88;}
+        #rdsm-close{background:none;border:none;color:#fff;font-size:18px;cursor:pointer;
+            opacity:.8;font-family:"Titillium Web",Calibri,sans-serif;}
+        #rdsm-close:hover{opacity:1;}
+        #rdsm-body{padding:11px 14px;}
+        .rr{display:flex;align-items:center;margin-bottom:8px;gap:8px;}
+        .rl{font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;
+            color:var(--color-main-bright,#4a90d9);min-width:62px;opacity:.85;
+            font-family:"Titillium Web",Calibri,sans-serif;}
+        .rv{font-size:14px;font-weight:600;flex:1;color:#f0f0f0;
+            overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+            font-family:"Titillium Web",Calibri,sans-serif;}
+        #rdsm-ps{display:flex;gap:2px;flex:1;}
+        .rpc{display:flex;flex-direction:column;align-items:center;width:20px;}
+        .rpc .c{font-size:24px;font-weight:700;font-family:"Titillium Web",Calibri,sans-serif;
+            line-height:1.2;transition:color .25s;min-height:1.2em;}
+        .rpc .cb{height:3px;width:100%;background:#1a1a1a;border-radius:2px;overflow:hidden;margin-top:2px;}
+        .rpc .cf{height:100%;border-radius:2px;transition:width .3s,background .3s,opacity .3s;}
+        #rdsm-rt-wrap{flex:1;min-width:0;}
+        .rt-line-label{font-size:9px;color:#3a4a5a;font-family:"Titillium Web",Calibri,sans-serif;
+            display:block;margin-bottom:1px;line-height:1;}
+        .rt-line{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;
+            text-overflow:ellipsis;line-height:1.55;font-family:"Titillium Web",Calibri,sans-serif;
+            display:block;min-height:1.55em;}
+        .rt-line + .rt-line-label{margin-top:5px;}
+        .rfl{display:flex;gap:5px;flex-wrap:wrap;}
+        .rf{font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px;
+            background:#1c1c1c;color:#444;letter-spacing:.5px;
+            font-family:"Titillium Web",Calibri,sans-serif;transition:background .25s,color .25s;}
+        .rf.on{background:var(--color-main-bright,#4a90d9);color:#fff;}
+        .pty-badge{font-size:10px;background:var(--color-main-bright,#4a90d9);
+            color:#fff;padding:1px 6px;border-radius:4px;margin-left:4px;
+            font-family:"Titillium Web",Calibri,sans-serif;}
+        #rdsm-gg{display:flex;flex-wrap:wrap;gap:3px;flex:1;}
+        .rgc{font-size:9px;font-weight:700;padding:1px 4px;border-radius:3px;
+            background:#1c1c1c;color:#444;font-family:"Titillium Web",Calibri,sans-serif;
+            min-width:24px;text-align:center;transition:background .3s,color .3s;}
+        .rgc.on{background:var(--color-main-bright,#4a90d9);color:#fff;}
+        #rdsm-stats{
+            display:grid;grid-template-columns:96px auto auto;
+            justify-content:space-between;align-items:center;
+            padding:5px 14px 7px;border-top:1px solid rgba(255,255,255,.06);
+            font-family:"Titillium Web",Calibri,sans-serif;
+            font-size:10px;color:#666;box-sizing:border-box;width:100%;}
+        #rdsm-gc{font-variant-numeric:tabular-nums;white-space:nowrap;}
+        #rdsm-follow-wrap{display:flex;justify-content:center;align-items:center;}
+        #rdsm-follow-btn{
+            display:inline-flex;align-items:center;gap:4px;
+            font-size:9px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+            font-family:"Titillium Web",Calibri,sans-serif;
+            color:#555;background:#181a24;border:1px solid #2a2d3a;border-radius:5px;
+            padding:2px 8px 2px 6px;white-space:nowrap;cursor:pointer;
+            transition:color .2s,border-color .2s,background .2s,opacity .2s;user-select:none;}
+        #rdsm-follow-btn:hover{color:#8ab4d8;border-color:#4a90d9;}
+        #rdsm-follow-btn.on{color:#44ff88;border-color:#44ff88;background:#0d1a12;}
+        #rdsm-follow-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0;}
+        #rdsm-ber-wrap{display:flex;align-items:center;justify-content:flex-end;
+            white-space:nowrap;font-variant-numeric:tabular-nums;}
+        #rdsm-bw{width:50px;height:4px;background:#2a2a2a;border-radius:2px;
+            overflow:hidden;display:inline-block;vertical-align:middle;flex-shrink:0;margin:0 4px;}
+        #rdsm-bf{height:100%;border-radius:2px;background:#44cc88;transition:width .5s,background .5s;}
+        #rdsm-bp{display:inline-block;min-width:3.2ch;text-align:right;}
+        #rdsm-btn:hover{color:var(--color-5);filter:brightness(120%);}
+        #rdsm-btn.active{background-color:var(--color-2)!important;filter:brightness(120%);}
+        #rdsm-stats-hdr{border-top:1px solid rgba(255,255,255,.08);background:#0d0f18;
+            padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:6px;
+            user-select:none;transition:background .2s;}
+        #rdsm-stats-hdr:hover{background:#111420;}
+        #rdsm-stats-arrow{font-size:9px;color:var(--color-main-bright,#4a90d9);
+            transition:transform .2s;display:inline-block;
+            font-family:"Titillium Web",Calibri,sans-serif;}
+        #rdsm-stats-hdr.open #rdsm-stats-arrow{transform:rotate(90deg);}
+        .stats-title{font-size:10px;font-weight:700;color:var(--color-main-bright,#4a90d9);
+            text-transform:uppercase;letter-spacing:1px;
+            font-family:"Titillium Web",Calibri,sans-serif;}
+        #rdsm-stats-pan{background:#0d0f18;padding:0 14px;max-height:0;overflow:hidden;
+            transition:max-height .25s ease,padding .25s ease;
+            font-family:"Titillium Web",Calibri,sans-serif;}
+        #rdsm-stats-pan.open{max-height:400px;padding:4px 14px 12px;}
+        .ai-stats-r{display:flex;justify-content:space-between;font-size:11px;color:#888;
+            margin-bottom:5px;font-family:"Titillium Web",Calibri,sans-serif;}
+        .ai-stats-r span{color:#ccc;font-weight:600;font-family:"Titillium Web",Calibri,sans-serif;}
+        .ai-stats-leg{font-size:9px;color:#555;margin-top:8px;line-height:2;
+            font-family:"Titillium Web",Calibri,sans-serif;}
+        .rdiv{border:none;border-top:1px solid rgba(255,255,255,.07);margin:7px 0;}
+        #rdsm-panel.drag{opacity:.85;cursor:move;}
+        `;
+        document.head.appendChild(s);
+    }
+
+    const GA = [];
+    for (let i=0;i<=15;i++) GA.push(`${i}A`,`${i}B`);
+
+    function createPanel() {
+        if (document.getElementById('rdsm-panel')) return;
+        const d = document.createElement('div');
+        d.id = 'rdsm-panel';
+        d.innerHTML = `
+          <div id="rdsm-hdr">
+            <span class="rdsm-ht">${pluginName}</span>
+            <span style="display:flex;align-items:center;gap:5px">
+              <span id="rdsm-dot" title="/data_plugins"></span>
+              <button id="rdsm-close">✕</button>
+            </span>
+          </div>
+          <div id="rdsm-body">
+            <div class="rr">
+              <span class="rl">Freq</span>
+              <span class="rv" id="rdsm-freq">—</span>
+            </div>
+            <div class="rr">
+              <span class="rl">PI Code</span>
+              <span class="rv" id="rdsm-pi">----</span>
+            </div>
+            <hr class="rdiv">
+            <div class="rr" style="align-items:flex-start">
+              <span class="rl" style="margin-top:3px">PS</span>
+              <div id="rdsm-ps">
+                ${[0,1,2,3,4,5,6,7].map(i=>`
+                  <div class="rpc">
+                    <span class="c" id="rdsm-c${i}" style="color:transparent"></span>
+                    <div class="cb"><div class="cf" id="rdsm-b${i}"
+                      style="width:0%;opacity:0;background:var(--color-main-bright,#4a90d9)">
+                    </div></div>
+                  </div>`).join('')}
+              </div>
+            </div>
+            <hr class="rdiv">
+            <div class="rr">
+              <span class="rl">PTY</span>
+              <span class="rv" id="rdsm-pty">—</span>
+            </div>
+            <hr class="rdiv">
+            <div class="rr" style="align-items:flex-start">
+              <span class="rl" style="margin-top:1px">RT</span>
+              <div id="rdsm-rt-wrap">
+                <span class="rt-line-label">previous RT</span>
+                <span class="rt-line" id="rdsm-rt1"><span style="color:#333">—</span></span>
+                <span class="rt-line-label">current</span>
+                <span class="rt-line" id="rdsm-rt2"><span style="color:#333">—</span></span>
+              </div>
+            </div>
+            <hr class="rdiv">
+            <div class="rr">
+              <span class="rl">Flags</span>
+              <div class="rfl">
+                <span class="rf" id="rdsm-tp">TP</span>
+                <span class="rf" id="rdsm-ta">TA</span>
+                <span class="rf" id="rdsm-ms">MUSIC</span>
+                <span class="rf" id="rdsm-st">STEREO</span>
+                <span class="rf" id="rdsm-ecc-flag" title="">ECC</span>
+              </div>
+            </div>
+            <hr class="rdiv">
+            <div class="rr" style="align-items:flex-start">
+              <span class="rl" style="margin-top:2px">Groups</span>
+              <div id="rdsm-gg">
+                ${GA.map(g=>`<span class="rgc" id="rg-${g}">${g}</span>`).join('')}
+              </div>
+            </div>
+          </div>
+          <div id="rdsm-stats">
+            <span id="rdsm-gc">Groups: 0</span>
+            <span id="rdsm-follow-wrap">
+              <button id="rdsm-follow-btn" title="RDS Follow inactive">
+                <span id="rdsm-follow-dot"></span>RDS Follow
+              </button>
+            </span>
+            <span id="rdsm-ber-wrap">BER
+              <span id="rdsm-bw"><div id="rdsm-bf" style="width:100%"></div></span>
+              <span id="rdsm-bp">—</span>
+            </span>
+          </div>
+          <div id="rdsm-stats-hdr">
+            <span id="rdsm-stats-arrow">▶</span>
+            <span class="stats-title">Statistics</span>
+          </div>
+          <div id="rdsm-stats-pan">
+            <div class="ai-stats-r">AI connection: <span id="ai-active">⏳</span></div>
+            <div class="ai-stats-r">Current PI: <span id="ai-cur-pi">—</span></div>
+            <div class="ai-stats-r">PS type: <span id="ai-dynamic">—</span></div>
+            <div class="ai-stats-r">Groups received: <span id="ai-seen">—</span></div>
+            <div class="ai-stats-r">PS votes total: <span id="ai-votes">—</span></div>
+            <div class="ai-stats-r">Last seen on: <span id="ai-freq">—</span></div>
+            <div class="ai-stats-r" style="flex-direction:column;gap:3px">
+              PS slots:<br>
+              <span id="ai-ps-breakdown"
+                style="color:#888;font-size:10px;font-family:'Titillium Web',Calibri,sans-serif;"></span>
+            </div>
+            <div class="ai-stats-leg">
+              bright = high confidence · dark = low<br>
+              ✅ = raw-verified (2× err≤1, same char)
+            </div>
+          </div>
+        `;
+        document.body.appendChild(d);
+        document.getElementById('rdsm-close').addEventListener('click', hidePanel);
+        document.getElementById('rdsm-follow-btn').addEventListener('click', toggleRdsFollow);
+        document.getElementById('rdsm-stats-hdr').addEventListener('click', () => {
+            statsOpen = !statsOpen;
+            document.getElementById('rdsm-stats-hdr').classList.toggle('open', statsOpen);
+            document.getElementById('rdsm-stats-pan').classList.toggle('open', statsOpen);
+            if (statsOpen) refreshStatsPanel();
+        });
+        makeDrag(d, document.getElementById('rdsm-hdr'));
+    }
+
+    function makeDrag(el,h) {
+        let sx,sy,sl,st2,dr=false;
+        h.addEventListener('mousedown',e=>{
+            if (e.target.id==='rdsm-close') return;
+            dr=true;el.classList.add('drag');sx=e.clientX;sy=e.clientY;
+            const r=el.getBoundingClientRect();sl=r.left;st2=r.top;e.preventDefault();
+        });
+        document.addEventListener('mousemove',e=>{
+            if (!dr) return;
+            el.style.left=Math.max(0,sl+e.clientX-sx)+'px';
+            el.style.top =Math.max(0,st2+e.clientY-sy)+'px';
+            el.style.right='auto';
+        });
+        document.addEventListener('mouseup',()=>{dr=false;el.classList.remove('drag');});
+    }
+
+    function addBtn() {
+        let found=false;
+        const obs=new MutationObserver((_,o)=>{
+            if (typeof addIconToPluginPanel!=='function') return;
+            found=true; o.disconnect();
+            addIconToPluginPanel('rdsm-btn','RDS Decoder','solid','microchip',
+               `${pluginName} v${pluginVersion}`);
+            const btnObs=new MutationObserver((_,o2)=>{
+                const btn=document.getElementById('rdsm-btn');
+                if (!btn) return;
+                o2.disconnect();
+                btn.classList.add('hide-phone','bg-color-2');
+                btn.addEventListener('click',()=>{
+                    if (!panelVis) {
+                        panelVis=true; btn.classList.add('active');
+                        $('#rdsm-panel').stop(true,true).fadeIn(400,()=>{
+                            document.getElementById('rdsm-panel').classList.add('vis');
+                        });
+                    } else { hidePanel(); }
+                });
+                syncFollowUI();
+            });
+            btnObs.observe(document.body,{childList:true,subtree:true});
+        });
+        obs.observe(document.body,{childList:true,subtree:true});
+        setTimeout(()=>{if(!found)obs.disconnect();},10000);
+    }
+
+    function hidePanel() {
+        panelVis=false;
+        const btn=document.getElementById('rdsm-btn');
+        if (btn) btn.classList.remove('active');
+        $('#rdsm-panel').stop(true,true).fadeOut(400,()=>{
+            const p=document.getElementById('rdsm-panel');
+            if (p){p.classList.remove('vis');p.style.display='none';}
+        });
+        syncFollowUI();
+    }
+
+    function connect() {
+        if (ws&&(ws.readyState===WebSocket.OPEN||ws.readyState===WebSocket.CONNECTING)) return;
+        if (reconn){clearTimeout(reconn);reconn=null;}
+        ws=new WebSocket(WS);
+        ws.onopen=()=>{
+            setDot(true);
+            console.log(`[${pluginName}] v${pluginVersion} → ${WS}`);
+            ws.send(JSON.stringify({type:'rdsm_get_rds_follow'}));
+        };
+        ws.onclose=()=>{setDot(false);reconn=setTimeout(connect,5000);};
+        ws.onerror=()=>setDot(false);
+        ws.onmessage=e=>onMessage(e.data);
+    }
+
+    const setEl  =(id,t)=>{const e=document.getElementById(id);if(e)e.textContent=t;};
+    const setDot =ok=>{
+        const e=document.getElementById('rdsm-dot');
+        if(e){e.style.background=ok?'#44ff88':'#ff4444';e.className=ok?'ok':'';}
+    };
+    const setFlag=(id,on)=>{const e=document.getElementById(id);if(e)e.className='rf'+(on?' on':'');};
+
+    function init() {
+        if (window.location.pathname==='/setup') return;
+        injectCSS();
+        createPanel();
+        addBtn();
+        connect();
+        fetch('/api').then(r=>r.json())
+            .then(d=>{if(d.freq){st.freq=d.freq;setEl('rdsm-freq',d.freq+' MHz');}})
+            .catch(()=>{});
+    }
+
+    if (document.readyState==='loading')
+        document.addEventListener('DOMContentLoaded',()=>setTimeout(init,900));
+    else
+        setTimeout(init,900);
+
+})();
