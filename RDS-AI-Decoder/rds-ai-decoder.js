@@ -41,6 +41,9 @@
                 if (!match) return;
                 const remoteVer = match[1];
                 if (remoteVer === pluginVersion) return;
+                // ── Toast notification for available update ──────────────
+                sendToast('warning', name,
+                    `Update available: v${pluginVersion} → v${remoteVer}. <a href="${urlUpdateLink}" target="_blank">Download</a>`);
                 if (!setupOnly || isSetupPath) {
                     const settings = document.getElementById('plugin-settings');
                     if (settings && !settings.innerHTML.includes(urlUpdateLink))
@@ -745,6 +748,9 @@
         ws=new WebSocket(WS);
         ws.onopen=()=>{
             setDot(true);
+            // ── Toast: successful WebSocket connection ───────────────
+            sendToast('info', pluginName,
+                `v${pluginVersion} connected to ${WS}`);
             console.log(`[${pluginName}] v${pluginVersion} → ${WS}`);
             ws.send(JSON.stringify({type:'rdsm_get_rds_follow'}));
         };
