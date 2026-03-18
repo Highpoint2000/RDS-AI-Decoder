@@ -1,29 +1,21 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V1.0)  //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.0)  //
 //                                                           //
-//  by Highpoint                last update: 2026-03-15      //
+//  by Highpoint                last update: 2026-03-18      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
 ///////////////////////////////////////////////////////////////
 
 (() => {
-	
-    const pluginVersion         = '1.0';
+
+    const pluginVersion         = '2.0';
     const pluginName            = 'RDS AI Decoder';
     const pluginHomepageUrl     = 'https://github.com/Highpoint2000/RDS-AI-Decoder/releases';
     const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
     const pluginSetupOnlyNotify = false;
     const CHECK_FOR_UPDATES     = true;
-
-    let isAdmin = false;
-    function checkAdminMode() {
-        const bodyText = document.body.textContent || document.body.innerText;
-        isAdmin = bodyText.includes('You are logged in as an administrator.') ||
-                  bodyText.includes('You are logged in as an adminstrator.');
-    }
-    checkAdminMode();
 
     if (typeof sendToast !== 'function') {
         window.sendToast = function(cls, src, txt) {
@@ -41,7 +33,6 @@
                 if (!match) return;
                 const remoteVer = match[1];
                 if (remoteVer === pluginVersion) return;
-                // ── Toast notification for available update ──────────────
                 sendToast('warning', name,
                     `Update available: v${pluginVersion} → v${remoteVer}. <a href="${urlUpdateLink}" target="_blank">Download</a>`);
                 if (!setupOnly || isSetupPath) {
@@ -69,11 +60,17 @@
     const WP = CU.protocol === 'https:' ? 'wss:' : 'ws:';
     const WS = `${WP}//${CU.hostname}:${CU.port||(CU.protocol==='https:'?'443':'80')}/data_plugins`;
 
-    const PTY = ['None','News','Current Affairs','Information','Sport','Education','Drama','Culture','Science','Varied','Pop Music','Rock Music','Easy Listening','Light Classical','Serious Classical','Other Music','Weather','Finance',"Children's Programmes",'Social Affairs','Religion','Phone-In','Travel','Leisure','Jazz Music','Country Music','National Music','Oldies Music','Folk Music','Documentary','Alarm Test','Alarm'];
+    const PTY = ['None','News','Current Affairs','Information','Sport','Education','Drama',
+                 'Culture','Science','Varied','Pop Music','Rock Music','Easy Listening',
+                 'Light Classical','Serious Classical','Other Music','Weather','Finance',
+                 "Children's Programmes",'Social Affairs','Religion','Phone-In','Travel',
+                 'Leisure','Jazz Music','Country Music','National Music','Oldies Music',
+                 'Folk Music','Documentary','Alarm Test','Alarm'];
 
+    // RDS character set – verified against ETSI EN 50067 / librdsparser
     const RDS_CHARSET = [
         ' ','!','"','#','¤','%','&',"'",
-        '(',')','+','+',',','-','.','/',
+        '(',')', '*','+',',','-','.','/',
         '0','1','2','3','4','5','6','7',
         '8','9',':',';','<','=','>','?',
         '@','A','B','C','D','E','F','G',
@@ -116,6 +113,7 @@
     let rtSlots = [mkRT(64), mkRT(64)];
     let rtAB    = -1;
 
+    // ── PS fusion: incoming raw RDS block ────────────────────
     function fusePS_raw(pos, char, conf, src, errLevel) {
         const cur = psSlots[pos];
         if (errLevel <= 1 && char === cur.rawChar) { cur.rawOk = Math.min(cur.rawOk + 1, 4); }
@@ -123,30 +121,45 @@
         const isVerified = cur.rawOk >= 2;
         const isEmpty    = cur.src === 'empty';
         const isBigram   = cur.src === 'ai-bigram';
-        const isAI       = cur.src.startsWith('ai');
+        const isRefSeed  = cur.src === 'ref-seed';
+        const isAI       = cur.src.startsWith('ai') || cur.src.startsWith('ref');
         const isWeakRaw  = cur.src.startsWith('raw') && cur.conf < 0.75;
-        if (isEmpty || isBigram) { psSlots[pos] = {char,conf,src,rawOk:cur.rawOk,rawChar:cur.rawChar}; return; }
+        if (isEmpty || isBigram || isRefSeed) {
+            psSlots[pos] = {char, conf, src, rawOk:cur.rawOk, rawChar:cur.rawChar};
+            return;
+        }
         if (isAI) {
-            if (isVerified) psSlots[pos] = {char,conf,src,rawOk:cur.rawOk,rawChar:cur.rawChar};
+            if (isVerified) psSlots[pos] = {char, conf, src, rawOk:cur.rawOk, rawChar:cur.rawChar};
             else cur.rawChar = char;
             return;
         }
         if (isWeakRaw || conf >= cur.conf - 0.05)
-            psSlots[pos] = {char,conf,src,rawOk:cur.rawOk,rawChar:cur.rawChar};
+            psSlots[pos] = {char, conf, src, rawOk:cur.rawOk, rawChar:cur.rawChar};
     }
+
+    // ── PS fusion: incoming AI prediction ───────────────────
     function fusePS_ai(pos, char, conf, src) {
         const cur = psSlots[pos];
         if (cur.rawOk >= 2 && cur.src.startsWith('raw')) return;
-        if (cur.src === 'empty' || cur.src === 'ai-bigram' || (cur.src.startsWith('ai') && conf > cur.conf))
-            psSlots[pos] = {char,conf,src,rawOk:cur.rawOk,rawChar:cur.rawChar};
+        const curIsWeak = cur.src === 'empty' || cur.src === 'ai-bigram' || cur.src === 'ref-seed';
+        const newIsBetter = conf > cur.conf;
+        if (curIsWeak ||
+            (cur.src.startsWith('ai')  && newIsBetter) ||
+            (cur.src === 'ref-match'   && src === 'ref-match' && newIsBetter) ||
+            (cur.src === 'ref-seed'    && newIsBetter))
+            psSlots[pos] = {char, conf, src, rawOk:cur.rawOk, rawChar:cur.rawChar};
     }
+
+    // ── RT fusion ────────────────────────────────────────────
     function fuseRT(ab, i, char, conf, src) {
         if (i < 0 || i >= rtSlots[ab].length) return;
         const cur     = rtSlots[ab][i];
         const rawWins = src.startsWith('raw') && cur.src.startsWith('ai') && conf >= cur.conf - 0.05;
-        if (conf > cur.conf || cur.src === 'empty' || rawWins) rtSlots[ab][i] = {char,conf,src};
+        if (conf > cur.conf || cur.src === 'empty' || rawWins)
+            rtSlots[ab][i] = {char, conf, src};
     }
 
+    // ── Stable flag debouncing ───────────────────────────────
     let _ptyCandidate = -1, _ptyCandCount = 0;
     let _taCandidate  = null, _taCandCount = 0;
 
@@ -161,24 +174,31 @@
             }
         } else { _ptyCandidate = pty; _ptyCandCount = 1; }
     }
-    function stableFlag_TP(tp, a, b)  { if (!a||!b) return; if (tp!==st.tp)    { st.tp=tp;    setFlag('rdsm-tp',tp); } }
-    function stableFlag_TA(ta, a, b)  {
+    function stableFlag_TP(tp, a, b) {
+        if (!a||!b) return;
+        if (tp !== st.tp) { st.tp = tp; setFlag('rdsm-tp', tp); }
+    }
+    function stableFlag_TA(ta, a, b) {
         if (!a||!b) return;
         if (ta === _taCandidate) {
             _taCandCount++;
-            if (_taCandCount >= 2 && ta !== st.ta) { st.ta=ta; setFlag('rdsm-ta',ta); }
-        } else { _taCandidate=ta; _taCandCount=1; }
+            if (_taCandCount >= 2 && ta !== st.ta) { st.ta = ta; setFlag('rdsm-ta', ta); }
+        } else { _taCandidate = ta; _taCandCount = 1; }
     }
-    function stableFlag_Stereo(s, a)  { if (!a) return; if (s!==st.stereo) { st.stereo=s; setFlag('rdsm-st',s); } }
-    function stableFlag_MS(ms, a, b)  {
+    function stableFlag_Stereo(s, a) {
+        if (!a) return;
+        if (s !== st.stereo) { st.stereo = s; setFlag('rdsm-st', s); }
+    }
+    function stableFlag_MS(ms, a, b) {
         if (!a||!b) return;
         if (ms !== st.ms) {
             st.ms = ms;
             const el = document.getElementById('rdsm-ms');
-            if (el) { el.textContent = ms?'MUSIC':'SPEECH'; el.className='rf on'; }
+            if (el) { el.textContent = ms ? 'MUSIC' : 'SPEECH'; el.className = 'rf on'; }
         }
     }
 
+    // ── Global state ─────────────────────────────────────────
     let st = {
         pi:'----', piCand:'----', piN:0,
         psBuf:new Array(8).fill(' '), psGroups:new Set(),
@@ -190,11 +210,17 @@
         _freqChangeTs:0,
         rtLine1:'', rtLine2:'',
         rdsFollow:false,
+        refStation:null, refDistKm:null, refMatchScore:0,
+        af:[],
+        psName:    null,   // stored station name (from fmdx.org or learned DB)
+        psNameSrc: null,   // 'fmdx' | 'db' | null
+        psVariants: [],    // all PS name variants from fmdx.org
     };
 
     let ws = null, reconn = null;
     let panelVis = false, statsOpen = false;
 
+    // ── Message dispatcher ───────────────────────────────────
     function onMessage(data) {
         let d; try { d = JSON.parse(data); } catch(e) { return; }
         switch (d.type) {
@@ -207,6 +233,7 @@
 
     function onRdsFollowState(d) { st.rdsFollow = !!d.enabled; syncFollowUI(); }
 
+    // ── Frequency change ─────────────────────────────────────
     function onFreq(d) {
         st._freqChangeTs = Date.now();
         reset();
@@ -214,190 +241,365 @@
         setEl('rdsm-freq', st.freq !== '—' ? st.freq + ' MHz' : '—');
     }
 
+    // ── Raw RDS group handler ────────────────────────────────
     function onRaw(d) {
-        if (d.freq && d.freq !== st.freq) { st.freq=d.freq; setEl('rdsm-freq', d.freq+' MHz'); }
+        if (d.freq && d.freq !== st.freq) { st.freq = d.freq; setEl('rdsm-freq', d.freq + ' MHz'); }
         if (d.pi) {
             const pi = d.pi.toUpperCase();
             if (pi === st.piCand) {
                 st.piN++;
-                if (st.piN >= 2 && pi !== st.pi) { st.pi=pi; setEl('rdsm-pi',pi); }
-            } else { st.piCand=pi; st.piN=1; }
+                if (st.piN >= 2 && pi !== st.pi) { st.pi = pi; setEl('rdsm-pi', pi); }
+            } else { st.piCand = pi; st.piN = 1; }
         }
         if (!d.b2) { updateBER(d.errB); return; }
-        const g2=parseInt(d.b2,16), g3=d.b3?parseInt(d.b3,16):NaN, g4=d.b4?parseInt(d.b4,16):NaN;
-        const gT=(g2>>12)&0xF, vB=(g2>>11)&1, tp=!!((g2>>10)&1), pty=(g2>>5)&0x1F;
-        const c3=CONF[d.errB[2]], c4=CONF[d.errB[3]];
-        const s3=`raw-${Math.min(d.errB[2],2)}`, s4=`raw-${Math.min(d.errB[3],2)}`;
-        const blkAok=d.errB[0]<=1, blkBok=d.errB[1]<=1;
-        const gc=document.getElementById(`rg-${gT}${vB?'B':'A'}`);
+        const g2 = parseInt(d.b2,16), g3 = d.b3 ? parseInt(d.b3,16) : NaN, g4 = d.b4 ? parseInt(d.b4,16) : NaN;
+        const gT = (g2>>12)&0xF, vB = (g2>>11)&1, tp = !!((g2>>10)&1), pty = (g2>>5)&0x1F;
+        const c3 = CONF[d.errB[2]], c4 = CONF[d.errB[3]];
+        const s3 = `raw-${Math.min(d.errB[2],2)}`, s4 = `raw-${Math.min(d.errB[3],2)}`;
+        const blkAok = d.errB[0] <= 1, blkBok = d.errB[1] <= 1;
+        const gc = document.getElementById(`rg-${gT}${vB?'B':'A'}`);
         if (gc) gc.classList.add('on');
         st.grpTotal++;
-        stableFlag_TP(tp,blkAok,blkBok);
-        stableFlag_PTY(pty,blkAok,blkBok);
-        if (gT===0) {
-            const ta=!!((g2>>4)&1), ms=!!((g2>>3)&1), seg=g2&3, di=!!((g2>>2)&1);
-            if (seg===3) stableFlag_Stereo(di,blkAok);
-            stableFlag_TA(ta,blkAok,blkBok);
-            stableFlag_MS(ms,blkAok,blkBok);
-            if (d.b4 && c4>0) {
-                const addr=seg*2, c0=rCh((g4>>8)&0xFF), c1=rCh(g4&0xFF);
-                if (c0>=' ') { fusePS_raw(addr,  c0,c4,s4,d.errB[3]); st.psBuf[addr]  =c0; st.psGroups.add(seg); }
-                if (c1>=' ') { fusePS_raw(addr+1,c1,c4,s4,d.errB[3]); st.psBuf[addr+1]=c1; }
+        stableFlag_TP(tp, blkAok, blkBok);
+        stableFlag_PTY(pty, blkAok, blkBok);
+        if (gT === 0) {
+            const ta = !!((g2>>4)&1), ms = !!((g2>>3)&1), seg = g2&3, di = !!((g2>>2)&1);
+            if (seg === 3) stableFlag_Stereo(di, blkAok);
+            stableFlag_TA(ta, blkAok, blkBok);
+            stableFlag_MS(ms, blkAok, blkBok);
+            if (d.b4 && c4 > 0) {
+                const addr = seg*2, c0 = rCh((g4>>8)&0xFF), c1 = rCh(g4&0xFF);
+                if (c0 >= ' ') { fusePS_raw(addr,   c0, c4, s4, d.errB[3]); st.psBuf[addr]   = c0; st.psGroups.add(seg); }
+                if (c1 >= ' ') { fusePS_raw(addr+1, c1, c4, s4, d.errB[3]); st.psBuf[addr+1] = c1; }
             }
         }
-        if (gT===2 && vB===0) {
-            const abF=(g2>>4)&1, addr=(g2&0xF)*4;
-            if (abF!==st.rtabFlag) { const o=extractRTText(st.rtabFlag>=0?st.rtabFlag:0); if(o.trim().length>=4)promoteRT(o); st.rtabFlag=abF; rtAB=abF; rtSlots[abF]=mkRT(64); }
-            if (d.b3&&c3>0) { fuseRT(abF,addr,  rCh((g3>>8)&0xFF),c3,s3); fuseRT(abF,addr+1,rCh(g3&0xFF),c3,s3); }
-            if (d.b4&&c4>0) { fuseRT(abF,addr+2,rCh((g4>>8)&0xFF),c4,s4); fuseRT(abF,addr+3,rCh(g4&0xFF),c4,s4); }
+        if (gT === 2 && vB === 0) {
+            const abF = (g2>>4)&1, addr = (g2&0xF)*4;
+            if (abF !== st.rtabFlag) {
+                const o = extractRTText(st.rtabFlag >= 0 ? st.rtabFlag : 0);
+                if (o.trim().length >= 4) promoteRT(o);
+                st.rtabFlag = abF; rtAB = abF; rtSlots[abF] = mkRT(64);
+            }
+            if (d.b3 && c3 > 0) { fuseRT(abF, addr,   rCh((g3>>8)&0xFF), c3, s3); fuseRT(abF, addr+1, rCh(g3&0xFF), c3, s3); }
+            if (d.b4 && c4 > 0) { fuseRT(abF, addr+2, rCh((g4>>8)&0xFF), c4, s4); fuseRT(abF, addr+3, rCh(g4&0xFF), c4, s4); }
         }
-        if (gT===2 && vB===1) {
-            const abF=(g2>>4)&1, addr=(g2&0xF)*2;
-            if (abF!==st.rtabFlag) { const o=extractRTText(st.rtabFlag>=0?st.rtabFlag:0); if(o.trim().length>=4)promoteRT(o); st.rtabFlag=abF; rtAB=abF; rtSlots[abF]=mkRT(64); }
-            if (d.b4&&c4>0) { fuseRT(abF,addr,  rCh((g4>>8)&0xFF),c4,s4); fuseRT(abF,addr+1,rCh(g4&0xFF),c4,s4); }
+        if (gT === 2 && vB === 1) {
+            const abF = (g2>>4)&1, addr = (g2&0xF)*2;
+            if (abF !== st.rtabFlag) {
+                const o = extractRTText(st.rtabFlag >= 0 ? st.rtabFlag : 0);
+                if (o.trim().length >= 4) promoteRT(o);
+                st.rtabFlag = abF; rtAB = abF; rtSlots[abF] = mkRT(64);
+            }
+            if (d.b4 && c4 > 0) { fuseRT(abF, addr, rCh((g4>>8)&0xFF), c4, s4); fuseRT(abF, addr+1, rCh(g4&0xFF), c4, s4); }
         }
-        if (gT===1 && vB===0 && d.b3 && d.errB[2]<=1 && ((g2>>1)&7)===0) {
-            const eccVal=(g3&0xFF).toString(16).toUpperCase().padStart(2,'0');
-            if (eccVal!==st.ecc) {
-                st.ecc=eccVal;
-                const el=document.getElementById('rdsm-ecc-flag');
-                if (el) { el.textContent='ECC '+eccVal; el.className='rf on'; el.title='Extended Country Code: 0x'+eccVal; }
+        if (gT === 1 && vB === 0 && d.b3 && d.errB[2] <= 1 && ((g2>>1)&7) === 0) {
+            const eccVal = (g3&0xFF).toString(16).toUpperCase().padStart(2,'0');
+            if (eccVal !== st.ecc) {
+                st.ecc = eccVal;
+                const el = document.getElementById('rdsm-ecc-flag');
+                if (el) { el.textContent = 'ECC ' + eccVal; el.className = 'rf on'; el.title = 'Extended Country Code: 0x' + eccVal; }
             }
         }
         updateBER(d.errB);
         renderAll();
     }
 
+    // ── AI prediction handler ────────────────────────────────
     function onAI(d) {
         if (d.ts && d.ts < st._freqChangeTs) return;
-        st.aiActive=true; st.aiStats=d.stats;
+        st.aiActive = true;
+        st.aiStats  = d.stats;
+        if (d.stats) {
+            st.refStation    = d.stats.refStation    || null;
+            st.refDistKm     = d.stats.refDistKm     || null;
+            st.refMatchScore = d.stats.refMatchScore || 0;
+        }
+        if (d.psName !== undefined) {
+            st.psName     = d.psName    || null;
+            st.psNameSrc  = d.psNameSrc || null;
+            st.psVariants = Array.isArray(d.psVariants) ? d.psVariants : [];
+            renderPSName();
+        }
+        if (d.af && Array.isArray(d.af) && d.af.length > 0) {
+            st.af = d.af.slice().sort((a, b) => a - b);
+            renderAF();
+        }
         if (d.ps && Array.isArray(d.ps))
-            for (let i=0;i<Math.min(d.ps.length,8);i++) {
-                const p=d.ps[i];
-                if (!p||!p.char||p.char===' ') continue;
-                fusePS_ai(i,p.char,p.conf||0,p.src||'ai-voted-mid');
+            for (let i = 0; i < Math.min(d.ps.length, 8); i++) {
+                const p = d.ps[i];
+                if (!p || !p.char || p.char === ' ') continue;
+                fusePS_ai(i, p.char, p.conf || 0, p.src || 'ai-voted-mid');
             }
         if (d.rt?.text) {
-            const ab=rtAB>=0?rtAB:0, sc=Math.min(d.rt.score||0.5,0.85);
-            for (let i=0;i<Math.min(d.rt.text.length,64);i++) {
-                const c=d.rt.text[i]; if(!c||c==='\r') break;
-                if (rtSlots[ab][i].conf<sc) fuseRT(ab,i,c,sc,'ai-rt-match');
+            const ab = rtAB >= 0 ? rtAB : 0, sc = Math.min(d.rt.score || 0.5, 0.85);
+            for (let i = 0; i < Math.min(d.rt.text.length, 64); i++) {
+                const c = d.rt.text[i]; if (!c || c === '\r') break;
+                if (rtSlots[ab][i].conf < sc) fuseRT(ab, i, c, sc, 'ai-rt-match');
             }
-            if (!st.rtLine1 && d.rt.src==='ai-rt-last') st.rtLine1=d.rt.text;
+            if (!st.rtLine1 && d.rt.src === 'ai-rt-last') st.rtLine1 = d.rt.text;
         }
-        if (d.pi && d.pi!==st.pi && d.pi!=='----') { st.pi=d.pi; setEl('rdsm-pi',d.pi); }
+        if (d.pi && d.pi !== st.pi && d.pi !== '----') { st.pi = d.pi; setEl('rdsm-pi', d.pi); }
         refreshStatsPanel();
         renderAll();
     }
 
     function extractRTText(ab) {
-        let t='';
-        for (let i=0;i<64;i++) {
-            const sl=rtSlots[ab]?.[i];
-            if (!sl||sl.char==='\r') break;
-            if (sl.conf>0) t+=sl.char; else if (t.length>0) break;
+        let t = '';
+        for (let i = 0; i < 64; i++) {
+            const sl = rtSlots[ab]?.[i];
+            if (!sl || sl.char === '\r') break;
+            if (sl.conf > 0) t += sl.char; else if (t.length > 0) break;
         }
         return t.trimEnd();
     }
-    function promoteRT(text) { if (text?.trim().length>=4) st.rtLine1=text; }
+    function promoteRT(text) { if (text?.trim().length >= 4) st.rtLine1 = text; }
 
-    function renderAll() { renderPS(); renderRT(); refreshStats(); }
+    function renderAll() { renderPS(); renderRT(); renderPSName(); refreshStats(); }
 
     // ── Confidence → colour ──────────────────────────────────
-    // Reworked scale: minimum visible grey raised from 42 to 80
-    // so low-confidence characters are clearly darker/dimmer,
-    // and full-confidence (conf=1.0) still reaches near-white
-    // (rgb(240,240,240)).  The gap between "uncertain" and
-    // "validated" is now much more visible.
-    //
-    //  conf = 0.00  →  rgb( 20, 20, 20)   almost black
-    //  conf = 0.50  →  rgb(110,110,110)   medium grey
-    //  conf = 0.75  →  rgb(163,163,163)   light grey
-    //  conf = 1.00  →  rgb(240,240,240)   near-white
-    //
-    // ai-bigram (unverified guess) uses a separate very dark
-    // scale so it is never mistaken for a real character.
+    //  src = 'ref-match'  →  warm gold  (fmdx.org confirmed)
+    //  src = 'ref-seed'   →  dim amber  (fmdx.org, unconfirmed)
+    //  src = 'empty'      →  transparent
+    //  src = 'ai-bigram'  →  very dark (barely visible guess)
+    //  everything else    →  grey scale 20–240
     function confToGray(conf, src) {
         if (src === 'empty') return 'transparent';
         if (src === 'ai-bigram') {
-            // Very dark: 15–45 – barely visible, clearly a guess
             const v = Math.round(15 + conf * 30);
             return `rgb(${v},${v},${v})`;
         }
-        // Normal: 20–240 – steep curve so low conf looks dark
+        if (src === 'ref-match') {
+            const r = Math.round(120 + conf * 135);
+            const g = Math.round( 80 + conf * 120);
+            const b = Math.round( 10 + conf *  20);
+            return `rgb(${r},${g},${b})`;
+        }
+        if (src === 'ref-seed') {
+            const r = Math.round(80 + conf * 80);
+            const g = Math.round(55 + conf * 55);
+            const b = Math.round(10 + conf * 10);
+            return `rgb(${r},${g},${b})`;
+        }
         const v = Math.round(20 + conf * 220);
         return `rgb(${v},${v},${v})`;
     }
 
+    // ── Render PS characters ─────────────────────────────────
     function renderPS() {
-        for (let i=0;i<8;i++) {
-            const sl=psSlots[i];
-            const chEl=document.getElementById(`rdsm-c${i}`), bEl=document.getElementById(`rdsm-b${i}`);
-            if (!chEl||!bEl) continue;
-            const q=Math.round(sl.conf*100);
-            chEl.textContent=(sl.src==='empty'||sl.char===' ')?'':sl.char;
-            chEl.className='c'; chEl.style.color=confToGray(sl.conf,sl.src);
-            chEl.parentElement.title=`[${i}] "${sl.char}" ${q}% ${sl.src} ok=${sl.rawOk}`;
-            bEl.style.width=sl.src==='empty'?'0%':q+'%';
-            bEl.style.background='var(--color-main-bright,#4a90d9)';
-            bEl.style.opacity=sl.src==='empty'?'0':String(0.15+sl.conf*0.85);
-            bEl.className='cf';
+        for (let i = 0; i < 8; i++) {
+            const sl   = psSlots[i];
+            const chEl = document.getElementById(`rdsm-c${i}`);
+            const bEl  = document.getElementById(`rdsm-b${i}`);
+            if (!chEl || !bEl) continue;
+            const q = Math.round(sl.conf * 100);
+            chEl.textContent = (sl.src === 'empty' || sl.char === ' ') ? '' : sl.char;
+            chEl.className   = 'c';
+            chEl.style.color = confToGray(sl.conf, sl.src);
+            chEl.parentElement.title = `[${i}] "${sl.char}" ${q}% ${sl.src} ok=${sl.rawOk}`;
+            bEl.style.width      = sl.src === 'empty' ? '0%' : q + '%';
+            const isRef          = sl.src === 'ref-match' || sl.src === 'ref-seed';
+            bEl.style.background = isRef ? '#c8a020' : 'var(--color-main-bright,#4a90d9)';
+            bEl.style.opacity    = sl.src === 'empty' ? '0' : String(0.15 + sl.conf * 0.85);
+            bEl.className        = 'cf';
         }
     }
 
-    function renderRT() {
-        const ab=rtAB>=0?rtAB:0;
-        const rt1El=document.getElementById('rdsm-rt1'), rt2El=document.getElementById('rdsm-rt2');
-        if (!rt1El||!rt2El) return;
-        let end=64;
-        for (let i=0;i<64;i++) if (rtSlots[ab][i].conf>0&&rtSlots[ab][i].char==='\r'){end=i;break;}
-        while (end>0&&rtSlots[ab][end-1].conf===0) end--;
-        let html2='';
-        if (end>0) {
-            for (let i=0;i<end;i++) {
-                const sl=rtSlots[ab][i], c=sl.char||' ';
-                const esc=c==='<'?'&lt;':c==='>'?'&gt;':c==='&'?'&amp;':c;
-                html2+=`<span style="color:${confToGray(sl.conf,sl.src)}" title="${Math.round(sl.conf*100)}%">${esc}</span>`;
+    // ── Render stored PS name with live variant match chips ──
+    function renderPSName() {
+        const el = document.getElementById('rdsm-psname');
+        if (!el) return;
+
+        const hasVariants = st.psVariants && st.psVariants.length > 0;
+
+        // Build current PS string from multiple sources:
+        // prefer fused psSlots, fall back to raw psBuf
+        const fusedPS   = psSlots.map(s => (s.src !== 'empty' && s.char !== ' ') ? s.char : ' ').join('').trim().toUpperCase();
+        const rawPS     = st.psBuf ? st.psBuf.join('').trim().toUpperCase() : '';
+        const currentPS = (fusedPS.replace(/ /g,'').length >= rawPS.replace(/ /g,'').length)
+            ? fusedPS : rawPS;
+
+        // Compute match score of a variant against both fused and raw PS
+        function matchScore(variant) {
+            const ref  = variant.trim().toUpperCase().padEnd(8, ' ');
+            const cur  = currentPS.padEnd(8, ' ');
+            const raw8 = rawPS.padEnd(8, ' ');
+            let best = 0;
+            for (const cmp of [cur, raw8]) {
+                // Position-aware match
+                let matches = 0, checked = 0;
+                for (let i = 0; i < 8; i++) {
+                    if (ref[i] !== ' ') {
+                        checked++;
+                        if (cmp[i] === ref[i]) matches++;
+                    }
+                }
+                const score = checked > 0 ? Math.round((matches / checked) * 100) : 0;
+                if (score > best) best = score;
+
+                // Position-independent match for short names (≤4 non-space chars)
+                // e.g. "DLF" received as "D l f" spread across positions
+                const refChars = ref.replace(/ /g, '');
+                const cmpChars = cmp.replace(/ /g, '');
+                if (refChars.length <= 4 && cmpChars.length > 0) {
+                    const posIndep = refChars.split('').filter(c => cmpChars.includes(c)).length;
+                    const posScore = Math.round((posIndep / refChars.length) * 100);
+                    if (posScore > best) best = posScore;
+                }
             }
-            st.rtLine2=extractRTText(ab);
-        } else html2='<span style="color:#333">—</span>';
-        rt2El.innerHTML=html2;
-        rt1El.innerHTML=st.rtLine1
-            ?`<span style="color:#909090">${st.rtLine1.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>`
-            :'<span style="color:#333">—</span>';
+            return best;
+        }
+
+        // Station name header line (psName = e.g. "R.SA")
+        const headerName = st.psName
+            ? `<span style="font-size:14px;font-weight:600;color:#f0f0f0;
+                font-family:'Titillium Web',Calibri,sans-serif;
+                letter-spacing:normal;white-space:nowrap;">${st.psName}</span>`
+            : '';
+
+        // Build a single chip HTML for one PS variant
+        function chipHTML(variant) {
+            const score   = matchScore(variant);
+            const isMatch = score === 100;
+            const isClose = score >= 50 && !isMatch;
+            const bg     = isMatch ? 'var(--color-main-bright,#4a90d9)' : '#1c1c1c';
+            const border = isMatch ? 'var(--color-main-bright,#4a90d9)'
+                         : isClose ? '#3a3a3a' : '#2a2a2a';
+            const color  = isMatch ? '#fff' : isClose ? '#888' : '#444';
+            const weight = isMatch ? '700' : '500';
+            return `<span style="
+                display:inline-block;
+                background:${bg};border:1px solid ${border};
+                color:${color};font-weight:${weight};
+                font-size:11px;letter-spacing:.8px;
+                font-family:'Titillium Web',Calibri,sans-serif;
+                padding:1px 7px;border-radius:4px;white-space:pre;cursor:default;
+                transition:color .3s,border-color .3s,background .3s;"
+                title="${variant.trim()}">${variant.padEnd(8,' ')}</span>`;
+        }
+
+        let chipsHTML = '';
+        if (hasVariants) {
+            chipsHTML = st.psVariants.map(chipHTML).join(' ');
+        } else if (st.psName) {
+            chipsHTML = chipHTML(st.psName);
+        }
+
+        // Label + content – only update innerHTML, never touch display/visibility
+        el.innerHTML = `
+            <span class="rl" style="flex-shrink:0;">FMDX.ORG</span>
+            <div style="display:flex;flex-direction:column;gap:3px;width:100%;">
+                <div style="height:16px;display:flex;align-items:center;">${headerName}</div>
+                <div style="min-height:22px;display:flex;flex-wrap:wrap;
+                    gap:4px;align-items:center;margin-top:3px;margin-left:-1px;">${chipsHTML}</div>
+            </div>`;
     }
 
-    function updateBER(errB) {
-        const hasLost=errB&&errB.some(e=>e===3);
-        st.ber.push(hasLost?1:0);
-        if (st.ber.length>60) st.ber.shift();
-        const errs=st.ber.filter(v=>v).length;
-        const q=st.ber.length?Math.round((1-errs/st.ber.length)*100):100;
-        const bar=document.getElementById('rdsm-bf'), pct=document.getElementById('rdsm-bp');
-        if (bar) { bar.style.width=q+'%'; bar.style.background=q>80?'#44cc88':q>50?'#ffaa44':'#ff5555'; }
-        if (pct) pct.textContent=q+'%';
+    // ── Render RadioText ─────────────────────────────────────
+    function renderRT() {
+        const ab    = rtAB >= 0 ? rtAB : 0;
+        const rt1El = document.getElementById('rdsm-rt1');
+        const rt2El = document.getElementById('rdsm-rt2');
+        if (!rt1El || !rt2El) return;
+        let end = 64;
+        for (let i = 0; i < 64; i++)
+            if (rtSlots[ab][i].conf > 0 && rtSlots[ab][i].char === '\r') { end = i; break; }
+        while (end > 0 && rtSlots[ab][end-1].conf === 0) end--;
+        let html2 = '';
+        if (end > 0) {
+            for (let i = 0; i < end; i++) {
+                const sl = rtSlots[ab][i], c = sl.char || ' ';
+                const esc = c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '&' ? '&amp;' : c;
+                html2 += `<span style="color:${confToGray(sl.conf,sl.src)}" title="${Math.round(sl.conf*100)}%">${esc}</span>`;
+            }
+            st.rtLine2 = extractRTText(ab);
+        } else {
+            html2 = '<span style="color:#333">—</span>';
+        }
+        rt2El.innerHTML = html2;
+        rt1El.innerHTML = st.rtLine1
+            ? `<span style="color:#909090">${st.rtLine1.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>`
+            : '<span style="color:#333">—</span>';
     }
-    function refreshStats() { setEl('rdsm-gc',`Groups: ${st.grpTotal}`); }
+
+    // ── AF flag rendering ────────────────────────────────────
+    function renderAF() {
+        const el = document.getElementById('rdsm-af-flag');
+        if (!el) return;
+        if (st.af && st.af.length > 0) {
+            el.className   = 'rf on';
+            el.textContent = 'AF ' + st.af.length;
+            el.title       = 'Alternate Frequencies: ' + st.af.map(f => f.toFixed(1) + ' MHz').join(', ');
+        } else {
+            el.className   = 'rf';
+            el.textContent = 'AF';
+            el.title       = '';
+        }
+    }
+
+    // ── BER: 0% = perfect, 100% = all blocks lost ────────────
+    function updateBER(errB) {
+        if (!errB || !Array.isArray(errB)) return;
+
+        const hasError = errB.some(e => e >= 2);
+
+        if (errB[0] === 3) {
+            st.ber.push(1);
+            if (st.ber.length > 40) st.ber.shift();
+        }
+
+        st.ber.push(hasError ? 1 : 0);
+        if (st.ber.length > 40) st.ber.shift();
+
+        const errs   = st.ber.filter(v => v).length;
+        const berPct = st.ber.length ? Math.round((errs / st.ber.length) * 100) : 0;
+        const bar    = document.getElementById('rdsm-bf');
+        const pct    = document.getElementById('rdsm-bp');
+        if (bar) {
+            bar.style.width      = berPct + '%';
+            bar.style.background = berPct < 20 ? '#44cc88' : berPct < 50 ? '#ffaa44' : '#ff5555';
+        }
+        if (pct) pct.textContent = berPct + '%';
+    }
+
+    function refreshStats() { setEl('rdsm-gc', `Groups: ${st.grpTotal}`); }
+
+    // ── Statistics panel ─────────────────────────────────────
     function refreshStatsPanel() {
         if (!statsOpen) return;
-        setEl('ai-cur-pi',st.pi);
-        setEl('ai-active',st.aiActive?'✅ active':'⏳ waiting...');
+        setEl('ai-cur-pi',  st.pi);
+        setEl('ai-active',  st.aiActive ? '✅ active' : '⏳ waiting...');
         if (st.aiStats) {
-            setEl('ai-seen',   st.aiStats.seenCount?.toLocaleString()||'—');
-            setEl('ai-votes',  st.aiStats.psVoteTotal?.toLocaleString()||'—');
-            setEl('ai-freq',   st.aiStats.freq||'—');
-            setEl('ai-dynamic',st.aiStats.psIsDynamic?'⚡ dynamic':'🔒 static');
+            setEl('ai-seen',    st.aiStats.seenCount?.toLocaleString() || '—');
+            setEl('ai-votes',   st.aiStats.psVoteTotal?.toLocaleString() || '—');
+            setEl('ai-freq',    st.aiStats.freq || '—');
+            setEl('ai-dynamic', st.aiStats.psIsDynamic ? '⚡ dynamic' : '🔒 static');
         }
-        const rawN =psSlots.filter(s=>s.src.startsWith('raw')).length;
-        const dbN  =psSlots.filter(s=>s.src==='ai-cached-db').length;
-        const hvote=psSlots.filter(s=>s.src==='ai-voted-high').length;
-        const mvote=psSlots.filter(s=>s.src==='ai-voted-mid').length;
-        const lvote=psSlots.filter(s=>s.src==='ai-voted-low').length;
-        const bigN =psSlots.filter(s=>s.src==='ai-bigram').length;
-        const vN   =psSlots.filter(s=>s.rawOk>=2).length;
-        setEl('ai-ps-breakdown',`raw:${rawN}  DB:${dbN}  ↑:${hvote}  ~:${mvote}  ↓:${lvote}  bigram:${bigN}  ✅:${vN}`);
+        // Reference station row
+        const refRow = document.getElementById('ai-ref-row');
+        if (st.refStation) {
+            setEl('ai-ref-station', st.refStation);
+            setEl('ai-ref-dist',    st.refDistKm !== null ? st.refDistKm + ' km' : '—');
+            setEl('ai-ref-match',   st.refMatchScore + '%');
+            if (refRow) refRow.style.display = '';
+        } else {
+            if (refRow) refRow.style.display = 'none';
+        }
+        // PS slot source breakdown
+        const rawN  = psSlots.filter(s => s.src.startsWith('raw')).length;
+        const dbN   = psSlots.filter(s => s.src === 'ai-cached-db').length;
+        const hvote = psSlots.filter(s => s.src === 'ai-voted-high').length;
+        const mvote = psSlots.filter(s => s.src === 'ai-voted-mid').length;
+        const lvote = psSlots.filter(s => s.src === 'ai-voted-low').length;
+        const bigN  = psSlots.filter(s => s.src === 'ai-bigram').length;
+        const refM  = psSlots.filter(s => s.src === 'ref-match').length;
+        const refS  = psSlots.filter(s => s.src === 'ref-seed').length;
+        const vN    = psSlots.filter(s => s.rawOk >= 2).length;
+        setEl('ai-ps-breakdown',
+            `raw:${rawN}  DB:${dbN}  ↑:${hvote}  ~:${mvote}  ↓:${lvote}  ` +
+            `bigram:${bigN}  🌐:${refM}  🔶:${refS}  ✅:${vN}`);
     }
 
+    // ── RDS Follow button sync ───────────────────────────────
     function syncFollowUI() {
         const panelBtn = document.getElementById('rdsm-follow-btn');
         if (panelBtn) {
@@ -430,38 +632,75 @@
         syncFollowUI();
     }
 
+    // ── Full state reset on frequency change ─────────────────
     function reset() {
-        st.pi='----'; st.piCand='----'; st.piN=0;
+        st.pi = '----'; st.piCand = '----'; st.piN = 0;
         st.psBuf.fill(' '); st.psGroups.clear();
-        st.pty=-1; st.tp=false; st.ta=false; st.ms=false; st.stereo=false;
-        st.rtabFlag=-1; st.ecc=''; st.grpTotal=0; st.ber=[];
-        st.aiStats=null; st.aiActive=false; st.rtLine1=''; st.rtLine2='';
-        _ptyCandidate=-1; _ptyCandCount=0; _taCandidate=null; _taCandCount=0;
-        psSlots=mkPS(); rtSlots=[mkRT(64),mkRT(64)]; rtAB=-1;
-        setEl('rdsm-pi','----');
-        for (let i=0;i<8;i++) {
-            const ch=document.getElementById(`rdsm-c${i}`), b=document.getElementById(`rdsm-b${i}`);
-            if (ch){ch.textContent='';ch.style.color='transparent';}
-            if (b) {b.style.width='0%';b.style.background='transparent';b.style.opacity='0';}
+        st.pty = -1; st.tp = false; st.ta = false; st.ms = false; st.stereo = false;
+        st.rtabFlag = -1; st.ecc = ''; st.grpTotal = 0; st.ber = [];
+        st.aiStats = null; st.aiActive = false; st.rtLine1 = ''; st.rtLine2 = '';
+        st.refStation = null; st.refDistKm = null; st.refMatchScore = 0;
+        st.af = [];
+        st.psName     = null;
+        st.psNameSrc  = null;
+        st.psVariants = [];
+        _ptyCandidate = -1; _ptyCandCount = 0; _taCandidate = null; _taCandCount = 0;
+        psSlots = mkPS(); rtSlots = [mkRT(64), mkRT(64)]; rtAB = -1;
+        setEl('rdsm-pi', '----');
+        for (let i = 0; i < 8; i++) {
+            const ch = document.getElementById(`rdsm-c${i}`);
+            const b  = document.getElementById(`rdsm-b${i}`);
+            if (ch) { ch.textContent = ''; ch.style.color = 'transparent'; }
+            if (b)  { b.style.width = '0%'; b.style.background = 'transparent'; b.style.opacity = '0'; }
         }
-        const rt1=document.getElementById('rdsm-rt1'), rt2=document.getElementById('rdsm-rt2');
-        if (rt1) rt1.innerHTML='<span style="color:#333">—</span>';
-        if (rt2) rt2.innerHTML='<span style="color:#333">—</span>';
-        const ptyEl=document.getElementById('rdsm-pty');
-        if (ptyEl){ptyEl.textContent='—';ptyEl.title='';}
-        const eccEl=document.getElementById('rdsm-ecc-flag');
-        if (eccEl){eccEl.textContent='ECC';eccEl.className='rf';eccEl.title='';}
-        GA.forEach(g=>{const el=document.getElementById(`rg-${g}`);if(el)el.classList.remove('on');});
-        setFlag('rdsm-tp',false); setFlag('rdsm-ta',false);
-        const ms=document.getElementById('rdsm-ms');
-        if (ms){ms.textContent='MUSIC';ms.className='rf';}
-        setFlag('rdsm-st',false);
-        setEl('rdsm-gc','Groups: 0');
-        const bar=document.getElementById('rdsm-bf'), pct=document.getElementById('rdsm-bp');
-        if (bar){bar.style.width='100%';bar.style.background='#44cc88';}
-        if (pct) pct.textContent='—';
+        const rt1 = document.getElementById('rdsm-rt1'), rt2 = document.getElementById('rdsm-rt2');
+        if (rt1) rt1.innerHTML = '<span style="color:#333">—</span>';
+        if (rt2) rt2.innerHTML = '<span style="color:#333">—</span>';
+        const ptyEl = document.getElementById('rdsm-pty');
+        if (ptyEl) { ptyEl.textContent = '—'; ptyEl.title = ''; }
+        // Reset AF flag
+        const afEl = document.getElementById('rdsm-af-flag');
+        if (afEl) { afEl.textContent = 'AF'; afEl.className = 'rf'; afEl.title = ''; }
+        // Reset ECC flag
+        const eccEl = document.getElementById('rdsm-ecc-flag');
+        if (eccEl) { eccEl.textContent = 'ECC'; eccEl.className = 'rf'; eccEl.title = ''; }
+        // Reset PS name row – keep visible, only clear content to placeholder
+        const psnEl = document.getElementById('rdsm-psname');
+        if (psnEl) {
+            psnEl.style.display    = '';
+            psnEl.style.visibility = '';
+            psnEl.innerHTML = `
+                <span class="rl" style="flex-shrink:0;">FMDX.ORG</span>
+                <div style="display:flex;flex-direction:column;gap:3px;width:100%;">
+                    <div style="height:16px;display:flex;align-items:center;"></div>
+                    <div style="min-height:22px;margin-top:10px;"></div>
+                </div>`;
+        }
+        GA.forEach(g => { const el = document.getElementById(`rg-${g}`); if (el) el.classList.remove('on'); });
+        setFlag('rdsm-tp', false); setFlag('rdsm-ta', false);
+        const ms = document.getElementById('rdsm-ms');
+        if (ms) { ms.textContent = 'MUSIC'; ms.className = 'rf'; }
+        setFlag('rdsm-st', false);
+        setEl('rdsm-gc', 'Groups: 0');
+        const bar = document.getElementById('rdsm-bf'), pct = document.getElementById('rdsm-bp');
+        if (bar) { bar.style.width = '0%'; bar.style.background = '#44cc88'; }
+        if (pct) pct.textContent = '0%';
+		
+		// If stats panel is open, immediately clear displayed values
+        if (statsOpen) {
+            setEl('ai-cur-pi',      '—');
+            setEl('ai-active',      '⏳ waiting...');
+            setEl('ai-seen',        '—');
+            setEl('ai-votes',       '—');
+            setEl('ai-freq',        '—');
+            setEl('ai-dynamic',     '—');
+            setEl('ai-ps-breakdown','');
+            const refRow = document.getElementById('ai-ref-row');
+            if (refRow) refRow.style.display = 'none';
+        }
     }
 
+    // ── CSS injection ────────────────────────────────────────
     function injectCSS() {
         if (document.getElementById('rdsm-css')) return;
         const s = document.createElement('style');
@@ -518,6 +757,13 @@
             background:#1c1c1c;color:#444;font-family:"Titillium Web",Calibri,sans-serif;
             min-width:24px;text-align:center;transition:background .3s,color .3s;}
         .rgc.on{background:var(--color-main-bright,#4a90d9);color:#fff;}
+        #rdsm-psname{
+            display:flex !important;visibility:visible !important;
+            align-items:flex-start;
+            min-height:46px;max-height:46px;height:46px;
+            padding:2px 0;gap:8px;overflow:hidden;
+            box-sizing:border-box;flex-shrink:0;
+            margin-bottom:8px;}
         #rdsm-stats{
             display:grid;grid-template-columns:96px auto auto;
             justify-content:space-between;align-items:center;
@@ -558,10 +804,14 @@
         #rdsm-stats-pan{background:#0d0f18;padding:0 14px;max-height:0;overflow:hidden;
             transition:max-height .25s ease,padding .25s ease;
             font-family:"Titillium Web",Calibri,sans-serif;}
-        #rdsm-stats-pan.open{max-height:400px;padding:4px 14px 12px;}
+        #rdsm-stats-pan.open{max-height:500px;padding:4px 14px 12px;}
         .ai-stats-r{display:flex;justify-content:space-between;font-size:11px;color:#888;
             margin-bottom:5px;font-family:"Titillium Web",Calibri,sans-serif;}
         .ai-stats-r span{color:#ccc;font-weight:600;font-family:"Titillium Web",Calibri,sans-serif;}
+        .ai-stats-ref{display:flex;justify-content:space-between;font-size:11px;
+            color:#888;margin-bottom:5px;font-family:"Titillium Web",Calibri,sans-serif;
+            background:rgba(200,160,32,.08);border-radius:4px;padding:3px 6px;}
+        .ai-stats-ref span{color:#c8a020;font-weight:600;}
         .ai-stats-leg{font-size:9px;color:#555;margin-top:8px;line-height:2;
             font-family:"Titillium Web",Calibri,sans-serif;}
         .rdiv{border:none;border-top:1px solid rgba(255,255,255,.07);margin:7px 0;}
@@ -571,8 +821,9 @@
     }
 
     const GA = [];
-    for (let i=0;i<=15;i++) GA.push(`${i}A`,`${i}B`);
+    for (let i = 0; i <= 15; i++) GA.push(`${i}A`, `${i}B`);
 
+    // ── Panel HTML ────────────────────────��──────────────────
     function createPanel() {
         if (document.getElementById('rdsm-panel')) return;
         const d = document.createElement('div');
@@ -598,7 +849,7 @@
             <div class="rr" style="align-items:flex-start">
               <span class="rl" style="margin-top:3px">PS</span>
               <div id="rdsm-ps">
-                ${[0,1,2,3,4,5,6,7].map(i=>`
+                ${[0,1,2,3,4,5,6,7].map(i => `
                   <div class="rpc">
                     <span class="c" id="rdsm-c${i}" style="color:transparent"></span>
                     <div class="cb"><div class="cf" id="rdsm-b${i}"
@@ -630,6 +881,7 @@
                 <span class="rf" id="rdsm-ta">TA</span>
                 <span class="rf" id="rdsm-ms">MUSIC</span>
                 <span class="rf" id="rdsm-st">STEREO</span>
+                <span class="rf" id="rdsm-af-flag" title="">AF</span>
                 <span class="rf" id="rdsm-ecc-flag" title="">ECC</span>
               </div>
             </div>
@@ -637,7 +889,15 @@
             <div class="rr" style="align-items:flex-start">
               <span class="rl" style="margin-top:2px">Groups</span>
               <div id="rdsm-gg">
-                ${GA.map(g=>`<span class="rgc" id="rg-${g}">${g}</span>`).join('')}
+                ${GA.map(g => `<span class="rgc" id="rg-${g}">${g}</span>`).join('')}
+              </div>
+            </div>
+            <hr class="rdiv">
+            <div id="rdsm-psname">
+              <span class="rl" style="flex-shrink:0;">FMDX.ORG</span>
+              <div style="display:flex;flex-direction:column;gap:3px;width:100%;">
+                <div style="height:16px;display:flex;align-items:center;"></div>
+                <div style="min-height:22px;"></div>
               </div>
             </div>
           </div>
@@ -649,8 +909,8 @@
               </button>
             </span>
             <span id="rdsm-ber-wrap">BER
-              <span id="rdsm-bw"><div id="rdsm-bf" style="width:100%"></div></span>
-              <span id="rdsm-bp">—</span>
+              <span id="rdsm-bw"><div id="rdsm-bf" style="width:0%"></div></span>
+              <span id="rdsm-bp">0%</span>
             </span>
           </div>
           <div id="rdsm-stats-hdr">
@@ -664,13 +924,22 @@
             <div class="ai-stats-r">Groups received: <span id="ai-seen">—</span></div>
             <div class="ai-stats-r">PS votes total: <span id="ai-votes">—</span></div>
             <div class="ai-stats-r">Last seen on: <span id="ai-freq">—</span></div>
+            <div class="ai-stats-ref" id="ai-ref-row" style="display:none">
+              <span style="color:#888">🌐 fmdx.org</span>
+              <span id="ai-ref-station" style="flex:1;margin:0 8px;overflow:hidden;
+                text-overflow:ellipsis;white-space:nowrap"></span>
+              <span id="ai-ref-dist" style="margin-right:8px;color:#888"></span>
+              <span>match: <span id="ai-ref-match">—</span></span>
+            </div>
             <div class="ai-stats-r" style="flex-direction:column;gap:3px">
               PS slots:<br>
               <span id="ai-ps-breakdown"
-                style="color:#888;font-size:10px;font-family:'Titillium Web',Calibri,sans-serif;"></span>
+                style="color:#888;font-size:10px;
+                font-family:'Titillium Web',Calibri,sans-serif;"></span>
             </div>
             <div class="ai-stats-leg">
               bright = high confidence · dark = low<br>
+              🌐 = fmdx.org confirmed (gold) · 🔶 = fmdx.org seed (amber)<br>
               ✅ = raw-verified (2× err≤1, same char)
             </div>
           </div>
@@ -687,99 +956,120 @@
         makeDrag(d, document.getElementById('rdsm-hdr'));
     }
 
-    function makeDrag(el,h) {
-        let sx,sy,sl,st2,dr=false;
-        h.addEventListener('mousedown',e=>{
-            if (e.target.id==='rdsm-close') return;
-            dr=true;el.classList.add('drag');sx=e.clientX;sy=e.clientY;
-            const r=el.getBoundingClientRect();sl=r.left;st2=r.top;e.preventDefault();
+    function makeDrag(el, h) {
+        let sx, sy, sl, st2, dr = false;
+        h.addEventListener('mousedown', e => {
+            if (e.target.id === 'rdsm-close') return;
+            dr = true; el.classList.add('drag');
+            sx = e.clientX; sy = e.clientY;
+            const r = el.getBoundingClientRect(); sl = r.left; st2 = r.top;
+            e.preventDefault();
         });
-        document.addEventListener('mousemove',e=>{
+        document.addEventListener('mousemove', e => {
             if (!dr) return;
-            el.style.left=Math.max(0,sl+e.clientX-sx)+'px';
-            el.style.top =Math.max(0,st2+e.clientY-sy)+'px';
-            el.style.right='auto';
+            el.style.left  = Math.max(0, sl + e.clientX - sx) + 'px';
+            el.style.top   = Math.max(0, st2 + e.clientY - sy) + 'px';
+            el.style.right = 'auto';
         });
-        document.addEventListener('mouseup',()=>{dr=false;el.classList.remove('drag');});
+        document.addEventListener('mouseup', () => { dr = false; el.classList.remove('drag'); });
     }
 
     function addBtn() {
-        let found=false;
-        const obs=new MutationObserver((_,o)=>{
-            if (typeof addIconToPluginPanel!=='function') return;
-            found=true; o.disconnect();
-            addIconToPluginPanel('rdsm-btn','RDS Decoder','solid','radio',
-               `${pluginName} v${pluginVersion}`);
-            const btnObs=new MutationObserver((_,o2)=>{
-                const btn=document.getElementById('rdsm-btn');
+        let found = false;
+        const obs = new MutationObserver((_, o) => {
+            if (typeof addIconToPluginPanel !== 'function') return;
+            found = true; o.disconnect();
+            addIconToPluginPanel('rdsm-btn', 'RDS Decoder', 'solid', 'radio',
+                `${pluginName} v${pluginVersion}`);
+            const btnObs = new MutationObserver((_, o2) => {
+                const btn = document.getElementById('rdsm-btn');
                 if (!btn) return;
                 o2.disconnect();
-                btn.classList.add('hide-phone','bg-color-2');
-                btn.addEventListener('click',()=>{
+                btn.classList.add('hide-phone', 'bg-color-2');
+                btn.addEventListener('click', () => {
                     if (!panelVis) {
-                        panelVis=true; btn.classList.add('active');
-                        $('#rdsm-panel').stop(true,true).fadeIn(400,()=>{
+                        panelVis = true; btn.classList.add('active');
+                        $('#rdsm-panel').stop(true, true).fadeIn(400, () => {
                             document.getElementById('rdsm-panel').classList.add('vis');
                         });
                     } else { hidePanel(); }
                 });
                 syncFollowUI();
             });
-            btnObs.observe(document.body,{childList:true,subtree:true});
+            btnObs.observe(document.body, {childList:true, subtree:true});
         });
-        obs.observe(document.body,{childList:true,subtree:true});
-        setTimeout(()=>{if(!found)obs.disconnect();},10000);
+        obs.observe(document.body, {childList:true, subtree:true});
+        setTimeout(() => { if (!found) obs.disconnect(); }, 10000);
     }
 
     function hidePanel() {
-        panelVis=false;
-        const btn=document.getElementById('rdsm-btn');
+        panelVis = false;
+        const btn = document.getElementById('rdsm-btn');
         if (btn) btn.classList.remove('active');
-        $('#rdsm-panel').stop(true,true).fadeOut(400,()=>{
-            const p=document.getElementById('rdsm-panel');
-            if (p){p.classList.remove('vis');p.style.display='none';}
+        $('#rdsm-panel').stop(true, true).fadeOut(400, () => {
+            const p = document.getElementById('rdsm-panel');
+            if (p) { p.classList.remove('vis'); p.style.display = 'none'; }
         });
         syncFollowUI();
     }
 
+    // ── WebSocket connection ─────────────────────────────────
+    let _wsFailToast = false;
     function connect() {
-        if (ws&&(ws.readyState===WebSocket.OPEN||ws.readyState===WebSocket.CONNECTING)) return;
-        if (reconn){clearTimeout(reconn);reconn=null;}
-        ws=new WebSocket(WS);
-        ws.onopen=()=>{
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+        if (reconn) { clearTimeout(reconn); reconn = null; }
+        _wsFailToast = false;
+        ws = new WebSocket(WS);
+        ws.onopen = () => {
             setDot(true);
-            // ── Toast: successful WebSocket connection ───────────────
-            sendToast('info', pluginName,
-                `v${pluginVersion} connected to ${WS}`);
+            _wsFailToast = false;
             console.log(`[${pluginName}] v${pluginVersion} → ${WS}`);
             ws.send(JSON.stringify({type:'rdsm_get_rds_follow'}));
         };
-        ws.onclose=()=>{setDot(false);reconn=setTimeout(connect,5000);};
-        ws.onerror=()=>setDot(false);
-        ws.onmessage=e=>onMessage(e.data);
+        ws.onclose = () => {
+            setDot(false);
+            if (!_wsFailToast) {
+                _wsFailToast = true;
+                sendToast('error', pluginName, 'Connection to RDS AI Decoder failed.');
+            }
+            reconn = setTimeout(connect, 5000);
+        };
+        ws.onerror  = () => setDot(false);
+        ws.onmessage = e => onMessage(e.data);
     }
 
-    const setEl  =(id,t)=>{const e=document.getElementById(id);if(e)e.textContent=t;};
-    const setDot =ok=>{
-        const e=document.getElementById('rdsm-dot');
-        if(e){e.style.background=ok?'#44ff88':'#ff4444';e.className=ok?'ok':'';}
+    // ── DOM helpers ──────────────────────────────────────────
+    const setEl   = (id, t) => { const e = document.getElementById(id); if (e) e.textContent = t; };
+    const setDot  = ok => {
+        const e = document.getElementById('rdsm-dot');
+        if (e) { e.style.background = ok ? '#44ff88' : '#ff4444'; e.className = ok ? 'ok' : ''; }
     };
-    const setFlag=(id,on)=>{const e=document.getElementById(id);if(e)e.className='rf'+(on?' on':'');};
+    const setFlag = (id, on) => { const e = document.getElementById(id); if (e) e.className = 'rf' + (on ? ' on' : ''); };
 
+    // ── Admin detection ───────��──────────────────────────────
+    let isAdmin = false;
+    function checkAdminMode() {
+        const bodyText = document.body.textContent || document.body.innerText;
+        isAdmin = bodyText.includes('You are logged in as an administrator.') ||
+                  bodyText.includes('You are logged in as an adminstrator.');
+    }
+    checkAdminMode();
+
+    // ── Entry point ──────────────────────────────────────────
     function init() {
-        if (window.location.pathname==='/setup') return;
+        if (window.location.pathname === '/setup') return;
         injectCSS();
         createPanel();
         addBtn();
         connect();
-        fetch('/api').then(r=>r.json())
-            .then(d=>{if(d.freq){st.freq=d.freq;setEl('rdsm-freq',d.freq+' MHz');}})
-            .catch(()=>{});
+        fetch('/api').then(r => r.json())
+            .then(d => { if (d.freq) { st.freq = d.freq; setEl('rdsm-freq', d.freq + ' MHz'); } })
+            .catch(() => {});
     }
 
-    if (document.readyState==='loading')
-        document.addEventListener('DOMContentLoaded',()=>setTimeout(init,900));
+    if (document.readyState === 'loading')
+        document.addEventListener('DOMContentLoaded', () => setTimeout(init, 900));
     else
-        setTimeout(init,900);
+        setTimeout(init, 900);
 
 })();

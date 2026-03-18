@@ -2,18 +2,16 @@
 An AI-powered RDS monitor for fm-dx-webserver that uses machine learning to predict and correct PS and RadioText data even under poor reception conditions.
 <img width="1592" height="846" alt="Image" src="https://github.com/user-attachments/assets/3ba0548a-911b-4377-b128-2209bf131448" />
 
-## Version 1.0
+## Version 2.0
 
-- AI-powered PS correction – Missing or corrupted PS characters are predicted and corrected using machine learning (voting, bigram detection, DB cache)
-- Confidence-based rendering – Every PS and RT character is colour-coded by reliability, ranging from near-black (uncertain) to near-white (verified)
-- RadioText fusion – Current and previous RT text are displayed side by side; AI results and raw reception are intelligently merged
-- RDS Follow mode – Administrators can feed the AI output directly into the FM-DX Webserver with a single button press, replacing the native decoder
-- Real-time WebSocket connection – Receives raw data and AI results via /data_plugins; automatic reconnection on connection loss
-- Group monitor – All received RDS groups (0A–15B) are displayed live and highlighted on reception
-- BER indicator – Bit error rate of the last 60 frames shown as a colour-coded progress bar (green / orange / red)
-- Statistics panel – Breakdown of PS slots by source (raw, DB, AI votes, bigram, verified) plus AI connection status and group count
-- Toast notifications – Visual alerts on successful WebSocket connect and when a plugin update is available (with version comparison)
-- Draggable panel – Freely positionable, closable overlay panel with seamless integration into the fm-dx-webserver plugin system
+- fmdx.org Database Integration – Automatically downloads and caches the FM transmitter database from maps.fmdx.org, using transmitter coordinates, PI codes, and PS name variants for instant station identification – no learning phase needed for known stations.
+- PS Lock Engine – Once a PS name is verified (via raw RDS, fmdx.org match, or DB), it is locked and displayed without flickering, even during high BER conditions. Unlocks only on frequency or PI change.
+- Support for Dynamic PS – When a station broadcasts multiple PS name variants (e.g. alternating between Antenne and Antenne 1), the plugin dynamically switches the displayed name to match the currently received variant.
+- RDS Expert Support – In RDS Follow mode, the native decoder is still called with the unmodified raw data stream, ensuring full compatibility with RDS Expert and other external analysis tools connected via the raw WebSocket.
+- GPS-based Location Tracking – Listens to a GPS WebSocket (/data_plugins) and automatically rebuilds the fmdx.org index when the receiver location changes, always keeping the transmitter database relevant to the current position.
+- AF (Alternate Frequency) Support – Decodes and caches alternative frequencies from Group 0A, feeds them to the web server UI, and displays them as a live "AF N" flag in the plugin panel.
+- Hybrid PS Construction – When a fmdx.org reference exists, the plugin builds a hybrid PS string that uses the raw RDS character case where it matches the reference, and falls back to the reference where the live signal is too noisy.
+- Expanded Statistics Panel – The panel now shows fmdx.org reference data (station name, distance in km, match score in %), live PS variant chips with colour-coded match highlighting, and an AF flag with tooltip listing all alternate frequencies.
 
 ## Installation notes:
 
@@ -31,8 +29,9 @@ An AI-powered RDS monitor for fm-dx-webserver that uses machine learning to pred
 - Click the RDS Decoder button to open the RDS monitor panel 
 - As an administrator, you can activate RDS Follow Mode. This will feed the plugin's RDS data directly into the web server
 
-Detailed documentation on how the plugin works can be found [here](https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation.html)
+Detailed documentation on how the plugin works can be found [here](https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation-v2.0.html)
 A demo video can be viewed [here](https://highpoint.fmdx.org/videos/RDS-AI-Decoder-Demo.mp4)
+A live demo with the RDS Follow function activated is available [here](http://highpoint2000.selfhost.de:8080)
 
 ## Notes: 
 

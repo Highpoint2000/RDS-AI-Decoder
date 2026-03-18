@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V1.0)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.0)  //
 //                                                           //
-//  by Highpoint                last update: 2026-03-15      //
+//  by Highpoint                last update: 2026-03-18      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -10,38 +10,40 @@
 
 'use strict';
 
+// ── Debug switch ─────────────────────────────────────────────
+const DEBUG = false;
+
 const fs         = require('fs');
 const path       = require('path');
+const WebSocket  = require('ws');
 const pluginsApi = require('../../server/plugins_api');
 const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '1.0',
+    version:      '2.0',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
 
-const PLUGIN_NAME         = 'RDS AI Decoder';
-const DB_FILE             = path.join(__dirname, 'rdsm_memory.json');
-const DB_SAVE_INTERVAL    = 60 * 1000;
-const MAX_STATIONS        = 2000;
-const CONF_TABLE          = [1.00, 0.90, 0.70, 0.00];
-const VOTE_HALFLIFE_DAYS  = 7;
-const VOTE_EXPIRE_DAYS    = 30;
-const STATION_EXPIRE_DAYS = 90;
-const QUICK_EXPIRE_DAYS   = 7;
-const CONSISTENCY_BOOST   = 1.5;
-const AI_BROADCAST_DELAY  = 80; // ms
+const PLUGIN_NAME          = 'RDS AI Decoder';
+const DB_FILE              = path.join(__dirname, 'rdsm_memory.json');
+const FMDX_BULK_FILE       = path.join(__dirname, 'rdsm_fmdx_cache.json');
+const DB_SAVE_INTERVAL     = 60 * 1000;
+const MAX_STATIONS         = 2000;
+const CONF_TABLE           = [1.00, 0.90, 0.70, 0.00];
+const VOTE_HALFLIFE_DAYS   = 7;
+const VOTE_EXPIRE_DAYS     = 30;
+const STATION_EXPIRE_DAYS  = 90;
+const QUICK_EXPIRE_DAYS    = 7;
+const CONSISTENCY_BOOST    = 1.5;
+const AI_BROADCAST_DELAY   = 80; // ms
 
-// ── Validation thresholds ────────────────────────────────────
-// PI_CONFIRM_THRESHOLD: number of consecutive raw packets with
-// the same PI code and errB[0] ≤ 1 required before the PI is
-// considered valid and broadcast to any output.
-// 2 is the earliest reliable value – it rules out a single
-// corrupt/spurious packet while adding only ~100 ms delay on
-// a typical RDS stream (groups arrive ~11.4 groups/sec).
+const FMDX_RADIUS_KM       = 3000;
+const FMDX_BULK_TTL_MS     = 6 * 60 * 60 * 1000;
+
 const PI_CONFIRM_THRESHOLD = 2;
+const GHOST_PI_THRESHOLD   = 8; // consecutive error-free groups for an unrecognised PI
 
 let aiExclusiveMode    = false;
 let rdsFollowMode      = false;
@@ -50,28 +52,116 @@ let pluginsWss         = null;
 let pluginsMainWss     = null;
 let currentFreq        = null;
 let legacyPiCache      = null;
+let lastBroadcastPS    = null;
 
-// ── PI confirmation state ────────────────────────────────────
-// piConfirmCount: consecutive qualifying raw packets seen for
-//                 currentState.pi in the current reception.
-// piConfirmed:    true once piConfirmCount >= PI_CONFIRM_THRESHOLD.
-//                 Reset to false on every frequency change or
-//                 PI change.
-// piPendingBroadcast: when pre-cache loaded a prediction before
-//                 confirmation, this flag marks that a full AI
-//                 broadcast should fire the moment confirmation
-//                 is reached (no extra delay after confirm).
-let piConfirmCount       = 0;
-let piConfirmed          = false;
-let piPendingBroadcast   = false;
+let piConfirmCount     = 0;
+let piConfirmed        = false;
+let piPendingBroadcast = false;
 
-let dataHandler = null;
-try { dataHandler = require('../../server/datahandler'); }
-catch(e) { logWarn(`[${PLUGIN_NAME}] Could not load datahandler: ${e.message}`); }
+// ── PS lock flag ──────────────────────────────────────────────
+// Set true once PS is 100% certain (raw-verified or full fmdx.org match).
+// Cleared on every frequency change or PI change.
+let psLocked = false;
 
-// ═══════════════════════════════════════════════════════════════
-//  FREQUENCY HELPERS
-// ═══════════════════���═══════════════════════════════════════════
+let ownLat = null;
+let ownLon = null;
+
+let gpsWsClient      = null;
+let gpsWsReconnTimer = null;
+let gpsWsConnected   = false;  // eslint-disable-line no-unused-vars
+
+// ── GPS WebSocket listener ────────────────────────────────────
+function startGpsWsListener() {
+    let wsPort = 8080;
+    try {
+        const cfgPath = path.join(__dirname, '../../config.json');
+        if (fs.existsSync(cfgPath)) {
+            const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+            wsPort = cfg?.webserver?.webserverPort || 8080;
+        }
+    } catch(e) { /* ignore */ }
+
+    const wsUrl = `ws://127.0.0.1:${wsPort}/data_plugins`;
+
+    function connect() {
+        if (gpsWsClient) {
+            try { gpsWsClient.removeAllListeners(); gpsWsClient.terminate(); } catch(e) {}
+            gpsWsClient = null;
+        }
+        const ws = new WebSocket(wsUrl);
+        gpsWsClient = ws;
+
+        ws.on('open', () => { gpsWsConnected = true; });
+
+        ws.on('message', (raw) => {
+            try {
+                const msg = JSON.parse(raw);
+                if (msg.type === 'GPS' && msg.value) {
+                    const lat = parseFloat(msg.value.lat);
+                    const lon = parseFloat(msg.value.lon);
+                    if (!isNaN(lat) && !isNaN(lon) && msg.value.status === 'active') {
+                        if (lat !== ownLat || lon !== ownLon) {
+                            ownLat = lat;
+                            ownLon = lon;
+                            if (fmdxLoadedAt > 0) {
+                                try {
+                                    const cached = JSON.parse(fs.readFileSync(FMDX_BULK_FILE, 'utf8'));
+                                    if (cached && cached.raw) buildFmdxIndex(cached.raw);
+                                } catch(e) { /* no cache yet */ }
+                            }
+                        }
+                    }
+                }
+            } catch(e) { /* ignore parse errors */ }
+        });
+
+        ws.on('close', () => { gpsWsConnected = false; scheduleGpsWsReconnect(); });
+        ws.on('error', () => { gpsWsConnected = false; scheduleGpsWsReconnect(); });
+    }
+
+    function scheduleGpsWsReconnect() {
+        if (gpsWsReconnTimer) return;
+        gpsWsReconnTimer = setTimeout(() => { gpsWsReconnTimer = null; connect(); }, 15000);
+    }
+
+    setTimeout(connect, 5000);
+}
+
+// ── Load own location from config.json ───────────────────────
+function loadOwnLocation() {
+    try {
+        const cfgPath = path.join(__dirname, '../../config.json');
+        if (fs.existsSync(cfgPath)) {
+            const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+            const lat = parseFloat(cfg?.identification?.lat);
+            const lon = parseFloat(cfg?.identification?.lon);
+            if (!isNaN(lat) && !isNaN(lon)) {
+                ownLat = lat;
+                ownLon = lon;
+                logInfo(`[${PLUGIN_NAME}] Own location: ${lat}, ${lon}`);
+            } else {
+                logWarn(`[${PLUGIN_NAME}] No valid lat/lon in config.json – distance filter disabled`);
+            }
+        }
+    } catch(e) {
+        logWarn(`[${PLUGIN_NAME}] Could not read config.json for location: ${e.message}`);
+    }
+}
+
+// ── Haversine distance ────────────────────────────────────────
+function haversineKm(lat1, lon1, lat2, lon2) {
+    const R  = 6371;
+    const dL = (lat2 - lat1) * Math.PI / 180;
+    const dO = (lon2 - lon1) * Math.PI / 180;
+    const a  = Math.sin(dL/2) * Math.sin(dL/2)
+             + Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180)
+             * Math.sin(dO/2) * Math.sin(dO/2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+let fmdxByFreq   = {};
+let fmdxLoadedAt = 0;
+
 function roundFreq(freqStr) {
     if (!freqStr) return freqStr;
     const f = parseFloat(freqStr);
@@ -79,12 +169,165 @@ function roundFreq(freqStr) {
     return (Math.round(f * 10) / 10).toFixed(2);
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  RDS CHARACTER SET  (ETSI EN 50067 / librdsparser string.c)
-// ═══════════════════════════════════════════════════════════════
+function parsePSVariants(psRaw) {
+    if (!psRaw || typeof psRaw !== 'string') return [];
+    const tokens = psRaw.split(' ').filter(t => t.length > 0);
+    const variants = [];
+    for (const token of tokens) {
+        // Preserves case from fmdx.org (e.g. "Antenne")
+        const chunk = token.slice(0, 8).padEnd(8, ' ').replace(/_/g, ' ');
+        if (chunk.trim().length > 0) variants.push(chunk);
+    }
+    if (variants.length === 0) {
+        const single = psRaw.replace(/_/g, ' ').trim().slice(0, 8).padEnd(8, ' ');
+        if (single.trim().length > 0) variants.push(single);
+    }
+    return variants;
+}
+
+function nodeHttpGetJSON(url) {
+    return new Promise((resolve, reject) => {
+        const mod = url.startsWith('https') ? require('https') : require('http');
+        const req = mod.get(url, { timeout: 20000 }, res => {
+            let body = '';
+            res.on('data', d => { body += d; });
+            res.on('end', () => { try { resolve(JSON.parse(body)); } catch(e) { reject(e); } });
+        });
+        req.on('error',   reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    });
+}
+
+// ── Load fmdx.org bulk data (with cache) ─────────────────────
+async function loadFmdxBulk() {
+    if (ownLat === null || ownLon === null) {
+        logWarn(`[${PLUGIN_NAME}] fmdx.org bulk load skipped – no location in config.json`);
+        return;
+    }
+    if (fs.existsSync(FMDX_BULK_FILE)) {
+        try {
+            const cached = JSON.parse(fs.readFileSync(FMDX_BULK_FILE, 'utf8'));
+            const fresh  = cached._ts && (Date.now() - cached._ts) < FMDX_BULK_TTL_MS;
+            const hasRaw = cached.raw && typeof cached.raw === 'object';
+            if (fresh && hasRaw) {
+                fmdxLoadedAt = cached._ts;
+                buildFmdxIndex(cached.raw);
+                if (Object.keys(fmdxByFreq).length > 0) {
+                    logInfo(`[${PLUGIN_NAME}] fmdx.org DB restored from cache`);
+                    const remaining = FMDX_BULK_TTL_MS - (Date.now() - cached._ts);
+                    setTimeout(downloadFmdxBulk, Math.max(remaining, 60000));
+                    return;
+                }
+                logWarn(`[${PLUGIN_NAME}] Cache produced empty index – re-downloading`);
+            }
+        } catch(e) {
+            logWarn(`[${PLUGIN_NAME}] Cache read error: ${e.message}`);
+        }
+    }
+    await downloadFmdxBulk();
+}
+
+async function downloadFmdxBulk() {
+    if (ownLat === null || ownLon === null) return;
+    const url = `https://maps.fmdx.org/api/?qth=${ownLat},${ownLon}`;
+    let raw;
+    try {
+        if (typeof fetch === 'function') {
+            const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            raw = await res.json();
+        } else {
+            raw = await nodeHttpGetJSON(url);
+        }
+    } catch(e) {
+        logWarn(`[${PLUGIN_NAME}] fmdx.org download failed: ${e.message} – retry in 10 min`);
+        setTimeout(downloadFmdxBulk, 10 * 60 * 1000);
+        return;
+    }
+    const locations = extractLocations(raw);
+    const txCount   = Object.keys(locations).length;
+    if (txCount === 0) {
+        logWarn(`[${PLUGIN_NAME}] fmdx.org returned empty structure – retry in 10 min`);
+        setTimeout(downloadFmdxBulk, 10 * 60 * 1000);
+        return;
+    }
+    fmdxLoadedAt = Date.now();
+    buildFmdxIndex(raw);
+    try {
+        fs.writeFileSync(FMDX_BULK_FILE, JSON.stringify({ _ts: fmdxLoadedAt, raw }), 'utf8');
+        logInfo(`[${PLUGIN_NAME}] fmdx.org DB cached to disk`);
+    } catch(e) {
+        logWarn(`[${PLUGIN_NAME}] Could not save fmdx bulk cache: ${e.message}`);
+    }
+    setTimeout(downloadFmdxBulk, FMDX_BULK_TTL_MS);
+}
+
+function extractLocations(raw) {
+    if (!raw || typeof raw !== 'object') return {};
+    if (raw.locations && typeof raw.locations === 'object' && !Array.isArray(raw.locations))
+        return raw.locations;
+    const firstVal = Object.values(raw)[0];
+    if (firstVal && Array.isArray(firstVal.stations)) return raw;
+    return {};
+}
+
+function buildFmdxIndex(raw) {
+    const byFreq     = {};
+    let totalEntries = 0;
+    let skippedDist  = 0;
+    const locations  = extractLocations(raw);
+
+    for (const [txId, txData] of Object.entries(locations)) {
+        if (!txData || !Array.isArray(txData.stations)) continue;
+        const txLat  = parseFloat(txData.lat);
+        const txLon  = parseFloat(txData.lon);
+        const txName = txData.name || txId;
+        if (isNaN(txLat) || isNaN(txLon)) continue;
+        const distKm = Math.round(haversineKm(ownLat, ownLon, txLat, txLon));
+        if (distKm > FMDX_RADIUS_KM) { skippedDist++; continue; }
+        for (const st of txData.stations) {
+            if (!st.pi || !st.freq) continue;
+            const f = roundFreq(String(st.freq));
+            const entry = {
+                pi:         st.pi.toUpperCase(),
+                psVariants: parsePSVariants(st.ps),
+                station:    st.station || txName,
+                lat:        txLat,
+                lon:        txLon,
+                distKm,
+            };
+            if (!byFreq[f]) byFreq[f] = [];
+            byFreq[f].push(entry);
+            totalEntries++;
+        }
+    }
+    for (const f of Object.keys(byFreq))
+        byFreq[f].sort((a, b) => a.distKm - b.distKm);
+
+    fmdxByFreq = byFreq;
+    if (DEBUG) logInfo(
+        `[${PLUGIN_NAME}] fmdx.org index: ${totalEntries} entries on ` +
+        `${Object.keys(byFreq).length} frequencies (${skippedDist} tx outside ${FMDX_RADIUS_KM} km)`
+    );
+}
+
+// ── Look up fmdx.org reference entries for a given frequency ─
+function getFreqRefs(freq) {
+    const f    = roundFreq(freq);
+    const refs = fmdxByFreq[f] || [];
+    if (DEBUG) logInfo(`[${PLUGIN_NAME}] getFreqRefs: "${f}" → ${refs.length} entry(s)`);
+    return refs;
+}
+
+// ── Load datahandler ──────────────────────────────────────────
+let dataHandler = null;
+try { dataHandler = require('../../server/datahandler'); }
+catch(e) { logWarn(`[${PLUGIN_NAME}] Could not load datahandler: ${e.message}`); }
+
+// ── RDS character set (ETSI EN 50067) ────────────────────────
 const RDS_CHARSET = [
     ' ','!','"','#','¤','%','&',"'",
-    '(',')','+','+',',','-','.','/',
+    '(',')', '*','+',',','-','.','/',
     '0','1','2','3','4','5','6','7',
     '8','9',':',';','<','=','>','?',
     '@','A','B','C','D','E','F','G',
@@ -119,9 +362,12 @@ function rdsChar(b) {
     return RDS_CHARSET[b - 0x20] || ' ';
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  RDS COUNTRY LOOKUP  (ECC + PI nibble → ISO 3166-1)
-// ═══════════════════════════════════════════════════════════════
+function decodeAFCode(code) {
+    if (code >= 1 && code <= 204) return (code + 875) / 10;
+    return null;
+}
+
+// ── RDS country / ECC lookup ──────────────────────────────────
 const RDS_COUNTRY = (() => {
     const T = {
         0xE0: { 0x1:'DE', 0x2:'DZ', 0x3:'AD', 0x4:'IL', 0x5:'IT',
@@ -185,10 +431,41 @@ function lookupCountry(pi, eccByte) {
 let db      = {};
 let dbDirty = false;
 
+// Database version for the initial wipe allowing proper mixed-case tracking
+const DB_VERSION = 1;
+
 function loadDB() {
     try {
         if (fs.existsSync(DB_FILE)) {
             const raw = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+
+            // --- ONE-TIME WIPE CHECK ---
+            // If the version is missing or old, we wipe the DB to remove legacy uppercase votes
+            if (!raw._meta || raw._meta.dbVersion !== DB_VERSION) {
+                logInfo(`[${PLUGIN_NAME}] Old database structure detected. Performing one-time wipe for mixed-case update...`);
+                
+                // PRESERVE RDS FOLLOW MODE
+                let preservedFollowMode = false;
+                if (raw._meta && typeof raw._meta.rdsFollowMode === 'boolean') {
+                    preservedFollowMode = raw._meta.rdsFollowMode;
+                }
+
+                // Apply the preserved state immediately to the running plugin
+                rdsFollowMode = preservedFollowMode;
+                nativeRDSDisabled = preservedFollowMode;
+                
+                if (preservedFollowMode) {
+                    logInfo(`[${PLUGIN_NAME}] RDS Follow state preserved across wipe: ON`);
+                }
+
+                // Create the fresh DB with the preserved setting
+                db = { _meta: { rdsFollowMode: preservedFollowMode, dbVersion: DB_VERSION } };
+                dbDirty = true;
+                saveDB();
+                return; // Start fresh
+            }
+            // -----------------------------
+
             if (raw._meta && typeof raw._meta === 'object') {
                 if (typeof raw._meta.rdsFollowMode === 'boolean') {
                     rdsFollowMode     = raw._meta.rdsFollowMode;
@@ -222,17 +499,18 @@ function loadDB() {
                     }
                 }
                 if (entry.freq) entry.freq = roundFreq(entry.freq);
+                if (!Array.isArray(entry.af)) entry.af = [];
             }
             db = raw;
             const n = Object.keys(db).filter(k => k !== '_meta').length;
             logInfo(`[${PLUGIN_NAME}] AI memory loaded: ${n} stations`);
         } else {
-            db = {};
+            db = { _meta: { rdsFollowMode: false, dbVersion: DB_VERSION } };
             logInfo(`[${PLUGIN_NAME}] AI memory: new database created`);
         }
     } catch(e) {
         logWarn(`[${PLUGIN_NAME}] Could not load AI DB: ${e.message} – starting fresh`);
-        db = {};
+        db = { _meta: { rdsFollowMode: false, dbVersion: DB_VERSION } };
     }
 }
 
@@ -243,12 +521,16 @@ function saveDB() {
         const expireMs      = STATION_EXPIRE_DAYS * 86400000;
         const quickExpireMs = QUICK_EXPIRE_DAYS   * 86400000;
         const toSave        = {};
-        toSave._meta        = { rdsFollowMode, savedAt: now };
+        
+        // Save the DB version alongside other meta info
+        toSave._meta        = { rdsFollowMode, savedAt: now, dbVersion: DB_VERSION };
+        
         for (const [pi, entry] of Object.entries(db)) {
             if (pi === '_meta') continue;
             if ((now - (entry.seen || 0)) > expireMs) continue;
             const hasPS     = entry.ps && Object.keys(entry.ps).length > 0;
-            const hasUseful = hasPS || entry.ecc || (entry.pty > 0);
+            const hasUseful = hasPS || entry.ecc || (entry.pty > 0) ||
+                              (Array.isArray(entry.af) && entry.af.length > 0);
             if (!hasUseful && (entry.seenCount || 0) <= 2 &&
                 (now - (entry.seen || 0)) > quickExpireMs) continue;
             const { psDynamicBuf, ...saveable } = entry; // eslint-disable-line no-unused-vars
@@ -281,17 +563,49 @@ function ensurePI(pi) {
             psIsDynamic: false,
             psLastRaw: new Array(8).fill(null), psLastRawTs: 0,
             pty: -1, tp: false, ta: false, ms: -1, stereo: false,
-            ecc: null, seen: Date.now(), seenCount: 0,
+            ecc: null, af: [],
+            seen: Date.now(), seenCount: 0,
         };
         Object.defineProperty(db[pi], 'psDynamicBuf', {
             value: [], writable: true, enumerable: false, configurable: true,
         });
-    } else if (!db[pi].psDynamicBuf) {
-        Object.defineProperty(db[pi], 'psDynamicBuf', {
-            value: [], writable: true, enumerable: false, configurable: true,
-        });
+    } else {
+        if (!db[pi].psDynamicBuf) {
+            Object.defineProperty(db[pi], 'psDynamicBuf', {
+                value: [], writable: true, enumerable: false, configurable: true,
+            });
+        }
+        if (!Array.isArray(db[pi].af)) db[pi].af = [];
     }
     return db[pi];
+}
+
+function findKnownPIForFreq(freq) {
+    if (!freq) return null;
+    const rounded = roundFreq(freq);
+    let bestPI = null, bestScore = 0;
+    for (const [pi, entry] of Object.entries(db)) {
+        if (pi === '_meta') continue;
+        if (entry.freq !== rounded) continue;
+        const resolved = entry.psResolved || '';
+        if (resolved.trim().length < 1) continue;
+        const avgConf = entry.psConf
+            ? entry.psConf.reduce((a, b) => a + b, 0) / 8 : 0;
+        const score = Math.log10(Math.max(1, entry.seenCount)) * 0.5 + avgConf * 0.5;
+        if (score > bestScore) { bestScore = score; bestPI = pi; }
+    }
+    return bestPI;
+}
+
+function cacheAF(pi, freqMHz) {
+    if (!pi || freqMHz === null || freqMHz === undefined) return;
+    const entry   = ensurePI(pi);
+    const rounded = Math.round(freqMHz * 10) / 10;
+    if (!entry.af.includes(rounded)) {
+        entry.af.push(rounded);
+        entry.af.sort((a, b) => a - b);
+        dbDirty = true;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -324,9 +638,8 @@ function votePS(pi, pos, char, weight, errLevel) {
             .reduce((s, [, v]) => s + v.w, 0);
         if (posVotes[char].w > competitorW * 2) finalWeight = weight * CONSISTENCY_BOOST;
     }
-    if (!posVotes[char]) {
+    if (!posVotes[char])
         posVotes[char] = { w: 0, count: 0, firstSeen: now, lastSeen: now };
-    }
     posVotes[char].w       += finalWeight;
     posVotes[char].count   += 1;
     posVotes[char].lastSeen = now;
@@ -373,9 +686,9 @@ function computePSConf(pi) {
         const vals  = Object.values(wv).sort((a, b) => b - a);
         const total = vals.reduce((a, b) => a + b, 0);
         if (total === 0) return 0;
-        const best      = vals[0], second = vals[1] || 0;
-        const share     = best / total;
-        const dominance = total > 1 ? (best - second) / total : share;
+        const best       = vals[0], second = vals[1] || 0;
+        const share      = best / total;
+        const dominance  = total > 1 ? (best - second) / total : share;
         const totalCount = Object.values(entry.ps[i] || {})
             .reduce((s, v) => s + (v.count || 0), 0);
         const voteFactor = Math.min(1, totalCount / 30);
@@ -389,13 +702,15 @@ function checkPSDynamic(pi, psString) {
     buf.push(psString);
     if (buf.length > 8) buf.shift();
     if (buf.length < 3) return;
-    const wasDynamic  = entry.psIsDynamic;
-    entry.psIsDynamic = detectScrollPS(buf) || detectChangingPS(buf);
-    if (entry.psIsDynamic && !wasDynamic) {
-        entry.ps = {}; entry.psResolved = null; entry.psConf = new Array(8).fill(0);
-        dbDirty = true;
-    } else if (!entry.psIsDynamic && wasDynamic && buf.length >= 5) {
-        dbDirty = true;
+    const wasDynamic = entry.psIsDynamic;
+    if (!wasDynamic) {
+        entry.psIsDynamic = detectScrollPS(buf) || detectChangingPS(buf);
+        if (entry.psIsDynamic) {
+            entry.ps = {};
+            entry.psResolved = null;
+            entry.psConf = new Array(8).fill(0);
+            dbDirty = true;
+        }
     }
 }
 
@@ -417,7 +732,264 @@ function detectScrollPS(buf) {
 
 function detectChangingPS(buf) {
     if (buf.length < 5) return false;
-    return new Set(buf.map(s => s.trim())).size >= 4;
+    const counts = {};
+    for (const s of buf) {
+        const clean = s.trim();
+        if (!clean) continue;
+        counts[clean] = (counts[clean] || 0) + 1;
+    }
+    let recurring = 0;
+    for (const count of Object.values(counts)) { if (count >= 2) recurring++; }
+    return recurring >= 2;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PS LOCK & DYNAMIC JUMP ENGINE
+// ═══════════════════════════════════════════════════════════════
+function checkAndLockPS(pi) {
+    const entry = pi ? db[pi] : null;
+    if (!entry) return;
+
+    const ref            = findRefEntry(pi);
+    const allRawVerified = currentState.psErrBuf.every(e => e <= 1) &&
+                           currentState.psBuf.every(c => c && c !== ' ') &&
+                           currentState.psRoundReceivedAfterConfirm;
+
+    // 1. Find the best matching fmdx.org variant for the current live buffer
+    let bestVariant  = null;
+    let bestScore    = 0;
+    if (ref?.psVariants?.length > 0) {
+        const psBufUpper = currentState.psBuf.join('').toUpperCase();
+        for (const v of ref.psVariants) {
+            const rv = v.toUpperCase().padEnd(8, ' ');
+            const pb = psBufUpper.padEnd(8, ' ');
+            let m = 0, c = 0;
+            for (let i = 0; i < 8; i++) {
+                if (rv[i] !== ' ') { c++; if (rv[i] === pb[i]) m++; }
+            }
+            const s = c > 0 ? m / c : 0;
+            if (s > bestScore) { bestScore = s; bestVariant = v; }
+        }
+    }
+
+    const refMatchIsGood = bestVariant && bestScore >= 0.75;
+
+    // Helper: Construct hybrid string keeping case of raw RDS where it matches FMDX
+    const buildHybridPS = (referenceStr) => {
+        let hybridPS = "";
+        const cleanRef = referenceStr.padEnd(8, ' ');
+        for (let i = 0; i < 8; i++) {
+            const rawChar = currentState.psBuf[i] || ' ';
+            const rawErr  = currentState.psErrBuf[i];
+            const refChar = cleanRef[i];
+            if (rawErr <= 2 && rawChar.toUpperCase() === refChar.toUpperCase()) {
+                hybridPS += rawChar; 
+            } else {
+                hybridPS += refChar;
+            }
+        }
+        return hybridPS;
+    };
+
+    // 2. Initial Lock Logic
+    if (!psLocked) {
+        let newPS = null;
+        let lockReason = "";
+
+        // Prio A: Verified PS from rdsm_memory.json
+        if (entry.psVerifiedRaw && entry.psVerifiedRaw.trim().length > 0) {
+            // Check if live buffer strongly matches a variant right now, keep hybrid sync
+            if (refMatchIsGood && bestScore >= 0.8) {
+                newPS = buildHybridPS(bestVariant);
+            } else {
+                newPS = entry.psVerifiedRaw;
+            }
+            lockReason = "DB verified string";
+            psLocked = true;
+        } 
+        // Prio B: FMDX Database Match
+        else if (refMatchIsGood) {
+            newPS = buildHybridPS(bestVariant);
+            lockReason = `FMDX match ${Math.round(bestScore*100)}%`;
+            psLocked = true;
+        } 
+        // Prio C: Full Raw Verification
+        else if (allRawVerified) {
+            newPS = currentState.psBuf.join('');
+            entry.psVerifiedRaw = newPS;
+            entry.psVerifiedRawTs = Date.now();
+            dbDirty = true;
+            lockReason = "Raw RDS fully verified";
+            psLocked = true;
+        }
+
+        if (psLocked && newPS) {
+            lastBroadcastPS = newPS;
+            if (DEBUG) logInfo(`[${PLUGIN_NAME}] PS locked for PI=${pi}: "${lastBroadcastPS}" (${lockReason})`);
+        }
+    } 
+    // 3. Dynamic Jump Logic (Already locked, but changing variants detected)
+    else {
+        // If FMDX has multiple variants and we strongly match a different one now
+        if (ref?.psVariants?.length > 1 && refMatchIsGood) {
+            const currentPSUpper = (lastBroadcastPS || "").toUpperCase().padEnd(8, ' ');
+            const bestVariantUpper = bestVariant.toUpperCase().padEnd(8, ' ');
+            
+            // If the live matched variant differs from what we currently broadcast -> JUMP
+            if (currentPSUpper !== bestVariantUpper) {
+                lastBroadcastPS = buildHybridPS(bestVariant);
+                
+                // Mark as dynamic until frequency change
+                entry.psIsDynamic = true; 
+                dbDirty = true;
+                
+                if (DEBUG) logInfo(`[${PLUGIN_NAME}] Dynamic FMDX Jump for PI=${pi}: locked switched to "${lastBroadcastPS}"`);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TX-SEARCH  (Follow mode off)
+// ══════════════════════════════════════════════════════════════
+let txUpdateTimer = null;
+function scheduleDataHandlerUpdate(pi) {
+    if (!dataHandler || rdsFollowMode || !piConfirmed || psLocked) return;
+    if (txUpdateTimer) clearTimeout(txUpdateTimer);
+    txUpdateTimer = setTimeout(() => {
+        txUpdateTimer = null;
+        if (!piConfirmed) return;
+        const entry = db[pi];
+        if (!entry) return;
+        if (pi && pi !== '?' && pi !== '----') {
+            dataHandler.dataToSend.pi  = pi;
+            dataHandler.initialData.pi = pi;
+        }
+        dataHandler.dataToSend.ps = '        ';
+        const psStr = buildPSString(pi);
+        if (psStr && psStr.trim().length > 0) {
+            if (psStr !== lastBroadcastPS) {
+                lastBroadcastPS = psStr;
+                dataHandler.dataToSend.ps = psStr;
+            } else {
+                dataHandler.dataToSend.ps = psStr;
+            }
+        }
+        if (entry.pty >= 0) dataHandler.dataToSend.pty = entry.pty;
+        if (currentState.freq) dataHandler.dataToSend.freq = currentState.freq;
+    }, 500);
+}
+
+// ── PS normalisation for webserver output ────────────────────
+// Do NOT force uppercase. Simply preserve spaces and case.
+function normPS(s) {
+    if (!s || typeof s !== 'string') return s;
+    return s;
+}
+
+// ── Build PS string from DB for TX-search mode ───────────────
+function buildPSString(pi) {
+    const entry = db[pi];
+    if (!entry) return '';
+    if (entry.psIsDynamic) {
+        const raw = entry.psLastRaw || [];
+        if (raw.every(c => c !== null)) return raw.map(c => c || ' ').join('');
+        return '';
+    }
+    // Prefer raw-verified string from DB to maintain mixed-case
+    if (entry.psVerifiedRaw) return entry.psVerifiedRaw;
+    return entry.psResolved || '';
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  fmdx.org REFERENCE MATCHING
+// ═══════════════════════════════════════════════════════════════
+function findBestRefEntry(pi) {
+    if (!currentState.freqRefs || !pi || !currentState.freq) return null;
+    const piUp  = pi.toUpperCase();
+    
+    // STRICT MATCH: Only allow the reference if the PI is explicitly listed
+    // on the exact currently tuned frequency in the fmdx.org database.
+    const exactMatches = currentState.freqRefs.filter(r => r.pi === piUp);
+    
+    if (exactMatches.length === 0) {
+        // If not found strictly on this frequency, explicitly reject it.
+        return null;
+    }
+    
+    // If found exactly on this frequency, sort by distance in case of multiple matches
+    if (exactMatches.length === 1) return exactMatches[0];
+    return exactMatches.sort((a, b) => (a.distKm ?? 99999) - (b.distKm ?? 99999))[0];
+}
+
+function findRefEntry(pi) { return findBestRefEntry(pi); }
+
+function computeRefMatchScore(pi) {
+    const ref   = findRefEntry(pi);
+    if (!ref?.psVariants?.length) return 0;
+    const buf   = currentState.psBuf;
+    const errB  = currentState.psErrBuf || new Array(8).fill(3);
+    const cleanPositions = buf.map((_, i) => errB[i] <= 1);
+    const cleanCount = cleanPositions.filter(Boolean).length;
+    if (cleanCount < 2) {
+        const entry = db[pi];
+        if (!entry?.psResolved) return 0;
+        const resolved = entry.psResolved.toUpperCase().padEnd(8, ' ');
+        let best = 0;
+        for (const variant of ref.psVariants) {
+            const rv = variant.toUpperCase().padEnd(8, ' ');
+            let m = 0, c = 0;
+            for (let i = 0; i < 8; i++) {
+                c++;
+                if (rv[i] === resolved[i]) m++;
+            }
+            const s = c > 0 ? m / c : 0;
+            if (s > best) best = s;
+        }
+        return best;
+    }
+    let best = 0;
+    for (const variant of ref.psVariants) {
+        const rv = variant.toUpperCase().padEnd(8, ' ');
+        let m = 0, c = 0;
+        for (let i = 0; i < 8; i++) {
+            if (!cleanPositions[i]) continue;
+            c++;
+            const received = (buf[i] || ' ').toUpperCase();
+            if (rv[i] === received) m++;
+        }
+        const s = c > 0 ? m / c : 0;
+        if (s > best) best = s;
+    }
+    return best;
+}
+
+// ── fmdx.org PI whitelist gate ────────────────────────────────
+function isPIAllowed(pi) {
+    if (!pi || pi === '----') return false;
+    const refs = currentState.freqRefs;
+    if (!refs || refs.length === 0) return true;
+    const piUp   = pi.toUpperCase();
+    const inFmdx = refs.some(r => r.pi === piUp);
+    if (!inFmdx) {
+        if (DEBUG) logInfo(
+            `[${PLUGIN_NAME}] PI ${piUp} not in fmdx.org for ${currentState.freq} MHz – allowing anyway`
+        );
+    }
+    return true;
+}
+
+// ── Confirmation threshold ────────────────────────────────────
+function getConfirmThreshold(pi) {
+    const refs = currentState.freqRefs;
+    if (refs && refs.length > 0) {
+        const piUp   = pi ? pi.toUpperCase() : '';
+        const inFmdx = refs.some(r => r.pi === piUp);
+        if (!inFmdx) return PI_CONFIRM_THRESHOLD;
+        const ref = findRefEntry(pi);
+        return (ref?.distKm ?? 9999) < 500 ? 1 : 2;
+    }
+    return PI_CONFIRM_THRESHOLD;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -429,11 +1001,12 @@ let currentState = {
     rtAB: -1,
     psSegsSeen: new Set(), psBuf: new Array(8).fill(' '),
     psErrBuf: new Array(8).fill(3), psRoundComplete: false,
+    psRoundReceivedAfterConfirm: false,
     lastPrediction: null,
     tp: false, ta: false, ms: -1, stereo: false,
+    freqRefs: [],
+    afSet: new Set(),
 };
-
-let _freqSeq = 0;
 
 // ═══════════════════════════════════════════════════════════════
 //  DATAHANDLER HELPERS
@@ -454,61 +1027,238 @@ function clearRDSInDataHandler() {
     } else {
         dataHandler.initialData.af = dataHandler.dataToSend.af;
     }
-    // Always reset confirmation when clearing
     piConfirmCount     = 0;
     piConfirmed        = false;
     piPendingBroadcast = false;
+    currentState.lastPrediction = null;
 }
 
-// ─────────────────────────────────────────────────────────────
-//  applyFollowToDataHandler
-//  Only called when piConfirmed = true.
-//  PI is always written first, then PS, then remaining fields.
-// ─────────────────────────────────────────────────────────────
+function applyAFToDataHandler(pi) {
+    if (!dataHandler || !pi || !rdsFollowMode) return;
+    const entry = db[pi];
+    if (!entry || !Array.isArray(entry.af) || entry.af.length === 0) return;
+    if (!Array.isArray(dataHandler.dataToSend.af)) dataHandler.dataToSend.af = [];
+    for (const f of entry.af) {
+        const fKHz = Math.round(f * 1000);
+        if (!dataHandler.dataToSend.af.includes(fKHz))
+            dataHandler.dataToSend.af.push(fKHz);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DATAHANDLER HELPERS
+// ═══════════════════════════════════════════════════════════════
 function applyFollowToDataHandler() {
     if (!dataHandler || !rdsFollowMode || !piConfirmed) return;
     const pi    = currentState.pi;
-    const pred  = currentState.lastPrediction;
     const entry = pi ? db[pi] : null;
+    const ref   = findRefEntry(pi);
+    const pred  = currentState.lastPrediction;
 
-    // 1. PI first
     dataHandler.dataToSend.pi  = (pi && pi !== '----' && pi !== '?') ? pi : '?';
     dataHandler.initialData.pi = dataHandler.dataToSend.pi;
 
-    // 2. PS
-    if (pred && pred.ps && Array.isArray(pred.ps)) {
-        const psStr = pred.ps.map(s =>
-            (s && s.src !== 'empty' && s.src !== 'ai-bigram' && s.char && s.char !== ' ')
-                ? s.char : ' '
-        ).join('');
-        dataHandler.dataToSend.ps        = psStr;
+    // Helper to get the best Mixed-Case string from DB
+    const getDbMixedCasePS = () => {
+        if (entry && entry.psVerifiedRaw && entry.psVerifiedRaw.trim().length > 0) {
+            return entry.psVerifiedRaw;
+        }
+        if (entry && entry.psResolved && entry.psResolved.trim().length > 0) {
+             if (entry.psResolved.indexOf('?') === -1) return entry.psResolved;
+        }
+        return null;
+    };
+
+    // If the PI is confirmed, we already know the exact station identity.
+    // Pre-seed lastBroadcastPS immediately so we don't display a blank PS during high BER.
+    if (!lastBroadcastPS) {
+        const dbStr = getDbMixedCasePS();
+        if (dbStr) {
+            lastBroadcastPS = dbStr;
+        } else if (ref?.psVariants?.length > 0) {
+            lastBroadcastPS = ref.psVariants[0].padEnd(8, ' ');
+        }
+    }
+    // ------------------------------------------
+
+    // Dynamic PS: learned by DB OR fmdx.org has multiple variants
+    const isDynamic = (entry?.psIsDynamic || false) ||
+                      (ref?.psVariants && ref.psVariants.length > 1);
+
+    // Check if it's dynamic WITHOUT any FMDX variants (e.g. scrolling artist name)
+    const isScrollingNonFmdx = entry?.psIsDynamic && (!ref?.psVariants || ref.psVariants.length <= 1);
+
+    // ── PS handling ───────────────────────────────────────────
+    if (psLocked && lastBroadcastPS && !isScrollingNonFmdx) {
+        // Static and locked: freeze
+        dataHandler.dataToSend.ps        = lastBroadcastPS;
         dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+        dataHandler.initialData.ps       = lastBroadcastPS;
+
+    } else if (isScrollingNonFmdx) {
+        // It's scrolling text not found in FMDX variants. Output raw clean buffer.
+        const raw = entry?.psLastRaw;
+        const rawClean = currentState.psErrBuf.every(e => e <= 2);
+        if (raw && raw.every(c => c !== null) && rawClean) {
+            const psStr = raw.map(c => c || ' ').join('');
+            lastBroadcastPS = psStr;
+            dataHandler.dataToSend.ps        = psStr;
+            dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+            dataHandler.initialData.ps       = psStr;
+        } else if (lastBroadcastPS) {
+            dataHandler.dataToSend.ps        = lastBroadcastPS;
+            dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+            dataHandler.initialData.ps       = lastBroadcastPS;
+        } else {
+            dataHandler.dataToSend.ps        = '        ';
+            dataHandler.dataToSend.ps_errors = '';
+        }
+
+    } else if (isDynamic) {
+        // Dynamic: pick the best-matching fmdx.org variant
+        if (ref?.psVariants?.length > 0) {
+            const psBufUpper = currentState.psBuf.join('').toUpperCase();
+            let bestVariant  = null;
+            let bestScore    = 0;
+            for (const v of ref.psVariants) {
+                const rv = v.toUpperCase().padEnd(8, ' ');
+                const pb = psBufUpper.padEnd(8, ' ');
+                let m = 0, c = 0;
+                for (let i = 0; i < 8; i++) {
+                    if (rv[i] !== ' ') { c++; if (rv[i] === pb[i]) m++; }
+                }
+                const s = c > 0 ? m / c : 0;
+                if (s > bestScore) { bestScore = s; bestVariant = v; }
+            }
+            if (bestVariant && bestScore >= 0.5) {
+                const dbStr = getDbMixedCasePS();
+                const psStr = dbStr ? dbStr : bestVariant.padEnd(8, ' ');
+                lastBroadcastPS = psStr;
+                dataHandler.dataToSend.ps        = psStr;
+                dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+                dataHandler.initialData.ps       = psStr;
+            } else if (lastBroadcastPS) {
+                dataHandler.dataToSend.ps        = lastBroadcastPS;
+                dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+                dataHandler.initialData.ps       = lastBroadcastPS;
+            } else {
+                dataHandler.dataToSend.ps        = '        ';
+                dataHandler.dataToSend.ps_errors = '';
+            }
+        }
+    } else if (pred && pred.ps && Array.isArray(pred.ps)) {
+        // Static, not yet locked: use AI prediction
+        const refScore   = computeRefMatchScore(pi);
+        const isRefReady = refScore >= 0.8;
+
+        if (isRefReady && ref?.psVariants?.length > 0) {
+            const dbStr = getDbMixedCasePS();
+            let psStr;
+            if (dbStr) {
+                psStr = dbStr;
+            } else {
+                const psBufUpper = currentState.psBuf.join('').toUpperCase();
+                let bestVariant  = ref.psVariants[0];
+                let bestScore    = 0;
+                for (const v of ref.psVariants) {
+                    const rv = v.toUpperCase().padEnd(8, ' ');
+                    const pb = psBufUpper.padEnd(8, ' ');
+                    let m = 0, c = 0;
+                    for (let i = 0; i < 8; i++) {
+                        if (rv[i] !== ' ') { c++; if (rv[i] === pb[i]) m++; }
+                    }
+                    const s = c > 0 ? m / c : 0;
+                    if (s > bestScore) { bestScore = s; bestVariant = v; }
+                }
+                
+                let hybridPS = "";
+                const cleanVariant = bestVariant.padEnd(8, ' ');
+                for (let i = 0; i < 8; i++) {
+                    const rawChar = currentState.psBuf[i] || ' ';
+                    const rawErr  = currentState.psErrBuf[i];
+                    const refChar = cleanVariant[i];
+                    if (rawErr <= 2 && rawChar.toUpperCase() === refChar.toUpperCase()) {
+                        hybridPS += rawChar; 
+                    } else {
+                        hybridPS += refChar;
+                    }
+                }
+                psStr = hybridPS;
+            }
+
+            lastBroadcastPS = psStr;
+            dataHandler.dataToSend.ps        = psStr;
+            dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+            dataHandler.initialData.ps       = psStr;
+        } else {
+            // Rebuild from AI Prediction slots
+            // FIX: Removed strict space filter so short names work, lowered threshold to 4.
+            const goodSlots = pred.ps.filter(s =>
+                s && s.src !== 'empty' && s.src !== 'ai-bigram' && s.conf >= 0.5
+            ).length;
+
+            if (goodSlots >= 4 || lastBroadcastPS) {
+                const psStr = pred.ps.map(s =>
+                    (s && s.src !== 'empty' && s.src !== 'ai-bigram' && s.char) ? s.char : ' '
+                ).join('');
+                if (!lastBroadcastPS || goodSlots >= 4) lastBroadcastPS = psStr;
+                dataHandler.dataToSend.ps        = lastBroadcastPS;
+                dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+                dataHandler.initialData.ps       = lastBroadcastPS;
+            }
+        }
+
+    } else if (lastBroadcastPS) {
+        dataHandler.dataToSend.ps        = lastBroadcastPS;
+        dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+        dataHandler.initialData.ps       = lastBroadcastPS;
     } else {
-        dataHandler.dataToSend.ps        = '';
+        dataHandler.dataToSend.ps        = '        ';
         dataHandler.dataToSend.ps_errors = '';
     }
 
-    // 3. Remaining fields
+    // ── Normalize PS string (safety net) ──────────
+    if (dataHandler.dataToSend.ps)
+        dataHandler.dataToSend.ps = normPS(dataHandler.dataToSend.ps);
+    if (dataHandler.initialData.ps)
+        dataHandler.initialData.ps = normPS(dataHandler.initialData.ps);
+    if (lastBroadcastPS)
+        lastBroadcastPS = normPS(lastBroadcastPS);
+
+    // ── PTY / TP / TA / MS ────────────────────────────────────
     dataHandler.dataToSend.pty = (entry && entry.pty >= 0) ? entry.pty : 0;
     dataHandler.dataToSend.tp  = currentState.tp ? 1 : 0;
     dataHandler.dataToSend.ta  = currentState.ta ? 1 : 0;
     dataHandler.dataToSend.ms  = currentState.ms;
 
-    if (pred && pred.rt && pred.rt.text && pred.rt.text.trim().length > 0) {
+    // ── RT ────────────────────────────────────────────────────
+    const rtLive = buildRTString();
+    const rtSrc  = rtLive.trim().length >= 3 ? rtLive
+                 : (pred?.rt?.text?.trim().length >= 3 ? pred.rt.text : null);
+
+    if (rtSrc) {
         const rtFlag = currentState.rtAB >= 0 ? currentState.rtAB : 0;
         if (rtFlag === 0) {
-            dataHandler.dataToSend.rt0        = pred.rt.text;
+            dataHandler.dataToSend.rt0        = rtSrc;
             dataHandler.dataToSend.rt0_errors = '';
         } else {
-            dataHandler.dataToSend.rt1        = pred.rt.text;
+            dataHandler.dataToSend.rt1        = rtSrc;
             dataHandler.dataToSend.rt1_errors = '';
         }
-        dataHandler.dataToSend.rt_flag = rtFlag;
+        dataHandler.dataToSend.rt_flag  = rtFlag;
+        dataHandler.initialData.rt0     = dataHandler.dataToSend.rt0;
+        dataHandler.initialData.rt1     = dataHandler.dataToSend.rt1;
+        dataHandler.initialData.rt_flag = rtFlag;
     } else {
-        dataHandler.dataToSend.rt0 = dataHandler.dataToSend.rt1 = '';
-        dataHandler.dataToSend.rt0_errors = dataHandler.dataToSend.rt1_errors = '';
+        dataHandler.dataToSend.rt0        = '';
+        dataHandler.dataToSend.rt1        = '';
+        dataHandler.dataToSend.rt0_errors = '';
+        dataHandler.dataToSend.rt1_errors = '';
+        dataHandler.initialData.rt0       = '';
+        dataHandler.initialData.rt1       = '';
     }
 
+    // ── ECC / Country ─────────────────────────────────────────
     const eccByte = (entry && entry.ecc) ? parseInt(entry.ecc, 16) : null;
     dataHandler.dataToSend.ecc = eccByte;
     if (pi && eccByte) {
@@ -519,38 +1269,9 @@ function applyFollowToDataHandler() {
         dataHandler.dataToSend.country_iso  = 'UN';
         dataHandler.dataToSend.country_name = '';
     }
+
     dataHandler.dataToSend.rds = !!(pi && pi !== '?');
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  TX-SEARCH  (Follow mode off)
-// ═══════════════════════════════════════════════════════════════
-let txUpdateTimer = null;
-function scheduleDataHandlerUpdate(pi) {
-    if (!dataHandler || rdsFollowMode || !piConfirmed) return;
-    if (txUpdateTimer) clearTimeout(txUpdateTimer);
-    txUpdateTimer = setTimeout(() => {
-        txUpdateTimer = null;
-        if (!piConfirmed) return;  // re-check inside callback
-        const entry = db[pi];
-        if (!entry) return;
-        // PI first
-        if (pi && pi !== '?' && pi !== '----') {
-            dataHandler.dataToSend.pi  = pi;
-            dataHandler.initialData.pi = pi;
-        }
-        const psStr = buildPSString(pi);
-        if (psStr && psStr.trim().length > 0) dataHandler.dataToSend.ps = psStr;
-        if (entry.pty >= 0) dataHandler.dataToSend.pty = entry.pty;
-        if (currentState.freq) dataHandler.dataToSend.freq = currentState.freq;
-    }, 500);
-}
-
-function buildPSString(pi) {
-    const entry = db[pi];
-    if (!entry) return '';
-    if (entry.psIsDynamic) return (entry.psLastRaw || []).map(c => c || ' ').join('');
-    return entry.psResolved || '';
+    applyAFToDataHandler(pi);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -579,21 +1300,52 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
     }
     dbDirty = true;
 
-    if (gT === 0) {
+    // ── Group 0A ─────────────────────────────────────────────
+    if (gT === 0 && vB === 0) {
         if (blkAok && blkBok) {
-            const ta = !!((g2 >> 4) & 0x01);
-            const ms = !!((g2 >> 3) & 0x01);
-            const seg =   g2 & 0x03;
-            const di = !!((g2 >> 2) & 0x01);
+            const ta  = !!((g2 >> 4) & 0x01);
+            const ms  = !!((g2 >> 3) & 0x01);
+            const seg =    g2 & 0x03;
+            const di  = !!((g2 >> 2) & 0x01);
             entry.ta = ta; currentState.ta = ta;
             entry.ms = ms ? 1 : 0; currentState.ms = ms ? 1 : 0;
             if (seg === 3) { entry.stereo = di; currentState.stereo = di; }
         }
+        if (b3hex && errB[2] <= 1 && blkAok && blkBok) {
+            const af1code = (g3 >> 8) & 0xFF;
+            const af2code =  g3 & 0xFF;
+            if (af1code !== 250) {
+                const f1 = decodeAFCode(af1code);
+                if (f1 !== null) {
+                    cacheAF(pi, f1);
+                    currentState.afSet.add(Math.round(f1 * 10) / 10);
+                    if (rdsFollowMode && piConfirmed && dataHandler &&
+                        Array.isArray(dataHandler.dataToSend.af)) {
+                        const f1KHz = Math.round(f1 * 1000);
+                        if (!dataHandler.dataToSend.af.includes(f1KHz))
+                            dataHandler.dataToSend.af.push(f1KHz);
+                    }
+                }
+            }
+            if (af2code !== 250) {
+                const f2 = decodeAFCode(af2code);
+                if (f2 !== null) {
+                    cacheAF(pi, f2);
+                    currentState.afSet.add(Math.round(f2 * 10) / 10);
+                    if (rdsFollowMode && piConfirmed && dataHandler &&
+                        Array.isArray(dataHandler.dataToSend.af)) {
+                        const f2KHz = Math.round(f2 * 1000);
+                        if (!dataHandler.dataToSend.af.includes(f2KHz))
+                            dataHandler.dataToSend.af.push(f2KHz);
+                    }
+                }
+            }
+        }
         if (b4hex && c4 > 0) {
-            const seg  = g2 & 0x03;
-            const addr = seg * 2;
-            const c0   = rdsChar((g4 >> 8) & 0xFF);
-            const c1   = rdsChar(g4 & 0xFF);
+            const seg    = g2 & 0x03;
+            const addr   = seg * 2;
+            const c0     = rdsChar((g4 >> 8) & 0xFF);
+            const c1     = rdsChar(g4 & 0xFF);
             const weight = errB[3] === 0 ? 10 : errB[3] === 1 ? 5 : 0;
             if (weight > 0 && blkAok && blkBok) {
                 if (c0 !== '\r') votePS(pi, addr,     c0, weight, errB[3]);
@@ -616,13 +1368,58 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
                     entry.psLastRawTs = Date.now();
                     dbDirty = true;
                 }
+                if (!currentState.psRoundReceivedAfterConfirm && piConfirmed)
+                    currentState.psRoundReceivedAfterConfirm = true;
                 currentState.psSegsSeen.clear();
                 currentState.psRoundComplete = false;
+                checkAndLockPS(pi);
                 scheduleDataHandlerUpdate(pi);
             }
         }
     }
 
+    // ── Group 0B ──────────────────────��──────────────────────
+    if (gT === 0 && vB === 1) {
+        if (blkAok && blkBok) {
+            const ta  = !!((g2 >> 4) & 0x01);
+            const ms  = !!((g2 >> 3) & 0x01);
+            const seg =    g2 & 0x03;
+            const di  = !!((g2 >> 2) & 0x01);
+            entry.ta = ta; currentState.ta = ta;
+            entry.ms = ms ? 1 : 0; currentState.ms = ms ? 1 : 0;
+            if (seg === 3) { entry.stereo = di; currentState.stereo = di; }
+        }
+        if (b4hex && c4 > 0) {
+            const seg  = g2 & 0x03;
+            const addr = seg * 2;
+            const c0   = rdsChar((g4 >> 8) & 0xFF);
+            const c1   = rdsChar(g4 & 0xFF);
+            const weight = errB[3] === 0 ? 10 : errB[3] === 1 ? 5 : 0;
+            if (weight > 0 && blkAok && blkBok) {
+                if (c0 !== '\r') votePS(pi, addr,     c0, weight, errB[3]);
+                if (c1 !== '\r') votePS(pi, addr + 1, c1, weight, errB[3]);
+            }
+            if (c0 !== '\r') { currentState.psBuf[addr]     = c0; currentState.psErrBuf[addr]     = errB[3]; currentState.psSegsSeen.add(seg); }
+            if (c1 !== '\r') { currentState.psBuf[addr + 1] = c1; currentState.psErrBuf[addr + 1] = errB[3]; }
+            if (currentState.psSegsSeen.size >= 4 && !currentState.psRoundComplete) {
+                currentState.psRoundComplete = true;
+                checkPSDynamic(pi, currentState.psBuf.join(''));
+                if (currentState.psErrBuf.every(e => e <= 1)) {
+                    entry.psLastRaw   = [...currentState.psBuf];
+                    entry.psLastRawTs = Date.now();
+                    dbDirty = true;
+                }
+                if (!currentState.psRoundReceivedAfterConfirm && piConfirmed)
+                    currentState.psRoundReceivedAfterConfirm = true;
+                currentState.psSegsSeen.clear();
+                currentState.psRoundComplete = false;
+                checkAndLockPS(pi);
+                scheduleDataHandlerUpdate(pi);
+            }
+        }
+    }
+
+    // ── Group 2A (RadioText) ──────────────────────────────────
     if (gT === 2 && vB === 0) {
         const abF  = (g2 >> 4) & 0x01;
         const addr = (g2 & 0x0F) * 4;
@@ -640,6 +1437,7 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
         }
     }
 
+    // ── Group 2B (RadioText, 2 chars per group) ───────────────
     if (gT === 2 && vB === 1) {
         const abF  = (g2 >> 4) & 0x01;
         const addr = (g2 & 0x0F) * 2;
@@ -653,6 +1451,7 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
         }
     }
 
+    // ── Group 1A (ECC) ────────────────────────────────────────
     if (gT === 1 && vB === 0 && b3hex && errB[2] <= 1) {
         const variant = (g2 >> 1) & 0x07;
         if (variant === 0) {
@@ -673,152 +1472,250 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  AI PREDICTION
-// ═══════════════════════════════════════════════════════════════
-function buildAIPrediction(pi) {
-    const entry = db[pi];
-    let psSlots;
-    if (entry?.psIsDynamic) {
-        const lastRaw    = entry.psLastRaw || new Array(8).fill(null);
-        const lastRawAge = Date.now() - (entry.psLastRawTs || 0);
-        const ageFactor  = Math.max(0, 1 - (lastRawAge / 120000));
-        const conf       = Math.min(0.92, 0.85 * ageFactor);
-        psSlots = Array.from({length: 8}, (_, i) => {
-            const ch = lastRaw[i];
-            return (ch && ch !== ' ' && conf > 0.1)
-                ? { char: ch, conf, src: 'ai-voted-high' }
-                : { char: ' ', conf: 0, src: 'ai-bigram' };
-        });
-    } else {
-        const psResolved = entry?.psResolved || null;
-        const psConf     = entry?.psConf     || new Array(8).fill(0);
-        const totalVotes = entry
-            ? Object.values(entry.ps).reduce((sum, posVotes) => {
-                const wv = getWeightedVotes(posVotes);
-                return sum + Object.values(wv).reduce((a, b) => a + b, 0);
-              }, 0)
-            : 0;
-        psSlots = Array.from({length: 8}, (_, i) => {
-            if (psResolved && psResolved[i] && psResolved[i] !== ' ' && psConf[i] > 0) {
-                if (totalVotes >= 15 && psConf[i] >= 0.70)
-                    return { char: psResolved[i], conf: psConf[i], src: 'ai-cached-db' };
-                const src = psConf[i] >= 0.9 ? 'ai-voted-high'
-                          : psConf[i] >= 0.7 ? 'ai-voted-mid'
-                          :                    'ai-voted-low';
-                return { char: psResolved[i], conf: Math.min(0.93, psConf[i] * 0.95), src };
-            }
-            const bg = bigramPredict(i > 0 && psResolved ? psResolved[i-1] : ' ');
-            return { char: bg.char, conf: bg.conf, src: 'ai-bigram' };
-        });
-    }
-    let rtPrediction = null;
-    let rtText = '';
-    for (let i = 0; i < 64; i++) {
-        const sl = currentState.rtSlots[i];
-        if (!sl || sl.conf === 0) { if (rtText.length > 0) break; continue; }
-        if (sl.char === '\r') break;
-        rtText += sl.char;
-    }
-    rtText = rtText.trimEnd();
-    if (rtText.length >= 4) {
-        const goodChars = currentState.rtSlots.filter(s => s.conf >= 0.90).length;
-        const score     = Math.min(0.85, 0.4 + (goodChars / Math.max(1, rtText.length)) * 0.45);
-        rtPrediction    = { text: rtText, score, src: 'ai-rt-live' };
-    }
-    const stats = entry ? {
-        seenCount:    entry.seenCount,
-        psVoteTotal:  Object.values(entry.ps).reduce((a, posVotes) => {
-            const wv = getWeightedVotes(posVotes);
-            return a + Object.values(wv).reduce((x, y) => x + y, 0);
-        }, 0),
-        freq: entry.freq, pty: entry.pty,
-        psIsDynamic:  entry.psIsDynamic || false,
-        psLastRawAge: entry.psLastRawTs
-            ? Math.round((Date.now() - entry.psLastRawTs) / 1000) : null,
-    } : null;
-    return { type: 'rdsm_ai', pi, ps: psSlots, rt: rtPrediction, stats, ts: Date.now() };
-}
-
-const BIGRAMS = {
-    ' ':{'R':25,'F':20,'M':15,'D':12,'N':10,'S':8,'K':7,'L':6,'B':5,'E':4,'A':3,'H':3,'W':3},
-    'R':{'D':20,'A':15,'I':12,'O':10,'E':8,'S':6,' ':5,'1':3,'N':3},
+// ── Bigram frequency table ────────────────────────────────────
+const BIGRAM = {
+    ' ':{'R':25,'S':20,'M':18,'F':15,'D':14,'N':12,'B':11,'K':10,'H':9,'L':8,'C':7,'W':6,'T':5,'A':5,'G':4,'E':4,'P':4,'1':3,'2':3,'3':3},
+    'R':{'A':20,'E':18,'O':15,'D':12,'S':10,'I':9,'U':8,'T':7,' ':6,'N':5,'K':4,'C':4,'L':4,'1':3,'2':3},
+    'A':{'D':15,'N':14,'S':12,'L':10,'M':9,'T':8,'R':7,'1':6,'2':5,'3':4,'K':4,' ':4,'X':3,'P':3},
+    'S':{'T':18,'E':16,'P':12,'O':10,'A':9,' ':8,'U':7,'W':6,'K':6,'N':5,'1':4,'2':3,'H':3,'I':3},
+    'I':{'N':20,'O':15,'S':12,'E':10,'R':8,' ':7,'C':6,'T':6,'1':5,'F':4,'L':4,'D':3},
+    'O':{'N':18,'S':15,'R':12,'L':10,' ':9,'U':8,'K':7,'T':6,'M':5,'D':5,'1':4,'P':4,'F':3},
+    'T':{'E':20,'H':18,'A':15,'S':12,'R':10,'O':8,'I':7,'U':6,' ':5,'1':4,'2':3,'W':3,'N':3},
+    'E':{'R':18,'N':15,'S':12,'L':10,'A':9,'T':8,'X':7,'C':6,' ':5,'W':5,'G':4,'1':4,'2':3},
+    'N':{'D':15,'E':14,'A':12,'S':10,' ':9,'O':8,'T':7,'I':6,'G':5,'R':4,'1':4,'2':3,'W':3},
+    'D':{'R':20,'E':15,'A':12,'I':10,'S':8,'U':7,'1':6,'2':5,'3':4,' ':4},
+    'L':{'A':15,'E':14,'I':12,'O':10,'U':8,' ':7,'T':6,'1':5,'2':4,'D':4,'S':3},
+    'G':{'E':18,'A':12,'O':10,'S':8,'R':7,' ':6,'U':5,'1':4,'2':3,'N':3,'I':3},
+    'K':{'A':15,'I':12,'O':10,'U':8,'E':7,' ':6,'1':5,'2':4,'3':3,'N':3,'L':3},
+    'C':{'H':18,'A':15,'O':12,'L':10,'E':9,'K':8,'I':7,'U':6,'1':5,'2':4,'3':3,'R':3},
     'F':{'M':40,'R':12,'L':8,'E':6,'U':5,'I':4,'O':3,'A':3},
     'M':{'D':15,'U':10,'A':9,'X':8,'E':8,'I':7,'S':5,'1':4,'2':3,'3':3},
-    'D':{'R':20,'E':15,'A':12,'I':10,'S':8,'U':7,'1':6,'2':5,'3':4,' ':4},
-    'N':{'D':20,'R':15,'O':12,'E':10,'A':8,'S':7,'1':6,' ':5,'W':4},
+    'H':{'I':15,'A':12,'E':10,'U':8,'R':7,'O':6,'1':5,'2':4,'N':3},
+    'P':{'O':15,'L':12,'R':10,'A':9,'E':8,'I':7,'U':6,'1':5,'2':4,'3':3},
+    'U':{'R':15,'N':12,'S':10,'E':8,'1':6,'2':5,'3':4,'K':4,'L':3},
+    'W':{'D':20,'A':15,'E':12,'I':10,'S':8,'R':7,'1':6,'2':5,'3':4,' ':4},
     'B':{'B':20,'A':15,'R':12,'E':10,'1':8,'2':7,'C':6,' ':4,'Y':3},
-    'K':{'I':20,'U':15,'A':12,'E':10,'R':8,'1':6,'2':5,' ':4,'L':4},
-    'S':{'W':20,'R':15,'A':12,'T':10,'U':8,'E':7,'1':6,'L':5,'H':4,'F':4},
-    'L':{'I':20,'A':15,'O':12,'U':10,'E':8,'S':7,'1':6,'T':4},
-    'E':{'N':20,'U':15,'A':12,'R':10,'S':8,'W':7,'1':6,'X':4},
-    'H':{'I':15,'R':12,'E':12,'1':10,'T':8},
-    'W':{'D':20,'R':15,'A':10,'E':8,'I':6},
-    '1':{'0':30,'F':20,'1':15,'8':12,'9':10,'2':8,' ':6,'5':5},
-    '0':{'0':25,'7':20,'6':15,'5':12,'4':10,' ':8},
+    'X':{'T':15,'1':12,'2':10,'3':8,'4':6,' ':5},
+    '1':{'0':20,'1':15,'2':12,'3':10,'4':8,'5':7,'6':6,'7':5,'8':4,'9':3,' ':3},
+    '2':{'0':20,'1':15,'2':12,'3':10,'4':8,'5':7,'6':6,'7':5,'8':4,'9':3,' ':3},
+    '3':{'0':15,'1':12,'2':10,'3':8,'4':7,'5':6,'6':5,'7':4,'8':3,'9':3,' ':3},
 };
-function bigramPredict(prevChar) {
-    const table = BIGRAMS[(prevChar || ' ').toUpperCase()] || BIGRAMS[' '];
-    let best = ' ', bestS = 0, total = 0;
-    for (const [c, s] of Object.entries(table)) {
-        total += s; if (s > bestS) { bestS = s; best = c; }
-    }
-    return { char: best, conf: total > 0 ? (bestS / total) * 0.25 : 0.05 };
+
+function bigramScore(a, b) {   // eslint-disable-line no-unused-vars
+    if (!a || !b) return 1;
+    return (BIGRAM[a]?.[b] || 1);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Freq → PI pre-cache  (internal seed only, never broadcast)
-// ─────────────────────────────────────────────────────────────
-function findKnownPIForFreq(freq) {
-    if (!freq) return null;
-    const rounded = roundFreq(freq);
-    let bestPI = null, bestScore = 0;
-    for (const [pi, entry] of Object.entries(db)) {
-        if (pi === '_meta') continue;
-        if (entry.freq !== rounded) continue;
-        const resolved = entry.psResolved || '';
-        if (resolved.trim().length < 1) continue;
-        const avgConf = entry.psConf
-            ? entry.psConf.reduce((a, b) => a + b, 0) / 8 : 0;
-        const score = Math.log10(Math.max(1, entry.seenCount)) * 0.5 + avgConf * 0.5;
-        if (score > bestScore) { bestScore = score; bestPI = pi; }
+function buildRTString() {
+    let rt = '';
+    for (let i = 0; i < 64; i++) {
+        const sl = currentState.rtSlots[i];
+        if (!sl || sl.char === '\r') break;
+        if (sl.conf > 0) rt += sl.char; else if (rt.length > 0) break;
     }
-    return bestPI;
+    return rt.trimEnd();
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  STRIP / INTERCEPT
+//  AI PREDICTION ENGINE
 // ═══════════════════════════════════════════════════════════════
-function stripRDSLines(receivedData) {
-    return receivedData.split('\n').filter(line => {
-        const t = line.trim();
-        if (!t.length) return true;
-        if (t[0] === 'R' && /^R[0-9A-Fa-f]/.test(t)) return false;
-        if (t[0] === 'P' && /^P[0-9A-Fa-f]{4}/.test(t)) return false;
-        return true;
-    }).join('\n');
-}
+function buildAIPrediction(pi) {
+    const entry = pi ? db[pi] : null;
+    const ref   = findRefEntry(pi);
+    const psSlots = [];
 
-function interceptLines(receivedData) {
-    for (const line of receivedData.split('\n')) {
-        const t = line.trim();
-        if (!t) continue;
-        if (t[0] === 'T' && /^T[0-9]/.test(t)) {
-            const f = parseFloat(t.slice(1).split(',')[0]);
-            if (!isNaN(f)) {
-                const newFreq = (f / 1000).toFixed(3);
-                if (newFreq !== currentFreq) {
-                    currentFreq = newFreq; legacyPiCache = null;
-                    onFreqChange(newFreq);
+    if (psLocked && lastBroadcastPS && entry && !entry.psIsDynamic) {
+        for (let i = 0; i < 8; i++)
+            psSlots.push({ char: lastBroadcastPS[i] || ' ', conf: 1.0, src: 'raw-0' });
+    } else {
+        for (let i = 0; i < 8; i++) {
+            const rawChar = currentState.psBuf[i];
+            const rawErr  = currentState.psErrBuf[i];
+            const rawConf = CONF_TABLE[Math.min(rawErr, 3)];
+
+            // 1. Dynamic PS
+            if (entry && entry.psIsDynamic && entry.psLastRaw && entry.psLastRaw[i] != null &&
+                currentState.psRoundReceivedAfterConfirm) {
+                psSlots.push({ char: entry.psLastRaw[i], conf: 0.9, src: 'ai-dynamic' });
+                continue;
+            }
+            // 2. Raw RDS verified
+            if (rawErr <= 1 && rawChar && rawChar !== ' ' &&
+                currentState.psRoundReceivedAfterConfirm) {
+                psSlots.push({ char: rawChar, conf: rawConf, src: `raw-${rawErr}` });
+                continue;
+            }
+            // 3. AI voted DB
+            if (entry && !entry.psIsDynamic && entry.ps[i]) {
+                const wv = getWeightedVotes(entry.ps[i]);
+                if (Object.keys(wv).length > 0) {
+                    let best = ' ', bestW = 0;
+                    for (const [ch, w] of Object.entries(wv))
+                        { if (w > bestW) { bestW = w; best = ch; } }
+                    const total = Object.values(wv).reduce((a, b) => a + b, 0);
+                    const conf  = Math.min(0.95, bestW / total);
+                    if (conf > 0.3) {
+                        // HYBRID FIX: Prefer RAW case if letters match
+                        let displayChar = best;
+                        if (rawChar && rawChar !== ' ' && 
+                            rawChar.toUpperCase() === best.toUpperCase()) {
+                            displayChar = rawChar;
+                        }
+
+                        psSlots.push({ char: displayChar, conf,
+                            src: 'ai-voted-' + (conf > 0.7 ? 'high' : conf > 0.5 ? 'mid' : 'low') });
+                        continue;
+                    }
                 }
             }
-            continue;
+            // 4. fmdx.org reference seed
+            if (ref && ref.psVariants && ref.psVariants.length > 0) {
+                const refPS      = ref.psVariants[0].padEnd(8, ' ');
+                if (refPS[i] && refPS[i] !== ' ') {
+                    const matchScore = computeRefMatchScore(pi);
+                    const src        = matchScore >= 0.5 ? 'ref-match' : 'ref-seed';
+                    
+                    // HYBRID FIX here too
+                    let displayChar = refPS[i];
+                    if (rawChar && rawChar !== ' ' && 
+                        rawChar.toUpperCase() === displayChar.toUpperCase()) {
+                        displayChar = rawChar;
+                    }
+                    
+                    psSlots.push({ char: displayChar, conf: 0.3 + matchScore * 0.4, src });
+                    continue;
+                }
+            }
+            // 5. Bigram fallback
+            if (i > 0 && psSlots[i-1]) {
+                const prev = psSlots[i-1].char;
+                const bg   = Object.entries(BIGRAM[prev] || {}).sort((a, b) => b[1] - a[1]);
+                if (bg.length > 0) {
+                    psSlots.push({ char: bg[0][0], conf: 0.1, src: 'ai-bigram' });
+                    continue;
+                }
+            }
+            psSlots.push({ char: ' ', conf: 0, src: 'empty' });
         }
-        if (t[0] === 'P' && /^P[0-9A-Fa-f]{4}/.test(t)) { legacyPiCache = t.slice(1).trim(); continue; }
-        if (t[0] === 'R' && /^R[0-9A-Fa-f]/.test(t)) parseAndDispatch(t.slice(1).trim());
     }
+
+    const rtText   = buildRTString();
+    const rtResult = rtText.trim().length >= 3
+        ? { text: rtText, score: 0.8, src: 'raw-rt' }
+        : (entry?.rtLast?.trim().length >= 3
+            ? { text: entry.rtLast, score: 0.5, src: 'ai-rt-last' }
+            : null);
+
+    const psVoteTotal = entry ? Object.values(entry.ps).reduce((a, posVotes) => {
+        const wv = getWeightedVotes(posVotes);
+        return a + Object.values(wv).reduce((x, y) => x + y, 0);
+    }, 0) : 0;
+
+    const refMatchScore = computeRefMatchScore(pi);
+
+    let psName     = null;
+    let psNameSrc  = null;
+    let psVariants = [];
+
+    // ONLY output a station name if we strictly found it in FMDX.ORG.
+    // Removed the AI DB fallback so the UI label "FMDX.ORG" doesn't falsely display learned names.
+    if (ref && ref.psVariants && ref.psVariants.length > 0) {
+        psVariants = ref.psVariants.map(v => v.trim()).filter(v => v.length > 0);
+        psName     = ref.station && ref.station.trim().length > 0
+            ? ref.station.trim() : null;
+        psNameSrc  = 'fmdx';
+    }
+
+    const psIsDynamicEffective = (entry?.psIsDynamic || false) ||
+                                 (ref?.psVariants && ref.psVariants.length > 1);
+
+    return {
+        pi,
+        ps:    psSlots,
+        rt:    rtResult,
+        af:    entry?.af || [],
+        psName,
+        psNameSrc,
+        psVariants: ref?.psVariants || [],
+        stats: {
+            freq:          entry?.freq    || currentState.freq,
+            seenCount:     entry?.seenCount || 0,
+            psVoteTotal:   Math.round(psVoteTotal),
+            psIsDynamic:   psIsDynamicEffective,
+            psLocked,
+            refStation:    ref?.station   || null,
+            refDistKm:     ref?.distKm    ?? null,
+            refMatchScore: Math.round(refMatchScore * 100),
+        },
+    };
 }
 
+// ─────────────────────────────────────────────────────────────
+//  onPIConfirmed
+// ─────────────────────────────────────────────────────────────
+function onPIConfirmed(pi) {
+    const entry = ensurePI(pi);
+    const ref   = findRefEntry(pi);
+
+    // Seed DB from fmdx.org reference if no local PS votes exist yet
+    if (ref && ref.psVariants && ref.psVariants.length > 0) {
+        const hasVotes = Object.keys(entry.ps).length > 0;
+        if (!hasVotes) {
+            const refPS = ref.psVariants[0].padEnd(8, ' ');
+            for (let i = 0; i < 8; i++) {
+                if (refPS[i] && refPS[i] !== ' ') {
+                    if (!entry.ps[i]) entry.ps[i] = {};
+                    entry.ps[i][refPS[i]] = {
+                        w: 1.0, count: 1,
+                        firstSeen: Date.now(), lastSeen: Date.now(),
+                    };
+                }
+            }
+            entry.psResolved = resolvePS(pi);
+            entry.psConf     = computePSConf(pi);
+            dbDirty = true;
+        }
+    }
+
+    if (DEBUG) {
+        const refMatchPct = Math.round(computeRefMatchScore(pi) * 100);
+        let source = 'no fmdx.org ref';
+        if (ref) {
+            const dist = ref.distKm !== null && ref.distKm !== undefined
+                ? `${ref.distKm} km` : '? km';
+            source = `fmdx.org, ${dist}, match ${refMatchPct}%`;
+        }
+        const psName = (entry.psResolved || '').trim() || ref?.psVariants?.[0]?.trim() || '';
+        logInfo(`[${PLUGIN_NAME}] PI confirmed: ${pi}${psName ? ` = "${psName}"` : ''} (${source})`);
+
+        if (ref && ref.psVariants && ref.psVariants.length > 0) {
+            const variantStr = ref.psVariants
+                .map((v, i) => `[${i}] "${v.trimEnd()}"`)
+                .join('  ');
+            logInfo(`[${PLUGIN_NAME}] PS variants for ${pi}: ${variantStr}`);
+        }
+    }
+
+    const prediction = buildAIPrediction(pi);
+    currentState.lastPrediction = prediction;
+
+    setTimeout(() => {
+        broadcast({ type: 'rdsm_ai', ...prediction, ts: Date.now() });
+    }, AI_BROADCAST_DELAY);
+
+    if (dataHandler) {
+        if (pi && pi !== '?' && pi !== '----') {
+            dataHandler.dataToSend.pi  = pi;
+            dataHandler.initialData.pi = pi;
+        }
+        dataHandler.dataToSend.rds = true;
+    }
+    if (rdsFollowMode) applyFollowToDataHandler();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  parseAndDispatch
+// ─────────────────────────────────────────────────────────────
 function parseAndDispatch(raw) {
     let dataHex, errorHex;
     if (raw.length >= 18) {
@@ -833,336 +1730,355 @@ function parseAndDispatch(raw) {
         errNew |= (legacyErr & 0x30) >> 4;
         dataHex = pi + raw.slice(0, 12); errorHex = errNew.toString(16).padStart(2, '0');
     } else return;
-    if (!/^[0-9A-Fa-f]{16}$/.test(dataHex))  return;
-    if (!/^[0-9A-Fa-f]{2}$/.test(errorHex)) return;
+
     const errByte = parseInt(errorHex, 16);
-    const errB    = [(errByte>>6)&3,(errByte>>4)&3,(errByte>>2)&3,(errByte>>0)&3];
-    const blocks  = [
-        errB[0]<3 ? dataHex.slice(0,  4).toUpperCase() : null,
-        errB[1]<3 ? dataHex.slice(4,  8).toUpperCase() : null,
-        errB[2]<3 ? dataHex.slice(8,  12).toUpperCase() : null,
-        errB[3]<3 ? dataHex.slice(12, 16).toUpperCase() : null,
+    const errB    = [
+        (errByte >> 6) & 0x03,
+        (errByte >> 4) & 0x03,
+        (errByte >> 2) & 0x03,
+         errByte       & 0x03,
     ];
 
-    // Always broadcast the raw packet to plugin clients so
-    // the panel can update BER/group counters in real time.
-    broadcast({
-        type:'rdsm_raw', pi:blocks[0], b2:blocks[1], b3:blocks[2], b4:blocks[3],
-        raw4:[dataHex.slice(0,4).toUpperCase(),dataHex.slice(4,8).toUpperCase(),
-              dataHex.slice(8,12).toUpperCase(),dataHex.slice(12,16).toUpperCase()],
-        errB, conf:errB.map(e=>CONF_TABLE[e]), err:errByte, freq:currentFreq, ts:Date.now(),
-    });
+    const piRaw = dataHex.slice(0, 4).toUpperCase();
+    const b2hex = dataHex.slice(4,  8);
+    const b3hex = dataHex.slice(8,  12);
+    const b4hex = dataHex.slice(12, 16);
 
-    if (!blocks[0]) return;
-    const pi    = blocks[0];
-    const blkAok = errB[0] <= 1;
+    if (errB[0] > 1) return;
 
-    // ── PI change detection ──────────────────────────────────
+    const pi = piRaw;
+
+    // ── New PI candidate ──────────────────────────────────────
     if (pi !== currentState.pi) {
-        onPIChange(pi);
-    }
+        currentState.pi    = pi;
+        piConfirmCount     = 1;
+        piConfirmed        = false;
+        piPendingBroadcast = false;
+        psLocked           = false;
+        lastBroadcastPS    = null;
 
-    // ── PI confirmation gate ─────────────────────────────────
-    // Only count this packet toward confirmation when Block A
-    // is error-free (errB[0] ≤ 1), which means the PI itself
-    // was received without uncorrectable errors.
-    if (blkAok && !piConfirmed) {
+        currentState.psBuf.fill(' ');
+        currentState.psErrBuf.fill(3);
+        currentState.psSegsSeen.clear();
+        currentState.rtSlots = Array.from({length: 64}, () => ({ char: ' ', conf: 0 }));
+        currentState.rtAB    = -1;
+        currentState.afSet   = new Set();
+        currentState.psRoundReceivedAfterConfirm = false;
+
+        const entry = db[pi];
+        if (entry) {
+            if (entry.psDynamicBuf) entry.psDynamicBuf.length = 0;
+            else Object.defineProperty(entry, 'psDynamicBuf', {
+                value: [], writable: true, enumerable: false, configurable: true,
+            });
+            entry.psIsDynamic = false;
+            entry.psLastRaw   = new Array(8).fill(null);
+            entry.psLastRawTs = 0;
+        }
+
+        currentState.freqRefs = getFreqRefs(currentState.freq);
+
+        if (DEBUG && currentState.freqRefs.length > 0) {
+            const inFmdx = currentState.freqRefs.some(r => r.pi === pi);
+            if (!inFmdx)
+                if (DEBUG) logInfo(`[${PLUGIN_NAME}] PI candidate ${pi} not in fmdx.org for ${currentState.freq} MHz – ghost threshold (${GHOST_PI_THRESHOLD})`);
+        }
+    } else {
         piConfirmCount++;
-        if (piConfirmCount >= PI_CONFIRM_THRESHOLD) {
-            piConfirmed = true;
-            onPIConfirmed(pi);
-        }
     }
 
-    decodeGroup(pi, blocks[1], blocks[2], blocks[3], errB);
-    scheduleAIBroadcast(pi);
-}
+    const threshold = getConfirmThreshold(pi);
 
-// ─────────────────────────────────────────────────────────────
-//  onPIChange
-//  Called when a new PI code appears in the raw stream.
-//  Resets confirmation state. Loads pre-cache as internal
-//  prediction seed (not broadcast to any output yet).
-// ─────────────────────────────────────────────────────────────
-function onPIChange(newPI) {
-    currentState.pi = newPI;
-    currentState.rtSlots = Array.from({length:64},()=>({char:' ',conf:0}));
-    currentState.rtAB = -1;
-    currentState.psBuf = new Array(8).fill(' ');
-    currentState.psErrBuf = new Array(8).fill(3);
-    currentState.psSegsSeen = new Set();
-    currentState.psRoundComplete = false;
-
-    // Reset confirmation for the new PI
-    piConfirmCount     = 1;   // this first packet already counts
-    piConfirmed        = false;
-    piPendingBroadcast = false;
-
-    // Load DB prediction as internal seed so buildAIPrediction()
-    // already has data when confirmation fires. Do NOT broadcast.
-    const prediction = buildAIPrediction(newPI);
-    currentState.lastPrediction = prediction;
-    // Mark that a broadcast is pending confirmation
-    piPendingBroadcast = true;
-}
-
-// ─────────────────────────────────────────────────────────────
-//  onPIConfirmed
-//  Called exactly once per frequency/PI when piConfirmed
-//  transitions to true. Fires the first broadcast to both
-//  plugin panel and dataHandler simultaneously.
-// ───────────────────────────────��─────────────────────────────
-function onPIConfirmed(pi) {
-    // Rebuild prediction now that we have confirmed PI context
-    const prediction = buildAIPrediction(pi);
-    currentState.lastPrediction = prediction;
-    piPendingBroadcast = false;
-
-    // ── Plugin panel ─────────────────────────────────────────
-    broadcast(prediction);
-
-    // ── dataHandler (web UI / autologger) ────────────────────
-    if (dataHandler) {
-        // PI first
-        if (pi && pi !== '?' && pi !== '----') {
-            dataHandler.dataToSend.pi  = pi;
-            dataHandler.initialData.pi = pi;
+    if (!piConfirmed && piConfirmCount >= threshold) {
+        if (!isPIAllowed(pi)) {
+            piConfirmCount = 0;
+            return;
         }
-        // PS from prediction
-        if (prediction.ps && Array.isArray(prediction.ps)) {
-            const psStr = prediction.ps.map(s =>
-                (s && s.src !== 'empty' && s.src !== 'ai-bigram' && s.char && s.char !== ' ')
-                    ? s.char : ' '
-            ).join('');
-            if (psStr.trim().length > 0) {
-                dataHandler.dataToSend.ps        = psStr;
-                dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-            }
-        }
-        dataHandler.dataToSend.rds = true;
+        piConfirmed = true;
+        broadcast({ type: 'rdsm_raw', pi, freq: currentState.freq, errB });
+        onPIConfirmed(pi);
+    } else if (piConfirmed) {
+        broadcast({
+            type: 'rdsm_raw',
+            pi,   freq: currentState.freq,
+            b2:   b2hex, b3: b3hex, b4: b4hex,
+            errB,
+        });
     }
 
-    // In Follow mode: full apply
-    if (rdsFollowMode) applyFollowToDataHandler();
+    if (!pi || pi === '----') return;
+    decodeGroup(pi, b2hex, b3hex, b4hex, errB);
+    if (piConfirmed) scheduleAIBroadcast(pi);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  onFreqChange
-//  Resets everything. Pre-cache is loaded as internal seed
-//  only – nothing is sent to panel or dataHandler until
-//  piConfirmed becomes true via live raw data.
-// ─────────────────────────────────────────────────────────────
-function onFreqChange(newFreq) {
-    _freqSeq++;
-    if (aiTimer)       { clearTimeout(aiTimer);       aiTimer       = null; }
-    if (txUpdateTimer) { clearTimeout(txUpdateTimer); txUpdateTimer = null; }
-    aiPendingPI = null;
-
-    currentState.freq = newFreq; currentState.pi = null;
-    currentState.lastPrediction = null;
-    currentState.rtSlots = Array.from({length:64},()=>({char:' ',conf:0}));
-    currentState.rtAB = -1;
-    currentState.psBuf = new Array(8).fill(' ');
-    currentState.psErrBuf = new Array(8).fill(3);
-    currentState.psSegsSeen = new Set();
-    currentState.psRoundComplete = false;
-    currentState.tp = false; currentState.ta = false;
-    currentState.ms = -1;    currentState.stereo = false;
-
-    // Notify plugin clients of frequency change (no PI/PS data yet)
-    broadcast({ type:'rdsm_freq', freq:newFreq, ts:Date.now() });
-
-    // Clear all RDS data in web UI and reset confirmation
-    clearRDSInDataHandler();
-
-    // Load pre-cache as internal prediction seed.
-    // piConfirmed is still false – nothing is shown anywhere yet.
-    const knownPI = findKnownPIForFreq(newFreq);
-    if (knownPI) {
-        // Pre-load into currentState so onPIChange / onPIConfirmed
-        // can use the DB data immediately when raw packets arrive.
-        currentState.pi = knownPI;
-        currentState.lastPrediction = buildAIPrediction(knownPI);
-        piPendingBroadcast = true;
-        // piConfirmCount stays 0 – first raw packet will set it to 1
-        // via onPIChange (which sets it to 1 itself) or the counter
-        // in parseAndDispatch when pi === currentState.pi.
-    }
-
-    saveDB();
-}
-
-let aiTimer = null, aiPendingPI = null;
+// ── AI broadcast scheduler ────────────────────────────────────
+// Always rebuilds the prediction so RT (which arrives later than
+// PS) is included even after the PS lock fires.
+let _aiTimer = null;
 function scheduleAIBroadcast(pi) {
-    // Only schedule if PI is confirmed – no point building a
-    // prediction that we cannot broadcast yet.
-    if (!piConfirmed) return;
-    aiPendingPI = pi;
-    if (aiTimer) return;
-    const seqAtSchedule = _freqSeq;
-    aiTimer = setTimeout(() => {
-        aiTimer = null;
-        if (_freqSeq !== seqAtSchedule || !aiPendingPI || !piConfirmed) return;
-        const prediction = buildAIPrediction(aiPendingPI);
+    if (_aiTimer) return;
+    _aiTimer = setTimeout(() => {
+        _aiTimer = null;
+        if (!piConfirmed || currentState.pi !== pi) return;
+        // Always rebuild – ensures live RT slots are included
+        const prediction = buildAIPrediction(pi);
         currentState.lastPrediction = prediction;
-        broadcast(prediction);
-        if (rdsFollowMode)   applyFollowToDataHandler();
-        if (aiExclusiveMode) {
-            const entry = db[aiPendingPI];
-            broadcastToMainWss(buildNativeRDSPacket(aiPendingPI, prediction.ps, entry));
-        }
+        broadcast({ type: 'rdsm_ai', ...prediction, ts: Date.now() });
+        if (rdsFollowMode) applyFollowToDataHandler();
     }, AI_BROADCAST_DELAY);
 }
 
+// ─────────────────────────────────────────────────────────────
+//  BROADCAST HELPERS
+// ─────────────────────────────────────────────────────────────
 function broadcast(payload) {
     if (!pluginsWss) return;
     const msg = JSON.stringify(payload);
-    pluginsWss.clients.forEach(c => { if (c.readyState===c.OPEN) try{c.send(msg);}catch(e){} });
+    pluginsWss.clients.forEach(c => {
+        if (c.readyState === c.OPEN) try { c.send(msg); } catch(e) {}
+    });
 }
-function broadcastToMainWss(payload) {
+
+function broadcastToMainWss(payload) {   // eslint-disable-line no-unused-vars
     if (!pluginsMainWss) return;
     const msg = JSON.stringify(payload);
-    pluginsMainWss.clients.forEach(c => { if (c.readyState===c.OPEN) try{c.send(msg);}catch(e){} });
+    pluginsMainWss.clients.forEach(c => {
+        if (c.readyState === c.OPEN) try { c.send(msg); } catch(e) {}
+    });
 }
 
-function buildNativeRDSPacket(pi, psSlots, entry) {
-    const psStr = psSlots.map(s =>
-        (s.src!=='empty'&&s.src!=='ai-bigram'&&s.char&&s.char!==' ')?s.char:' '
-    ).join('');
-    return { type:'rdsm_ai_frontend', ps:psStr, pty:entry?.pty>=0?entry.pty:0,
-             freq:currentFreq||'0.000', pi, rt:buildRTString(), ts:Date.now() };
+// ─────────────────────────────────────────────────────────────
+//  hookDataHandler
+// ─────────────────────────────────────────────────────────────
+function stripRDSLines(data) {
+    return data.split('\n').filter(l => !l.startsWith('R')).join('\n');
 }
 
-function buildRTString() {
-    let rt = '';
-    for (let i=0;i<64;i++) {
-        const sl=currentState.rtSlots[i];
-        if (!sl||sl.conf===0){if(rt.length>0)break;continue;}
-        if (sl.char==='\r') break;
-        rt+=sl.char;
+function interceptLines(data) {
+    for (const line of data.split('\n')) {
+        const l = line.trim();
+        if (l.startsWith('P') && l.length >= 5) {
+            legacyPiCache = l.slice(1).trim();
+        } else if (l.startsWith('T') && l.length >= 2) {
+            const freq = (parseFloat(l.slice(1)) / 1000).toFixed(2);
+            if (freq !== currentState.freq) {
+                currentState.freq  = freq;
+                currentFreq        = freq;
+                currentState.pi    = null;
+                piConfirmCount     = 0;
+                piConfirmed        = false;
+                piPendingBroadcast = false;
+                psLocked           = false;
+                lastBroadcastPS    = null;
+                currentState.psBuf.fill(' ');
+                currentState.psErrBuf.fill(3);
+                currentState.psSegsSeen.clear();
+                currentState.rtSlots = Array.from({length: 64}, () => ({ char: ' ', conf: 0 }));
+                currentState.rtAB    = -1;
+                currentState.afSet   = new Set();
+                currentState.psRoundReceivedAfterConfirm = false;
+                currentState.freqRefs = getFreqRefs(freq);
+                currentState.lastPrediction = null;
+                if (_aiTimer) { clearTimeout(_aiTimer); _aiTimer = null; }
+                legacyPiCache = null;
+                clearRDSInDataHandler();
+
+                // Broadcast full reset so the frontend clears all statistics
+                broadcast({
+                    type:  'rdsm_freq',
+                    freq,
+                    reset: true,
+                    pi:    null,
+                    ps:    null,
+                    stats: {
+                        freq,
+                        seenCount:     0,
+                        psVoteTotal:   0,
+                        psIsDynamic:   false,
+                        psLocked:      false,
+                        refStation:    null,
+                        refDistKm:     null,
+                        refMatchScore: 0,
+                    },
+                });
+
+                const knownPI = findKnownPIForFreq(freq);
+                if (knownPI) {
+                    currentState.pi             = knownPI;
+                    currentState.lastPrediction = buildAIPrediction(knownPI);
+                    piPendingBroadcast          = true;
+                    const knownEntry = db[knownPI];
+                    const psName = (knownEntry?.psResolved || '').trim();
+                    if (DEBUG) logInfo(`[${PLUGIN_NAME}] Pre-seeded PI ${knownPI}${psName ? ` = "${psName}"` : ''} from learned DB`);
+                }
+            }
+        } else if (l.startsWith('R') && l.length >= 14) {
+            parseAndDispatch(l.slice(1).trim());
+        }
     }
-    return rt.trimEnd();
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  WebSocket / API / patch
-// ═══════════════════════════════════════════════════════════════
-function getAdminToken() {
-    try {
-        const cfgPath = path.join(__dirname,'../../config.json');
-        if (fs.existsSync(cfgPath)) {
-            const cfg = JSON.parse(fs.readFileSync(cfgPath,'utf8'));
-            return cfg.password?.adminPass||cfg.adminPassword||'admin';
+// ─────────────────────────────────────────────────────────────
+//  hookDataHandler
+// ─────────────────────────────────────────────────────────────
+function hookDataHandler(dh) {
+    if (!dh || typeof dh.handleData !== 'function') return;
+    const orig = dh.handleData.bind(dh);
+    
+    dh.handleData = function(wss, receivedData, rdsWss) {
+        if (!pluginsMainWss && wss) pluginsMainWss = wss;
+        
+        // 1. Let the AI parse the incoming lines first
+        interceptLines(receivedData);
+        
+        if (aiExclusiveMode) return;
+
+        // 2. Prevent Native Decoder Flicker & Feed RDS Expert properly
+        if (rdsFollowMode && piConfirmed) {
+            
+            // Apply our AI values FIRST
+            applyFollowToDataHandler();
+
+            // Lock properties so the native decoder cannot overwrite them while it runs
+            const fields = [
+                'pi', 'ps', 'ps_errors', 'pty', 'tp', 'ta', 'ms', 
+                'rt0', 'rt1', 'rt0_errors', 'rt1_errors', 'rt_flag', 
+                'ecc', 'country_iso', 'country_name', 'af'
+            ];
+            
+            const lockedData = {};
+            const lockedInit = {};
+
+            fields.forEach(f => {
+                lockedData[f] = dh.dataToSend[f];
+                lockedInit[f] = dh.initialData[f];
+                
+                // Freeze dataToSend fields
+                Object.defineProperty(dh.dataToSend, f, {
+                    get: () => lockedData[f],
+                    set: () => {}, // Ignore writes from the native decoder!
+                    configurable: true,
+                    enumerable: true
+                });
+                
+                // Freeze initialData fields
+                Object.defineProperty(dh.initialData, f, {
+                    get: () => lockedInit[f],
+                    set: () => {}, 
+                    configurable: true,
+                    enumerable: true
+                });
+            });
+
+            // 3. Execute the native decoder with the UNTOUCHED raw data.
+            // This guarantees that external tools like RDS Expert (via rdsWss) receive the exact stream.
+            // The native decoder will try to update dh.dataToSend, but our property locks ignore it!
+            const result = orig.call(this, wss, receivedData, rdsWss);
+
+            // 4. Restore properties back to normal writable variables for the next cycle
+            fields.forEach(f => {
+                Object.defineProperty(dh.dataToSend, f, {
+                    value: lockedData[f],
+                    writable: true,
+                    configurable: true,
+                    enumerable: true
+                });
+                Object.defineProperty(dh.initialData, f, {
+                    value: lockedInit[f],
+                    writable: true,
+                    configurable: true,
+                    enumerable: true
+                });
+            });
+            
+            return result;
         }
-    } catch(e) {}
-    return 'admin';
+
+        // Normal fallback if Follow Mode is off or PI not confirmed yet
+        const result = orig.call(this, wss, receivedData, rdsWss);
+        return result;
+    };
+    logInfo(`[${PLUGIN_NAME}] datahandler hooked`);
 }
 
-function handlePluginMessage(data) {
-    let msg; try { msg=JSON.parse(data); } catch(e) { return; }
-    if (msg.type==='rdsm_set_rds_follow') {
-        const wanted=!!msg.enabled;
-        if (wanted!==rdsFollowMode) {
-            rdsFollowMode=wanted; nativeRDSDisabled=wanted;
-            logInfo(`[${PLUGIN_NAME}] RDS Follow: ${rdsFollowMode?'ON':'OFF'}`);
-            if (rdsFollowMode) { clearRDSInDataHandler(); applyFollowToDataHandler(); }
-            dbDirty=true; saveDB();
-        }
-        broadcast({type:'rdsm_rds_follow_state',enabled:rdsFollowMode,ts:Date.now()});
+// ─────────────────────────────────────────────────────────────
+//  WebSocket message handler
+// ─────────────────────────────────────────────────────────────
+function handlePluginMessage(ws, raw) {
+    let msg;
+    try { msg = JSON.parse(raw); } catch(e) { return; }
+
+    if (msg.type === 'rdsm_get_rds_follow') {
+        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode })); }
+        catch(e) {}
         return;
     }
-    if (msg.type==='rdsm_get_rds_follow') {
-        broadcast({type:'rdsm_rds_follow_state',enabled:rdsFollowMode,ts:Date.now()});
-        return;
-    }
-    if (msg.type==='rdsm_set_exclusive') {
-        if (msg.adminToken!==getAdminToken()) {
-            logWarn(`[${PLUGIN_NAME}] Unauthorized exclusive mode attempt`);
-            broadcast({type:'rdsm_exclusive_state',enabled:aiExclusiveMode,error:'unauthorized',ts:Date.now()});
-            return;
+    if (msg.type === 'rdsm_set_rds_follow') {
+        const next = !!msg.enabled;
+        if (next !== rdsFollowMode) {
+            rdsFollowMode     = next;
+            nativeRDSDisabled = next;
+            dbDirty = true;
+            logInfo(`[${PLUGIN_NAME}] RDS Follow ${next ? 'ENABLED' : 'DISABLED'}`);
+            if (!next) clearRDSInDataHandler();
+            else if (piConfirmed) applyFollowToDataHandler();
         }
-        aiExclusiveMode=!!msg.enabled;
-        logInfo(`[${PLUGIN_NAME}] AI Exclusive: ${aiExclusiveMode?'ON':'OFF'}`);
-        broadcast({type:'rdsm_exclusive_state',enabled:aiExclusiveMode,ts:Date.now()});
+        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode });
         return;
     }
-    if (msg.type==='rdsm_get_exclusive')
-        broadcast({type:'rdsm_exclusive_state',enabled:aiExclusiveMode,ts:Date.now()});
 }
 
+// ─────────────────────────────────────────────────────────────
+//  API routes
+// ─────────────────────────────────────────────────────────────
 function registerAPIRoutes() {
     try {
-        const app=pluginsApi.getHttpServer();
+        const app = pluginsApi.getHttpServer();
         if (!app) return;
-        app.on('request',(req,res)=>{
-            if (req.method==='GET'&&req.url==='/api/rdsm/stats') {
-                res.writeHead(200,{'Content-Type':'application/json'});
+        app.on('request', (req, res) => {
+            if (req.method === 'GET' && req.url === '/api/rdsm/stats') {
+                if (res.headersSent) return;
+                res.writeHead(200, {'Content-Type': 'application/json'});
                 res.end(JSON.stringify({
-                    stations:Object.keys(db).filter(k=>k!=='_meta').length,
-                    current:currentState.pi, piConfirmed,
-                    freq:currentFreq, freqRounded:roundFreq(currentFreq),
-                    uptime:process.uptime(), aiExclusiveMode, rdsFollowMode,
-                }));
-                return;
-            }
-            if (req.method==='GET'&&req.url?.startsWith('/api/rdsm/pi/')) {
-                const pi=req.url.split('/').pop().toUpperCase();
-                const entry=db[pi];
-                if (!entry) { res.writeHead(404,{'Content-Type':'application/json'}); res.end(JSON.stringify({error:'not found'})); return; }
-                const psVoteTotal=Object.values(entry.ps).reduce((a,posVotes)=>{
-                    const wv=getWeightedVotes(posVotes);
-                    return a+Object.values(wv).reduce((x,y)=>x+y,0);
-                },0);
-                res.writeHead(200,{'Content-Type':'application/json'});
-                res.end(JSON.stringify({
-                    freq:entry.freq, psResolved:entry.psResolved, psConf:entry.psConf,
-                    psVoteTotal:Math.round(psVoteTotal), psIsDynamic:entry.psIsDynamic,
-                    psLastRaw:entry.psLastRaw?.join(''),
-                    psLastRawAge:entry.psLastRawTs?Math.round((Date.now()-entry.psLastRawTs)/1000)+'s':null,
-                    pty:entry.pty,tp:entry.tp,ta:entry.ta,ecc:entry.ecc,
-                    seen:entry.seen,seenCount:entry.seenCount,
+                    stationCount:  Object.keys(db).filter(k => k !== '_meta').length,
+                    fmdxFreqCount: Object.keys(fmdxByFreq).length,
+                    rdsFollowMode, aiExclusiveMode,
+                    piConfirmed, psLocked,
+                    currentPI:   currentState.pi,
+                    currentFreq,
                 }));
             }
         });
-        logInfo(`[${PLUGIN_NAME}] API routes registered`);
-    } catch(e) {}
+    } catch(e) {
+        logWarn(`[${PLUGIN_NAME}] Could not register API routes: ${e.message}`);
+    }
 }
 
-function hookDataHandler() {
-    try {
-        const dh=require('../../server/datahandler');
-        if (!dh?.handleData) { logWarn(`[${PLUGIN_NAME}] handleData not found – retrying`); setTimeout(hookDataHandler,2000); return; }
-        if (dh._rdsm_patched) return;
-        const orig=dh.handleData;
-        dh.handleData=function(wss,receivedData,rdsWss) {
-            if (!pluginsMainWss&&wss) pluginsMainWss=wss;
-            interceptLines(receivedData);
-            if (aiExclusiveMode) return;
-            const dataForNative=nativeRDSDisabled?stripRDSLines(receivedData):receivedData;
-            const result=orig.call(this,wss,dataForNative,rdsWss);
-            if (rdsFollowMode&&piConfirmed) applyFollowToDataHandler();
-            return result;
-        };
-        dh._rdsm_patched=true;
-        logInfo(`[${PLUGIN_NAME}] v4.4.0 ready – RDS Follow: ${rdsFollowMode?'ON':'OFF'}`);
-        if (rdsFollowMode) { clearRDSInDataHandler(); applyFollowToDataHandler(); }
-    } catch(e) { logWarn(`[${PLUGIN_NAME}] Patch failed: ${e.message}`); }
-}
-
-function start() {
+// ─────────────────────────────────────────────────────────────
+//  INIT
+// ─────────────────────────────────────────────────────────────
+function init() {
+    loadOwnLocation();
+    startGpsWsListener();
     loadDB();
-    const iv=setInterval(()=>{
-        pluginsWss=pluginsApi.getPluginsWss();
-        if (pluginsWss) {
-            clearInterval(iv);
-            pluginsWss.on('connection',ws=>{
-                ws.send(JSON.stringify({type:'rdsm_exclusive_state', enabled:aiExclusiveMode,ts:Date.now()}));
-                ws.send(JSON.stringify({type:'rdsm_rds_follow_state',enabled:rdsFollowMode,  ts:Date.now()}));
-                ws.on('message',data=>handlePluginMessage(data));
-            });
-            hookDataHandler();
-            registerAPIRoutes();
-        }
-    },500);
+    if (dataHandler) hookDataHandler(dataHandler);
+
+    pluginsWss     = pluginsApi.getPluginsWss();
+    pluginsMainWss = pluginsApi.getWss();
+
+    if (pluginsWss) {
+        pluginsWss.on('connection', (ws) => {
+            ws.on('message', (raw) => handlePluginMessage(ws, raw));
+        });
+    }
+
+    try { registerAPIRoutes(); } catch(e) {
+        logWarn(`[${PLUGIN_NAME}] Could not register API routes: ${e.message}`);
+    }
+
+    loadFmdxBulk().catch(e => logWarn(`[${PLUGIN_NAME}] fmdx.org load error: ${e.message}`));
+
+    logInfo(`[${PLUGIN_NAME}] v${pluginConfig.version} initialised`);
 }
-start();
+
+setTimeout(init, 500);
