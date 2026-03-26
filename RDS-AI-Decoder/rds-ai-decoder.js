@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.0)  //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.1)  //
 //                                                           //
-//  by Highpoint                last update: 2026-03-18      //
+//  by Highpoint                last update: 2026-03-25      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -10,7 +10,7 @@
 
 (() => {
 
-    const pluginVersion         = '2.0';
+    const pluginVersion         = '2.1';
     const pluginName            = 'RDS AI Decoder';
     const pluginHomepageUrl     = 'https://github.com/Highpoint2000/RDS-AI-Decoder/releases';
     const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
@@ -23,6 +23,7 @@
         };
     }
 
+    // ── Update check ──────────────────────��──────────────────
     function checkUpdate(setupOnly, name, urlUpdateLink, urlFetchLink) {
         const isSetupPath = (window.location.pathname || '/').indexOf('/setup') >= 0;
         fetch(urlFetchLink + '?t=' + Date.now(), { cache: 'no-store' })
@@ -56,10 +57,12 @@
     }
     if (CHECK_FOR_UPDATES) checkUpdate(pluginSetupOnlyNotify, pluginName, pluginHomepageUrl, pluginUpdateUrl);
 
+    // ── WebSocket URL ─────────────────────────────────────────
     const CU = new URL(window.location.href);
     const WP = CU.protocol === 'https:' ? 'wss:' : 'ws:';
     const WS = `${WP}//${CU.hostname}:${CU.port||(CU.protocol==='https:'?'443':'80')}/data_plugins`;
 
+    // ── PTY table ─────────────────────────────────────────────
     const PTY = ['None','News','Current Affairs','Information','Sport','Education','Drama',
                  'Culture','Science','Varied','Pop Music','Rock Music','Easy Listening',
                  'Light Classical','Serious Classical','Other Music','Weather','Finance',
@@ -67,7 +70,7 @@
                  'Leisure','Jazz Music','Country Music','National Music','Oldies Music',
                  'Folk Music','Documentary','Alarm Test','Alarm'];
 
-    // RDS character set – verified against ETSI EN 50067 / librdsparser
+    // ── RDS character set (ETSI EN 50067) ────────────────────
     const RDS_CHARSET = [
         ' ','!','"','#','¤','%','&',"'",
         '(',')', '*','+',',','-','.','/',
@@ -106,6 +109,7 @@
 
     const CONF = [1.00, 0.90, 0.70, 0.00];
 
+    // ── Slot factories ────────────────────────────────────────
     const mkPS = () => Array.from({length:8}, ()=>({char:' ',conf:0,src:'empty',rawOk:0,rawChar:null}));
     const mkRT = n   => Array.from({length:n}, ()=>({char:' ',conf:0,src:'empty'}));
 
@@ -137,7 +141,7 @@
             psSlots[pos] = {char, conf, src, rawOk:cur.rawOk, rawChar:cur.rawChar};
     }
 
-    // ── PS fusion: incoming AI prediction ───────────────────
+    // ── PS fusion: incoming AI prediction ────────────────────
     function fusePS_ai(pos, char, conf, src) {
         const cur = psSlots[pos];
         if (cur.rawOk >= 2 && cur.src.startsWith('raw')) return;
@@ -150,7 +154,7 @@
             psSlots[pos] = {char, conf, src, rawOk:cur.rawOk, rawChar:cur.rawChar};
     }
 
-    // ── RT fusion ────────────────────────────────────────────
+    // ── RT fusion ─────────────────────────────────────────────
     function fuseRT(ab, i, char, conf, src) {
         if (i < 0 || i >= rtSlots[ab].length) return;
         const cur     = rtSlots[ab][i];
@@ -159,7 +163,7 @@
             rtSlots[ab][i] = {char, conf, src};
     }
 
-    // ── Stable flag debouncing ───────────────────────────────
+    // ── Stable flag debouncing ────────────────────────────────
     let _ptyCandidate = -1, _ptyCandCount = 0;
     let _taCandidate  = null, _taCandCount = 0;
 
@@ -198,7 +202,7 @@
         }
     }
 
-    // ── Global state ─────────────────────────────────────────
+    // ── Global state ──────────────────────────────────────────
     let st = {
         pi:'----', piCand:'----', piN:0,
         psBuf:new Array(8).fill(' '), psGroups:new Set(),
@@ -212,15 +216,16 @@
         rdsFollow:false,
         refStation:null, refDistKm:null, refMatchScore:0,
         af:[],
-        psName:    null,   // stored station name (from fmdx.org or learned DB)
-        psNameSrc: null,   // 'fmdx' | 'db' | null
-        psVariants: [],    // all PS name variants from fmdx.org
+        psName:     null,
+        psNameSrc:  null,
+        psVariants: [],
+        altFreqs:   [],
     };
 
     let ws = null, reconn = null;
     let panelVis = false, statsOpen = false;
 
-    // ── Message dispatcher ───────────────────────────────────
+    // ── Message dispatcher ────────────────────────────────────
     function onMessage(data) {
         let d; try { d = JSON.parse(data); } catch(e) { return; }
         switch (d.type) {
@@ -233,7 +238,7 @@
 
     function onRdsFollowState(d) { st.rdsFollow = !!d.enabled; syncFollowUI(); }
 
-    // ── Frequency change ─────────────────────────────────────
+    // ── Frequency change ──────────────────────────────────────
     function onFreq(d) {
         st._freqChangeTs = Date.now();
         reset();
@@ -241,7 +246,7 @@
         setEl('rdsm-freq', st.freq !== '—' ? st.freq + ' MHz' : '—');
     }
 
-    // ── Raw RDS group handler ────────────────────────────────
+    // ── Raw RDS group handler ─────────────────────────────────
     function onRaw(d) {
         if (d.freq && d.freq !== st.freq) { st.freq = d.freq; setEl('rdsm-freq', d.freq + ' MHz'); }
         if (d.pi) {
@@ -304,7 +309,7 @@
         renderAll();
     }
 
-    // ── AI prediction handler ────────────────────────────────
+    // ── AI prediction handler ─────────────────────────────────
     function onAI(d) {
         if (d.ts && d.ts < st._freqChangeTs) return;
         st.aiActive = true;
@@ -314,16 +319,48 @@
             st.refDistKm     = d.stats.refDistKm     || null;
             st.refMatchScore = d.stats.refMatchScore || 0;
         }
+
+        let psNameChanged = false;
         if (d.psName !== undefined) {
-            st.psName     = d.psName    || null;
-            st.psNameSrc  = d.psNameSrc || null;
-            st.psVariants = Array.isArray(d.psVariants) ? d.psVariants : [];
-            renderPSName();
+            const newName     = d.psName    || null;
+            const newSrc      = d.psNameSrc || null;
+            const newVariants = Array.isArray(d.psVariants) ? d.psVariants : [];
+            if (newName !== st.psName ||
+                JSON.stringify(newVariants) !== JSON.stringify(st.psVariants)) {
+                psNameChanged = true;
+            }
+            st.psName     = newName;
+            st.psNameSrc  = newSrc;
+            st.psVariants = newVariants;
         }
-        if (d.af && Array.isArray(d.af) && d.af.length > 0) {
-            st.af = d.af.slice().sort((a, b) => a - b);
-            renderAF();
+
+        let altFreqsChanged = false;
+        if (Array.isArray(d.altFreqs)) {
+            const newFp = d.altFreqs.map(x => parseFloat(x.freq).toFixed(1)).join(',');
+            const oldFp = st.altFreqs.map(x => parseFloat(x.freq).toFixed(1)).join(',');
+            if (newFp !== oldFp) {
+                altFreqsChanged = true;
+                st.altFreqs = d.altFreqs.slice();
+                st.altFreqs.sort((a, b) => parseFloat(a.freq) - parseFloat(b.freq));
+            }
         }
+
+        let afChanged = false;
+        if (Array.isArray(d.af) && d.af.length > 0) {
+            const merged = new Set(st.af.map(f => parseFloat(f).toFixed(1)));
+            const before = merged.size;
+            for (const f of d.af) merged.add(parseFloat(f).toFixed(1));
+            if (merged.size !== before) {
+                afChanged = true;
+                st.af = Array.from(merged).map(parseFloat).sort((a, b) => a - b);
+            }
+        }
+
+        if (afChanged) renderAF();
+
+        // Only re-render FMDX section when data actually changed
+        if (psNameChanged || altFreqsChanged || afChanged) renderPSName();
+
         if (d.ps && Array.isArray(d.ps))
             for (let i = 0; i < Math.min(d.ps.length, 8); i++) {
                 const p = d.ps[i];
@@ -354,14 +391,9 @@
     }
     function promoteRT(text) { if (text?.trim().length >= 4) st.rtLine1 = text; }
 
-    function renderAll() { renderPS(); renderRT(); renderPSName(); refreshStats(); }
+    function renderAll() { renderPS(); renderRT(); refreshStats(); }
 
-    // ── Confidence → colour ──────────────────────────────────
-    //  src = 'ref-match'  →  warm gold  (fmdx.org confirmed)
-    //  src = 'ref-seed'   →  dim amber  (fmdx.org, unconfirmed)
-    //  src = 'empty'      →  transparent
-    //  src = 'ai-bigram'  →  very dark (barely visible guess)
-    //  everything else    →  grey scale 20–240
+    // ── Confidence → colour ───────────────────────────────────
     function confToGray(conf, src) {
         if (src === 'empty') return 'transparent';
         if (src === 'ai-bigram') {
@@ -384,7 +416,7 @@
         return `rgb(${v},${v},${v})`;
     }
 
-    // ── Render PS characters ─────────────────────────────────
+    // ── Render PS characters ──────────────────────────────────
     function renderPS() {
         for (let i = 0; i < 8; i++) {
             const sl   = psSlots[i];
@@ -404,40 +436,35 @@
         }
     }
 
-    // ── Render stored PS name with live variant match chips ──
+    // ── Render FMDX.ORG section ───────────────────────────────
+    // Preserves scroll position of the frequency chip scroller across re-renders.
+    let _freqScrollTop = 0;
+
     function renderPSName() {
         const el = document.getElementById('rdsm-psname');
         if (!el) return;
 
-        const hasVariants = st.psVariants && st.psVariants.length > 0;
+        // Save scroll position before re-render
+        const existingScroller = document.getElementById('rdsm-freqscroller');
+        if (existingScroller) _freqScrollTop = existingScroller.scrollTop;
 
-        // Build current PS string from multiple sources:
-        // prefer fused psSlots, fall back to raw psBuf
         const fusedPS   = psSlots.map(s => (s.src !== 'empty' && s.char !== ' ') ? s.char : ' ').join('').trim().toUpperCase();
         const rawPS     = st.psBuf ? st.psBuf.join('').trim().toUpperCase() : '';
         const currentPS = (fusedPS.replace(/ /g,'').length >= rawPS.replace(/ /g,'').length)
             ? fusedPS : rawPS;
 
-        // Compute match score of a variant against both fused and raw PS
         function matchScore(variant) {
             const ref  = variant.trim().toUpperCase().padEnd(8, ' ');
             const cur  = currentPS.padEnd(8, ' ');
             const raw8 = rawPS.padEnd(8, ' ');
             let best = 0;
             for (const cmp of [cur, raw8]) {
-                // Position-aware match
                 let matches = 0, checked = 0;
                 for (let i = 0; i < 8; i++) {
-                    if (ref[i] !== ' ') {
-                        checked++;
-                        if (cmp[i] === ref[i]) matches++;
-                    }
+                    if (ref[i] !== ' ') { checked++; if (cmp[i] === ref[i]) matches++; }
                 }
                 const score = checked > 0 ? Math.round((matches / checked) * 100) : 0;
                 if (score > best) best = score;
-
-                // Position-independent match for short names (≤4 non-space chars)
-                // e.g. "DLF" received as "D l f" spread across positions
                 const refChars = ref.replace(/ /g, '');
                 const cmpChars = cmp.replace(/ /g, '');
                 if (refChars.length <= 4 && cmpChars.length > 0) {
@@ -449,15 +476,13 @@
             return best;
         }
 
-        // Station name header line (psName = e.g. "R.SA")
         const headerName = st.psName
             ? `<span style="font-size:14px;font-weight:600;color:#f0f0f0;
                 font-family:'Titillium Web',Calibri,sans-serif;
                 letter-spacing:normal;white-space:nowrap;">${st.psName}</span>`
             : '';
 
-        // Build a single chip HTML for one PS variant
-        function chipHTML(variant) {
+        function variantChipHTML(variant) {
             const score   = matchScore(variant);
             const isMatch = score === 100;
             const isClose = score >= 50 && !isMatch;
@@ -467,34 +492,140 @@
             const color  = isMatch ? '#fff' : isClose ? '#888' : '#444';
             const weight = isMatch ? '700' : '500';
             return `<span style="
-                display:inline-block;
-                background:${bg};border:1px solid ${border};
-                color:${color};font-weight:${weight};
-                font-size:11px;letter-spacing:.8px;
+                display:inline-block;background:${bg};border:1px solid ${border};
+                color:${color};font-weight:${weight};font-size:11px;letter-spacing:.8px;
                 font-family:'Titillium Web',Calibri,sans-serif;
                 padding:1px 7px;border-radius:4px;white-space:pre;cursor:default;
                 transition:color .3s,border-color .3s,background .3s;"
                 title="${variant.trim()}">${variant.padEnd(8,' ')}</span>`;
         }
 
-        let chipsHTML = '';
+        const hasVariants = st.psVariants && st.psVariants.length > 0;
+        let variantChips = '';
         if (hasVariants) {
-            chipsHTML = st.psVariants.map(chipHTML).join(' ');
+            variantChips = st.psVariants.map(variantChipHTML).join(' ');
         } else if (st.psName) {
-            chipsHTML = chipHTML(st.psName);
+            variantChips = variantChipHTML(st.psName);
         }
 
-        // Label + content – only update innerHTML, never touch display/visibility
+        const receivedFreqSet = new Set();
+        if (st.af && st.af.length > 0)
+            for (const f of st.af) receivedFreqSet.add(parseFloat(f).toFixed(1));
+        if (st.freq && st.freq !== '—')
+            receivedFreqSet.add(parseFloat(st.freq).toFixed(1));
+
+        let uniqueFreqs = [];
+        if (st.altFreqs && st.altFreqs.length > 0) {
+            const seen = new Set();
+            uniqueFreqs = st.altFreqs.filter(item => {
+                const key = parseFloat(item.freq).toFixed(1);
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
+        }
+
+        // ── AF coverage percentage ─────��──────────────────────
+        // Counts how many DB frequencies (altFreqs) have been received (st.af)
+        let afCoverageHTML = '';
+        if (uniqueFreqs.length > 0) {
+            const dbFreqSet = new Set(uniqueFreqs.map(item => parseFloat(item.freq).toFixed(1)));
+            let matched = 0;
+            for (const dbFreq of dbFreqSet) {
+                if (receivedFreqSet.has(dbFreq)) matched++;
+            }
+            const total   = dbFreqSet.size;
+            const pct     = Math.round((matched / total) * 100);
+            afCoverageHTML = `<span style="
+                font-size:10px;font-weight:700;letter-spacing:.5px;
+                color:#666;font-family:'Titillium Web',Calibri,sans-serif;
+                white-space:nowrap;"
+                title="AF received: ${matched} of ${total} from FMDX.ORG DB">
+                AF ${matched}/${total} (${pct}%)
+            </span>`;
+        }
+
+        const hasHeader    = !!st.psName;
+        const hasChips     = variantChips.length > 0;
+        const hasFreqRow   = uniqueFreqs.length > 0;
+        const hasCoverage  = afCoverageHTML.length > 0;
+
+        // Build the static structure
         el.innerHTML = `
-            <span class="rl" style="flex-shrink:0;">FMDX.ORG</span>
-            <div style="display:flex;flex-direction:column;gap:3px;width:100%;">
-                <div style="height:16px;display:flex;align-items:center;">${headerName}</div>
-                <div style="min-height:22px;display:flex;flex-wrap:wrap;
-                    gap:4px;align-items:center;margin-top:3px;margin-left:-1px;">${chipsHTML}</div>
+            <span class="rl" style="flex-shrink:0;padding-top:2px;">FMDX.ORG</span>
+            <div style="display:flex;flex-direction:column;gap:4px;width:100%;">
+                ${hasHeader ? `<div style="height:18px;display:flex;align-items:center;">${headerName}</div>` : ''}
+                ${hasChips  ? `<div style="display:flex;flex-wrap:wrap;gap:4px;align-items:center;">${variantChips}</div>` : ''}
+                ${hasCoverage ? `<div style="display:flex;align-items:center;gap:6px;padding-top:2px;">${afCoverageHTML}</div>` : ''}
+                ${hasFreqRow ? `<div id="rdsm-freqchips-wrap" style="padding-top:4px;border-top:1px solid rgba(255,255,255,.06);"></div>` : ''}
             </div>`;
+
+        if (hasFreqRow) {
+            const wrap = document.getElementById('rdsm-freqchips-wrap');
+            if (!wrap) return;
+
+            const freqChipItems = uniqueFreqs.map(item => {
+                const freqLabel = parseFloat(item.freq).toFixed(1);
+                const isMatch   = receivedFreqSet.has(freqLabel);
+                const bg        = isMatch ? 'var(--color-main-bright,#4a90d9)' : '#1c1c1c';
+                const border    = isMatch ? 'var(--color-main-bright,#4a90d9)' : '#2a2a2a';
+                const color     = isMatch ? '#fff' : '#444';
+                const weight    = isMatch ? '700'  : '500';
+                const tipV      = (item.psVariants && item.psVariants.length > 0)
+                    ? item.psVariants.map(v => v.trim()).filter(v => v).join(' / ') : '';
+                const tip = tipV ? `${freqLabel} MHz – ${tipV}` : `${freqLabel} MHz`;
+                return `<span style="
+                    display:inline-block;background:${bg};border:1px solid ${border};
+                    color:${color};font-weight:${weight};font-size:11px;letter-spacing:.5px;
+                    font-family:'Titillium Web',Calibri,sans-serif;
+                    padding:1px 7px;border-radius:4px;white-space:nowrap;cursor:default;
+                    transition:color .3s,border-color .3s,background .3s;"
+                    title="${tip}">${freqLabel}</span>`;
+            });
+
+            const CHIP_ROW_HEIGHT  = 24;
+            const MAX_VISIBLE_ROWS = 5;
+            const CHIPS_PER_ROW    = 5;
+            const maxH             = MAX_VISIBLE_ROWS * CHIP_ROW_HEIGHT;
+            const estimatedRows    = Math.ceil(freqChipItems.length / CHIPS_PER_ROW);
+            const needsScroll      = estimatedRows > MAX_VISIBLE_ROWS;
+
+            const scroller = document.createElement('div');
+            scroller.id = 'rdsm-freqscroller';
+            scroller.style.cssText = [
+                'display:flex',
+                'flex-wrap:wrap',
+                'gap:4px',
+                'align-items:flex-start',
+                needsScroll ? `max-height:${maxH}px` : '',
+                needsScroll ? 'overflow-y:scroll' : 'overflow-y:visible',
+                'overflow-x:hidden',
+                'scrollbar-width:thin',
+                'scrollbar-color:#444 #1a1a1a',
+                '-webkit-overflow-scrolling:touch',
+                'pointer-events:auto',
+            ].filter(Boolean).join(';');
+
+            scroller.innerHTML = freqChipItems.join('');
+
+            if (needsScroll) {
+                scroller.addEventListener('wheel', function(e) {
+                    e.stopPropagation();
+                    const atTop    = this.scrollTop === 0 && e.deltaY < 0;
+                    const atBottom = this.scrollTop + this.clientHeight >= this.scrollHeight - 1 && e.deltaY > 0;
+                    if (!atTop && !atBottom) e.preventDefault();
+                    this.scrollTop += e.deltaY;
+                }, { passive: false });
+            }
+
+            wrap.appendChild(scroller);
+
+            // Restore scroll position after DOM insertion
+            if (_freqScrollTop > 0) scroller.scrollTop = _freqScrollTop;
+        }
     }
 
-    // ── Render RadioText ─────────────────────────────────────
+    // ── Render RadioText ──────────────────────────────────────
     function renderRT() {
         const ab    = rtAB >= 0 ? rtAB : 0;
         const rt1El = document.getElementById('rdsm-rt1');
@@ -521,14 +652,15 @@
             : '<span style="color:#333">—</span>';
     }
 
-    // ── AF flag rendering ────────────────────────────────────
+    // ── AF flag rendering ─────────────────────────────────────
     function renderAF() {
         const el = document.getElementById('rdsm-af-flag');
         if (!el) return;
         if (st.af && st.af.length > 0) {
             el.className   = 'rf on';
             el.textContent = 'AF ' + st.af.length;
-            el.title       = 'Alternate Frequencies: ' + st.af.map(f => f.toFixed(1) + ' MHz').join(', ');
+            el.title       = 'Alternate Frequencies: ' +
+                st.af.map(f => parseFloat(f).toFixed(1)).join(', ');
         } else {
             el.className   = 'rf';
             el.textContent = 'AF';
@@ -536,20 +668,16 @@
         }
     }
 
-    // ── BER: 0% = perfect, 100% = all blocks lost ────────────
+    // ── BER: 0% = perfect, 100% = all blocks lost ─────────────
     function updateBER(errB) {
         if (!errB || !Array.isArray(errB)) return;
-
         const hasError = errB.some(e => e >= 2);
-
         if (errB[0] === 3) {
             st.ber.push(1);
             if (st.ber.length > 40) st.ber.shift();
         }
-
         st.ber.push(hasError ? 1 : 0);
         if (st.ber.length > 40) st.ber.shift();
-
         const errs   = st.ber.filter(v => v).length;
         const berPct = st.ber.length ? Math.round((errs / st.ber.length) * 100) : 0;
         const bar    = document.getElementById('rdsm-bf');
@@ -563,7 +691,7 @@
 
     function refreshStats() { setEl('rdsm-gc', `Groups: ${st.grpTotal}`); }
 
-    // ── Statistics panel ─────────────────────────────────────
+    // ── Statistics panel ──────────────────────────────────────
     function refreshStatsPanel() {
         if (!statsOpen) return;
         setEl('ai-cur-pi',  st.pi);
@@ -574,7 +702,6 @@
             setEl('ai-freq',    st.aiStats.freq || '—');
             setEl('ai-dynamic', st.aiStats.psIsDynamic ? '⚡ dynamic' : '🔒 static');
         }
-        // Reference station row
         const refRow = document.getElementById('ai-ref-row');
         if (st.refStation) {
             setEl('ai-ref-station', st.refStation);
@@ -584,7 +711,6 @@
         } else {
             if (refRow) refRow.style.display = 'none';
         }
-        // PS slot source breakdown
         const rawN  = psSlots.filter(s => s.src.startsWith('raw')).length;
         const dbN   = psSlots.filter(s => s.src === 'ai-cached-db').length;
         const hvote = psSlots.filter(s => s.src === 'ai-voted-high').length;
@@ -599,7 +725,7 @@
             `bigram:${bigN}  🌐:${refM}  🔶:${refS}  ✅:${vN}`);
     }
 
-    // ── RDS Follow button sync ───────────────────────────────
+    // ── RDS Follow button sync ────────────────────────────────
     function syncFollowUI() {
         const panelBtn = document.getElementById('rdsm-follow-btn');
         if (panelBtn) {
@@ -632,7 +758,7 @@
         syncFollowUI();
     }
 
-    // ── Full state reset on frequency change ─────────────────
+    // ── Full state reset on frequency change ──────────────────
     function reset() {
         st.pi = '----'; st.piCand = '----'; st.piN = 0;
         st.psBuf.fill(' '); st.psGroups.clear();
@@ -644,6 +770,8 @@
         st.psName     = null;
         st.psNameSrc  = null;
         st.psVariants = [];
+        st.altFreqs   = [];
+        _freqScrollTop = 0;
         _ptyCandidate = -1; _ptyCandCount = 0; _taCandidate = null; _taCandCount = 0;
         psSlots = mkPS(); rtSlots = [mkRT(64), mkRT(64)]; rtAB = -1;
         setEl('rdsm-pi', '----');
@@ -658,22 +786,16 @@
         if (rt2) rt2.innerHTML = '<span style="color:#333">—</span>';
         const ptyEl = document.getElementById('rdsm-pty');
         if (ptyEl) { ptyEl.textContent = '—'; ptyEl.title = ''; }
-        // Reset AF flag
         const afEl = document.getElementById('rdsm-af-flag');
         if (afEl) { afEl.textContent = 'AF'; afEl.className = 'rf'; afEl.title = ''; }
-        // Reset ECC flag
         const eccEl = document.getElementById('rdsm-ecc-flag');
         if (eccEl) { eccEl.textContent = 'ECC'; eccEl.className = 'rf'; eccEl.title = ''; }
-        // Reset PS name row – keep visible, only clear content to placeholder
         const psnEl = document.getElementById('rdsm-psname');
         if (psnEl) {
-            psnEl.style.display    = '';
-            psnEl.style.visibility = '';
             psnEl.innerHTML = `
-                <span class="rl" style="flex-shrink:0;">FMDX.ORG</span>
-                <div style="display:flex;flex-direction:column;gap:3px;width:100%;">
-                    <div style="height:16px;display:flex;align-items:center;"></div>
-                    <div style="min-height:22px;margin-top:10px;"></div>
+                <span class="rl" style="flex-shrink:0;padding-top:2px;">FMDX.ORG</span>
+                <div style="display:flex;flex-direction:column;gap:4px;width:100%;">
+                    <div style="min-height:4px;"></div>
                 </div>`;
         }
         GA.forEach(g => { const el = document.getElementById(`rg-${g}`); if (el) el.classList.remove('on'); });
@@ -685,8 +807,7 @@
         const bar = document.getElementById('rdsm-bf'), pct = document.getElementById('rdsm-bp');
         if (bar) { bar.style.width = '0%'; bar.style.background = '#44cc88'; }
         if (pct) pct.textContent = '0%';
-		
-		// If stats panel is open, immediately clear displayed values
+
         if (statsOpen) {
             setEl('ai-cur-pi',      '—');
             setEl('ai-active',      '⏳ waiting...');
@@ -700,7 +821,7 @@
         }
     }
 
-    // ── CSS injection ────────────────────────────────────────
+    // ── CSS injection ─────────────────────────────────────────
     function injectCSS() {
         if (document.getElementById('rdsm-css')) return;
         const s = document.createElement('style');
@@ -760,8 +881,8 @@
         #rdsm-psname{
             display:flex !important;visibility:visible !important;
             align-items:flex-start;
-            min-height:46px;max-height:46px;height:46px;
-            padding:2px 0;gap:8px;overflow:hidden;
+            min-height:28px;
+            padding:4px 0;gap:8px;
             box-sizing:border-box;flex-shrink:0;
             margin-bottom:8px;}
         #rdsm-stats{
@@ -805,6 +926,9 @@
             transition:max-height .25s ease,padding .25s ease;
             font-family:"Titillium Web",Calibri,sans-serif;}
         #rdsm-stats-pan.open{max-height:500px;padding:4px 14px 12px;}
+        #rdsm-panel #rdsm-psname { pointer-events:all; }
+        #rdsm-panel #rdsm-psname * { pointer-events:all; }
+        #rdsm-freqscroller { touch-action:pan-y; }
         .ai-stats-r{display:flex;justify-content:space-between;font-size:11px;color:#888;
             margin-bottom:5px;font-family:"Titillium Web",Calibri,sans-serif;}
         .ai-stats-r span{color:#ccc;font-weight:600;font-family:"Titillium Web",Calibri,sans-serif;}
@@ -820,10 +944,11 @@
         document.head.appendChild(s);
     }
 
+    // ── RDS group type labels ─────────────────────────────────
     const GA = [];
     for (let i = 0; i <= 15; i++) GA.push(`${i}A`, `${i}B`);
 
-    // ── Panel HTML ────────────────────────��──────────────────
+    // ── Panel HTML ────────────────────────────────────────────
     function createPanel() {
         if (document.getElementById('rdsm-panel')) return;
         const d = document.createElement('div');
@@ -894,10 +1019,9 @@
             </div>
             <hr class="rdiv">
             <div id="rdsm-psname">
-              <span class="rl" style="flex-shrink:0;">FMDX.ORG</span>
-              <div style="display:flex;flex-direction:column;gap:3px;width:100%;">
-                <div style="height:16px;display:flex;align-items:center;"></div>
-                <div style="min-height:22px;"></div>
+              <span class="rl" style="flex-shrink:0;padding-top:2px;">FMDX.ORG</span>
+              <div style="display:flex;flex-direction:column;gap:4px;width:100%;">
+                <div style="min-height:4px;"></div>
               </div>
             </div>
           </div>
@@ -956,6 +1080,7 @@
         makeDrag(d, document.getElementById('rdsm-hdr'));
     }
 
+    // ── Drag support ──────────────────────────────────────────
     function makeDrag(el, h) {
         let sx, sy, sl, st2, dr = false;
         h.addEventListener('mousedown', e => {
@@ -974,6 +1099,7 @@
         document.addEventListener('mouseup', () => { dr = false; el.classList.remove('drag'); });
     }
 
+    // ── Toolbar button ────────────────────────────────────────
     function addBtn() {
         let found = false;
         const obs = new MutationObserver((_, o) => {
@@ -1013,7 +1139,7 @@
         syncFollowUI();
     }
 
-    // ── WebSocket connection ─────────────────────────────────
+    // ── WebSocket connection ──────────────────────────────────
     let _wsFailToast = false;
     function connect() {
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
@@ -1038,7 +1164,7 @@
         ws.onmessage = e => onMessage(e.data);
     }
 
-    // ── DOM helpers ──────────────────────────────────────────
+    // ── DOM helpers ───────────────────────────────────────────
     const setEl   = (id, t) => { const e = document.getElementById(id); if (e) e.textContent = t; };
     const setDot  = ok => {
         const e = document.getElementById('rdsm-dot');
@@ -1046,7 +1172,7 @@
     };
     const setFlag = (id, on) => { const e = document.getElementById(id); if (e) e.className = 'rf' + (on ? ' on' : ''); };
 
-    // ── Admin detection ───────��──────────────────────────────
+    // ── Admin detection ───────────────────────────────────────
     let isAdmin = false;
     function checkAdminMode() {
         const bodyText = document.body.textContent || document.body.innerText;
@@ -1055,7 +1181,7 @@
     }
     checkAdminMode();
 
-    // ── Entry point ──────────────────────────────────────────
+    // ── Entry point ───────────────────────────────────────────
     function init() {
         if (window.location.pathname === '/setup') return;
         injectCSS();
