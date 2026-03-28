@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.1)  //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.2)  //
 //                                                           //
-//  by Highpoint                last update: 2026-03-26      //
+//  by Highpoint                last update: 2026-03-28      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -10,7 +10,7 @@
 
 (() => {
 
-    const pluginVersion         = '2.1';
+    const pluginVersion         = '2.2';
     const pluginName            = 'RDS AI Decoder';
     const pluginHomepageUrl     = 'https://github.com/Highpoint2000/RDS-AI-Decoder/releases';
     const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
@@ -221,6 +221,13 @@
         psNameSrc:  null,
         psVariants: [],
         altFreqs:   [],
+
+        // Provisional → locked UI support
+        psProvisional: null,
+        psProvisionalConf: 0,
+        psStableMs: 0,
+        psLockReason: null,
+        psLocked: false,
     };
 
     let ws = null, reconn = null;
@@ -362,6 +369,13 @@
         // Only re-render FMDX section when data actually changed
         if (psNameChanged || altFreqsChanged || afChanged) renderPSName();
 
+        // Provisional → locked fields
+        if (d.psProvisional !== undefined) st.psProvisional = d.psProvisional || null;
+        if (typeof d.psProvisionalConf === 'number') st.psProvisionalConf = d.psProvisionalConf;
+        if (typeof d.psStableMs === 'number') st.psStableMs = d.psStableMs;
+        if (d.psLockReason !== undefined) st.psLockReason = d.psLockReason || null;
+        if (typeof d.psLocked === 'boolean') st.psLocked = d.psLocked;
+
         if (d.ps && Array.isArray(d.ps))
             for (let i = 0; i < Math.min(d.ps.length, 8); i++) {
                 const p = d.ps[i];
@@ -379,6 +393,7 @@
         if (d.pi && d.pi !== st.pi && d.pi !== '----') { st.pi = d.pi; setEl('rdsm-pi', d.pi); }
         refreshStatsPanel();
         renderAll();
+        renderStatus();
     }
 
     function extractRTText(ab) {
@@ -417,7 +432,7 @@
         return `rgb(${v},${v},${v})`;
     }
 
-    // ── Render PS characters ──────────────────────────────────
+    // ── Render PS characters ─────────────────��────────────────
     function renderPS() {
         for (let i = 0; i < 8; i++) {
             const sl   = psSlots[i];
@@ -527,7 +542,6 @@
         }
 
         // ── AF coverage percentage ─────────────────────────────
-        // Counts how many DB frequencies (altFreqs) have been received (st.af)
         let afCoverageHTML = '';
         if (uniqueFreqs.length > 0) {
             const dbFreqSet = new Set(uniqueFreqs.map(item => parseFloat(item.freq).toFixed(1)));
@@ -551,7 +565,6 @@
         const hasFreqRow   = uniqueFreqs.length > 0;
         const hasCoverage  = afCoverageHTML.length > 0;
 
-        // Build the static structure
         el.innerHTML = `
             <span class="rl" style="flex-shrink:0;padding-top:2px;">FMDX.ORG</span>
             <div style="display:flex;flex-direction:column;gap:4px;width:100%;">
@@ -669,7 +682,7 @@
         }
     }
 
-    // ── BER: 0% = perfect, 100% = all blocks lost ──��──────────
+    // ── BER: 0% = perfect, 100% = all blocks lost ─────────────
     function updateBER(errB) {
         if (!errB || !Array.isArray(errB)) return;
         const hasError = errB.some(e => e >= 2);
@@ -726,6 +739,32 @@
             `bigram:${bigN}  🌐:${refM}  🔶:${refS}  ✅:${vN}`);
     }
 
+    // ── Render Provisional → Locked status ────────────────────
+    function renderStatus() {
+        const el = document.getElementById('rdsm-status');
+        if (!el) return;
+
+        if (st.psLocked) {
+            const reason = st.psLockReason ? ` – ${st.psLockReason}` : '';
+            el.innerHTML = `
+                <span class="rf on" style="background:#1b3b2a;color:#44ff88;border:1px solid #44ff88;padding:3px 7px;line-height:1.6;">LOCKED</span>
+                <span style="color:#777;font-size:11px;">${reason}</span>`;
+            return;
+        }
+
+        const confPct = Math.round((st.psProvisionalConf || 0) * 100);
+        if (st.psProvisional && confPct >= 55) {
+            const stableS = (st.psStableMs || 0) / 1000;
+            el.innerHTML = `
+                <span class="rf on" style="background:#2a2331;color:#c8a020;border:1px solid #c8a020;padding:3px 7px;line-height:1.6;">PROVISIONAL</span>
+                <span style="color:#888;font-size:11px;">${confPct}% · stable ${stableS.toFixed(1)}s</span>`;
+        } else {
+            el.innerHTML = `
+                <span class="rf" style="border:1px solid #2a2a2a;">WAIT</span>
+                <span style="color:#555;font-size:11px;">collecting…</span>`;
+        }
+    }
+
     // ── RDS Follow button sync ────────────────────────────────
     function syncFollowUI() {
         const panelBtn = document.getElementById('rdsm-follow-btn');
@@ -772,6 +811,13 @@
         st.psNameSrc  = null;
         st.psVariants = [];
         st.altFreqs   = [];
+
+        st.psProvisional     = null;
+        st.psProvisionalConf = 0;
+        st.psStableMs        = 0;
+        st.psLockReason      = null;
+        st.psLocked          = false;
+
         _freqScrollTop = 0;
         _ptyCandidate = -1; _ptyCandCount = 0; _taCandidate = null; _taCandCount = 0;
         psSlots = mkPS(); rtSlots = [mkRT(64), mkRT(64)]; rtAB = -1;
@@ -820,6 +866,7 @@
             const refRow = document.getElementById('ai-ref-row');
             if (refRow) refRow.style.display = 'none';
         }
+        renderStatus();
     }
 
     // ── CSS injection ─────────────────────────────────────────
@@ -944,6 +991,7 @@
             font-family:"Titillium Web",Calibri,sans-serif;}
         .rdiv{border:none;border-top:1px solid rgba(255,255,255,.07);margin:7px 0;}
         #rdsm-panel.drag{opacity:.85;cursor:move;}
+		#rdsm-status{overflow:visible;line-height:1.8;}
         `;
         document.head.appendChild(s);
     }
@@ -961,7 +1009,6 @@
           <div id="rdsm-hdr">
             <span class="rdsm-ht">${pluginName}</span>
             <span style="display:flex;align-items:center;gap:5px">
-
               <span id="rdsm-dot" title="Connection status"></span>
               <a id="rdsm-manual-link"
                  href="${pluginManualUrl}"
@@ -978,6 +1025,13 @@
             <div class="rr">
               <span class="rl">PI Code</span>
               <span class="rv" id="rdsm-pi">----</span>
+            </div>
+            <div class="rr">
+              <span class="rl">Status</span>
+              <span class="rv" id="rdsm-status">
+                <span class="rf" style="border:1px solid #2a2a2a;">WAIT</span>
+                <span style="color:#555;font-size:11px;">collecting…</span>
+              </span>
             </div>
             <hr class="rdiv">
             <div class="rr" style="align-items:flex-start">
