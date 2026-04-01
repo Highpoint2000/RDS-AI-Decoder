@@ -4,12 +4,12 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 
 
 
-## Version 2.2
+## Version 2.2a
 
-- New status field in the panel: displays decoding progress as WAIT → PROVISIONAL (with confidence % and stability in seconds) → LOCKED (with locking reason)
-- Five new WebSocket fields in the rdsm_ai protocol for transmitting the Provisional/Locked state from the server to the browser
-- renderStatus() – new client function that renders the status field and is automatically updated with every update and frequency change
-- _aiTimer raised to the module level to prevent duplicate or outdated broadcasts on parallel code paths
+- Statistics are now displayed on the right side
+- Unnecessary reloading of the TX database during GPS use is prevented
+- Code optimizations to reduce CPU load
+- Fixed error with the third decimal place in the FM DX web server frequency display
 
 ## Installation notes:
 
@@ -44,6 +44,13 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 2.2
+
+- New status field in the panel: displays decoding progress as WAIT → PROVISIONAL (with confidence % and stability in seconds) → LOCKED (with locking reason)
+- Five new WebSocket fields in the rdsm_ai protocol for transmitting the Provisional/Locked state from the server to the browser
+- renderStatus() – new client function that renders the status field and is automatically updated with every update and frequency change
+- _aiTimer raised to the module level to prevent duplicate or outdated broadcasts on parallel code paths
 
 ### Version 2.1
 

@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.2)  //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.2a) //
 //                                                           //
-//  by Highpoint                last update: 2026-03-28      //
+//  by Highpoint                last update: 2026-04-01      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -10,13 +10,13 @@
 
 (() => {
 
-    const pluginVersion         = '2.2';
+    const pluginVersion         = '2.2a';
     const pluginName            = 'RDS AI Decoder';
     const pluginHomepageUrl     = 'https://github.com/Highpoint2000/RDS-AI-Decoder/releases';
     const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
     const pluginSetupOnlyNotify = false;
     const CHECK_FOR_UPDATES     = true;
-    const pluginManualUrl       = 'https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation-v2.1.html';
+    const pluginManualUrl       = 'https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation-v2.2a.html';
 
     if (typeof sendToast !== 'function') {
         window.sendToast = function(cls, src, txt) {
@@ -36,7 +36,7 @@
                 const remoteVer = match[1];
                 if (remoteVer === pluginVersion) return;
                 sendToast('warning', name,
-                    `Update available: v${pluginVersion} → v${remoteVer}. <a href="${urlUpdateLink}" target="_blank">Download</a>`);
+                    `Update available: v${pluginVersion} -> v${remoteVer}. <a href="${urlUpdateLink}" target="_blank">Download</a>`);
                 if (!setupOnly || isSetupPath) {
                     const settings = document.getElementById('plugin-settings');
                     if (settings && !settings.innerHTML.includes(urlUpdateLink))
@@ -142,7 +142,7 @@
             psSlots[pos] = {char, conf, src, rawOk:cur.rawOk, rawChar:cur.rawChar};
     }
 
-    // ── PS fusion: incoming AI prediction ────────────────────
+    // ── PS fusion: incoming AI prediction ───────────────────
     function fusePS_ai(pos, char, conf, src) {
         const cur = psSlots[pos];
         if (cur.rawOk >= 2 && cur.src.startsWith('raw')) return;
@@ -210,7 +210,7 @@
         pty:-1, tp:false, ta:false, ms:false, stereo:false,
         rtabFlag:-1, ecc:'',
         grpTotal:0, ber:[],
-        freq:'—',
+        freq:'-',
         aiStats:null, aiActive:false,
         _freqChangeTs:0,
         rtLine1:'', rtLine2:'',
@@ -229,6 +229,29 @@
         psLockReason: null,
         psLocked: false,
     };
+
+    // ── Change-detection fingerprint for PS slots ─────────────
+    let _lastPSFingerprint = '';
+    let _lastRTFingerprint = '';
+
+    function psSlotsFingerprint() {
+        let s = '';
+        for (let i = 0; i < 8; i++) {
+            const sl = psSlots[i];
+            s += sl.char + sl.conf.toFixed(2) + sl.src + '|';
+        }
+        return s;
+    }
+    function rtSlotsFingerprint(ab) {
+        let s = '';
+        const end = Math.min(64, rtSlots[ab].length);
+        for (let i = 0; i < end; i++) {
+            const sl = rtSlots[ab][i];
+            if (sl.conf <= 0) break;
+            s += sl.char + sl.conf.toFixed(2) + '|';
+        }
+        return s;
+    }
 
     let ws = null, reconn = null;
     let panelVis = false, statsOpen = false;
@@ -250,8 +273,8 @@
     function onFreq(d) {
         st._freqChangeTs = Date.now();
         reset();
-        st.freq = d.freq || '—';
-        setEl('rdsm-freq', st.freq !== '—' ? st.freq + ' MHz' : '—');
+        st.freq = d.freq || '-';
+        setEl('rdsm-freq', st.freq !== '-' ? st.freq + ' MHz' : '-');
     }
 
     // ── Raw RDS group handler ─────────────────────────────────
@@ -306,11 +329,13 @@
             if (d.b4 && c4 > 0) { fuseRT(abF, addr, rCh((g4>>8)&0xFF), c4, s4); fuseRT(abF, addr+1, rCh(g4&0xFF), c4, s4); }
         }
         if (gT === 1 && vB === 0 && d.b3 && d.errB[2] <= 1 && ((g2>>1)&7) === 0) {
-            const eccVal = (g3&0xFF).toString(16).toUpperCase().padStart(2,'0');
-            if (eccVal !== st.ecc) {
-                st.ecc = eccVal;
+            const eccVal = (g4 !== undefined ? (parseInt(d.b3,16)&0xFF) : NaN);
+            const eccStr = !isNaN(eccVal) && eccVal > 0
+                ? eccVal.toString(16).toUpperCase().padStart(2,'0') : null;
+            if (eccStr && eccStr !== st.ecc) {
+                st.ecc = eccStr;
                 const el = document.getElementById('rdsm-ecc-flag');
-                if (el) { el.textContent = 'ECC ' + eccVal; el.className = 'rf on'; el.title = 'Extended Country Code: 0x' + eccVal; }
+                if (el) { el.textContent = 'ECC ' + eccStr; el.className = 'rf on'; el.title = 'Extended Country Code: 0x' + eccStr; }
             }
         }
         updateBER(d.errB);
@@ -365,8 +390,6 @@
         }
 
         if (afChanged) renderAF();
-
-        // Only re-render FMDX section when data actually changed
         if (psNameChanged || altFreqsChanged || afChanged) renderPSName();
 
         // Provisional → locked fields
@@ -376,23 +399,37 @@
         if (d.psLockReason !== undefined) st.psLockReason = d.psLockReason || null;
         if (typeof d.psLocked === 'boolean') st.psLocked = d.psLocked;
 
-        if (d.ps && Array.isArray(d.ps))
+        let psSlotsChanged = false;
+        if (d.ps && Array.isArray(d.ps)) {
             for (let i = 0; i < Math.min(d.ps.length, 8); i++) {
                 const p = d.ps[i];
                 if (!p || !p.char || p.char === ' ') continue;
+                const before = psSlots[i].char + psSlots[i].conf + psSlots[i].src;
                 fusePS_ai(i, p.char, p.conf || 0, p.src || 'ai-voted-mid');
+                const after = psSlots[i].char + psSlots[i].conf + psSlots[i].src;
+                if (before !== after) psSlotsChanged = true;
             }
+        }
+
+        let rtChanged = false;
         if (d.rt?.text) {
             const ab = rtAB >= 0 ? rtAB : 0, sc = Math.min(d.rt.score || 0.5, 0.85);
             for (let i = 0; i < Math.min(d.rt.text.length, 64); i++) {
                 const c = d.rt.text[i]; if (!c || c === '\r') break;
-                if (rtSlots[ab][i].conf < sc) fuseRT(ab, i, c, sc, 'ai-rt-match');
+                if (rtSlots[ab][i].conf < sc) {
+                    fuseRT(ab, i, c, sc, 'ai-rt-match');
+                    rtChanged = true;
+                }
             }
-            if (!st.rtLine1 && d.rt.src === 'ai-rt-last') st.rtLine1 = d.rt.text;
+            if (!st.rtLine1 && d.rt.src === 'ai-rt-last') { st.rtLine1 = d.rt.text; rtChanged = true; }
         }
+
         if (d.pi && d.pi !== st.pi && d.pi !== '----') { st.pi = d.pi; setEl('rdsm-pi', d.pi); }
+
+        if (psSlotsChanged) renderPS();
+        if (rtChanged) renderRT();
+
         refreshStatsPanel();
-        renderAll();
         renderStatus();
     }
 
@@ -432,8 +469,12 @@
         return `rgb(${v},${v},${v})`;
     }
 
-    // ── Render PS characters ─────────────────��────────────────
+    // ── Render PS characters ──────────────────────────────────
     function renderPS() {
+        const fp = psSlotsFingerprint();
+        if (fp === _lastPSFingerprint) return;
+        _lastPSFingerprint = fp;
+
         for (let i = 0; i < 8; i++) {
             const sl   = psSlots[i];
             const chEl = document.getElementById(`rdsm-c${i}`);
@@ -453,14 +494,12 @@
     }
 
     // ── Render FMDX.ORG section ───────────────────────────────
-    // Preserves scroll position of the frequency chip scroller across re-renders.
     let _freqScrollTop = 0;
 
     function renderPSName() {
         const el = document.getElementById('rdsm-psname');
         if (!el) return;
 
-        // Save scroll position before re-render
         const existingScroller = document.getElementById('rdsm-freqscroller');
         if (existingScroller) _freqScrollTop = existingScroller.scrollTop;
 
@@ -527,7 +566,7 @@
         const receivedFreqSet = new Set();
         if (st.af && st.af.length > 0)
             for (const f of st.af) receivedFreqSet.add(parseFloat(f).toFixed(1));
-        if (st.freq && st.freq !== '—')
+        if (st.freq && st.freq !== '-')
             receivedFreqSet.add(parseFloat(st.freq).toFixed(1));
 
         let uniqueFreqs = [];
@@ -541,7 +580,6 @@
             });
         }
 
-        // ── AF coverage percentage ─────────────────────────────
         let afCoverageHTML = '';
         if (uniqueFreqs.length > 0) {
             const dbFreqSet = new Set(uniqueFreqs.map(item => parseFloat(item.freq).toFixed(1)));
@@ -587,7 +625,7 @@
                 const weight    = isMatch ? '700'  : '500';
                 const tipV      = (item.psVariants && item.psVariants.length > 0)
                     ? item.psVariants.map(v => v.trim()).filter(v => v).join(' / ') : '';
-                const tip = tipV ? `${freqLabel} MHz – ${tipV}` : `${freqLabel} MHz`;
+                const tip = tipV ? `${freqLabel} MHz - ${tipV}` : `${freqLabel} MHz`;
                 return `<span style="
                     display:inline-block;background:${bg};border:1px solid ${border};
                     color:${color};font-weight:${weight};font-size:11px;letter-spacing:.5px;
@@ -634,7 +672,6 @@
 
             wrap.appendChild(scroller);
 
-            // Restore scroll position after DOM insertion
             if (_freqScrollTop > 0) scroller.scrollTop = _freqScrollTop;
         }
     }
@@ -642,6 +679,10 @@
     // ── Render RadioText ──────────────────────────────────────
     function renderRT() {
         const ab    = rtAB >= 0 ? rtAB : 0;
+        const fp = rtSlotsFingerprint(ab) + '|' + st.rtLine1;
+        if (fp === _lastRTFingerprint) return;
+        _lastRTFingerprint = fp;
+
         const rt1El = document.getElementById('rdsm-rt1');
         const rt2El = document.getElementById('rdsm-rt2');
         if (!rt1El || !rt2El) return;
@@ -658,12 +699,12 @@
             }
             st.rtLine2 = extractRTText(ab);
         } else {
-            html2 = '<span style="color:#333">—</span>';
+            html2 = '<span style="color:#333">-</span>';
         }
         rt2El.innerHTML = html2;
         rt1El.innerHTML = st.rtLine1
             ? `<span style="color:#909090">${st.rtLine1.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>`
-            : '<span style="color:#333">—</span>';
+            : '<span style="color:#333">-</span>';
     }
 
     // ── AF flag rendering ─────────────────────────────────────
@@ -711,15 +752,15 @@
         setEl('ai-cur-pi',  st.pi);
         setEl('ai-active',  st.aiActive ? '✅ active' : '⏳ waiting...');
         if (st.aiStats) {
-            setEl('ai-seen',    st.aiStats.seenCount?.toLocaleString() || '—');
-            setEl('ai-votes',   st.aiStats.psVoteTotal?.toLocaleString() || '—');
-            setEl('ai-freq',    st.aiStats.freq || '—');
+            setEl('ai-seen',    st.aiStats.seenCount?.toLocaleString() || '-');
+            setEl('ai-votes',   st.aiStats.psVoteTotal?.toLocaleString() || '-');
+            setEl('ai-freq',    st.aiStats.freq || '-');
             setEl('ai-dynamic', st.aiStats.psIsDynamic ? '⚡ dynamic' : '🔒 static');
         }
         const refRow = document.getElementById('ai-ref-row');
         if (st.refStation) {
             setEl('ai-ref-station', st.refStation);
-            setEl('ai-ref-dist',    st.refDistKm !== null ? st.refDistKm + ' km' : '—');
+            setEl('ai-ref-dist',    st.refDistKm !== null ? st.refDistKm + ' km' : '-');
             setEl('ai-ref-match',   st.refMatchScore + '%');
             if (refRow) refRow.style.display = '';
         } else {
@@ -745,7 +786,7 @@
         if (!el) return;
 
         if (st.psLocked) {
-            const reason = st.psLockReason ? ` – ${st.psLockReason}` : '';
+            const reason = st.psLockReason ? ` - ${st.psLockReason}` : '';
             el.innerHTML = `
                 <span class="rf on" style="background:#1b3b2a;color:#44ff88;border:1px solid #44ff88;padding:3px 7px;line-height:1.6;">LOCKED</span>
                 <span style="color:#777;font-size:11px;">${reason}</span>`;
@@ -765,7 +806,7 @@
         }
     }
 
-    // ── RDS Follow button sync ────────────────────────────────
+    // ── RDS Follow button sync ───────────────────────────────
     function syncFollowUI() {
         const panelBtn = document.getElementById('rdsm-follow-btn');
         if (panelBtn) {
@@ -773,8 +814,8 @@
             panelBtn.title = !isAdmin
                 ? 'Administrator login required to toggle RDS Follow'
                 : st.rdsFollow
-                    ? 'RDS Follow active – AI feeds the web server'
-                    : 'RDS Follow inactive – native decoder active';
+                    ? 'RDS Follow active - AI feeds the web server'
+                    : 'RDS Follow inactive - native decoder active';
             panelBtn.style.opacity = isAdmin ? '' : '0.5';
             panelBtn.style.cursor  = isAdmin ? 'pointer' : 'not-allowed';
         }
@@ -819,6 +860,8 @@
         st.psLocked          = false;
 
         _freqScrollTop = 0;
+        _lastPSFingerprint = '';
+        _lastRTFingerprint = '';
         _ptyCandidate = -1; _ptyCandCount = 0; _taCandidate = null; _taCandCount = 0;
         psSlots = mkPS(); rtSlots = [mkRT(64), mkRT(64)]; rtAB = -1;
         setEl('rdsm-pi', '----');
@@ -829,10 +872,12 @@
             if (b)  { b.style.width = '0%'; b.style.background = 'transparent'; b.style.opacity = '0'; }
         }
         const rt1 = document.getElementById('rdsm-rt1'), rt2 = document.getElementById('rdsm-rt2');
-        if (rt1) rt1.innerHTML = '<span style="color:#333">—</span>';
-        if (rt2) rt2.innerHTML = '<span style="color:#333">—</span>';
+        if (rt1) rt1.innerHTML = '<span style="color:#333">-</span>';
+        if (rt2) rt2.innerHTML = '<span style="color:#333">-</span>';
+        
         const ptyEl = document.getElementById('rdsm-pty');
-        if (ptyEl) { ptyEl.textContent = '—'; ptyEl.title = ''; }
+        if (ptyEl) { ptyEl.textContent = '-'; ptyEl.title = ''; } // Hier war vorher noch ein leerer String ''
+        
         const afEl = document.getElementById('rdsm-af-flag');
         if (afEl) { afEl.textContent = 'AF'; afEl.className = 'rf'; afEl.title = ''; }
         const eccEl = document.getElementById('rdsm-ecc-flag');
@@ -856,12 +901,12 @@
         if (pct) pct.textContent = '0%';
 
         if (statsOpen) {
-            setEl('ai-cur-pi',      '—');
+            setEl('ai-cur-pi',      '-');
             setEl('ai-active',      '⏳ waiting...');
-            setEl('ai-seen',        '—');
-            setEl('ai-votes',       '—');
-            setEl('ai-freq',        '—');
-            setEl('ai-dynamic',     '—');
+            setEl('ai-seen',        '-');
+            setEl('ai-votes',       '-');
+            setEl('ai-freq',        '-');
+            setEl('ai-dynamic',     '-');
             setEl('ai-ps-breakdown','');
             const refRow = document.getElementById('ai-ref-row');
             if (refRow) refRow.style.display = 'none';
@@ -875,15 +920,27 @@
         const s = document.createElement('style');
         s.id = 'rdsm-css';
         s.textContent = `
-        #rdsm-panel{position:fixed;top:70px;right:20px;width:390px;
+        #rdsm-panel-container { display:flex; position:fixed; top:70px; right:20px; z-index:9999; pointer-events:none; }
+        #rdsm-panel { pointer-events:auto; width:390px;
             background:var(--color-bg-1,#13151f);
             border:1px solid var(--color-main-bright,#4a90d9);
             border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6);
-            z-index:9999;font-family:"Titillium Web",Calibri,sans-serif;
-            color:#e0e0e0;overflow:hidden;display:none;user-select:none;}
-        #rdsm-panel.vis{display:block;}
+            font-family:"Titillium Web",Calibri,sans-serif;
+            color:#e0e0e0;display:none;user-select:none;
+            flex-direction:column;}
+        #rdsm-panel-container.vis #rdsm-panel {display:flex;}
+        #rdsm-stats-pan { pointer-events:auto; width:280px; margin-left:10px;
+            background:var(--color-bg-1,#13151f);
+            border:1px solid var(--color-main-bright,#4a90d9);
+            border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6);
+            font-family:"Titillium Web",Calibri,sans-serif;
+            color:#e0e0e0;display:none;user-select:none;
+            flex-direction:column; padding:12px; height:fit-content;}
+        #rdsm-panel-container.vis.stats-open #rdsm-stats-pan {display:flex;}
+        
         #rdsm-hdr{display:flex;align-items:center;justify-content:space-between;
-            padding:10px 14px 8px;background:var(--color-main-bright,#4a90d9);cursor:move;}
+            padding:10px 14px 8px;background:var(--color-main-bright,#4a90d9);cursor:move;
+            border-radius:11px 11px 0 0;}
         .rdsm-ht{font-size:14px;font-weight:700;color:#fff;text-transform:uppercase;
             letter-spacing:1px;font-family:"Titillium Web",Calibri,sans-serif;}
         #rdsm-dot{display:inline-block;width:16px;height:6px;border-radius:50%;
@@ -902,7 +959,7 @@
             font-family:"Titillium Web",Calibri,sans-serif;}
         .rv{font-size:14px;font-weight:600;flex:1;color:#f0f0f0;
             overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-            font-family:"Titillium Web",Calibri,sans-serif;}
+            font-family:"Titillium Web",Calibri,sans-serif; display:flex; align-items:center;}
         #rdsm-ps{display:flex;gap:2px;flex:1;}
         .rpc{display:flex;flex-direction:column;align-items:center;width:20px;}
         .rpc .c{font-size:24px;font-weight:700;font-family:"Titillium Web",Calibri,sans-serif;
@@ -962,24 +1019,22 @@
         #rdsm-bp{display:inline-block;min-width:3.2ch;text-align:right;}
         #rdsm-btn:hover{color:var(--color-5);filter:brightness(120%);}
         #rdsm-btn.active{background-color:var(--color-2)!important;filter:brightness(120%);}
-        #rdsm-stats-hdr{border-top:1px solid rgba(255,255,255,.08);background:#0d0f18;
-            padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:6px;
-            user-select:none;transition:background .2s;}
-        #rdsm-stats-hdr:hover{background:#111420;}
-        #rdsm-stats-arrow{font-size:9px;color:var(--color-main-bright,#4a90d9);
-            transition:transform .2s;display:inline-block;
-            font-family:"Titillium Web",Calibri,sans-serif;}
-        #rdsm-stats-hdr.open #rdsm-stats-arrow{transform:rotate(90deg);}
-        .stats-title{font-size:10px;font-weight:700;color:var(--color-main-bright,#4a90d9);
-            text-transform:uppercase;letter-spacing:1px;
-            font-family:"Titillium Web",Calibri,sans-serif;}
-        #rdsm-stats-pan{background:#0d0f18;padding:0 14px;max-height:0;overflow:hidden;
-            transition:max-height .25s ease,padding .25s ease;
-            font-family:"Titillium Web",Calibri,sans-serif;}
-        #rdsm-stats-pan.open{max-height:500px;padding:4px 14px 12px;}
+        
+        #rdsm-stats-btn{font-size:10px;font-weight:700;color:var(--color-main-bright,#4a90d9);
+            text-transform:uppercase;letter-spacing:1px; cursor:pointer;
+            font-family:"Titillium Web",Calibri,sans-serif; display:flex; align-items:center; gap:4px;
+            margin-left:auto;}
+        #rdsm-stats-btn:hover{color:#fff;}
+        #rdsm-stats-arrow{font-size:8px;transition:transform .2s; display:inline-block; transform:rotate(-90deg);}
+        .stats-open #rdsm-stats-arrow{transform:rotate(0deg);}
+
         #rdsm-panel #rdsm-psname { pointer-events:all; }
         #rdsm-panel #rdsm-psname * { pointer-events:all; }
         #rdsm-freqscroller { touch-action:pan-y; }
+        
+        .ai-stats-title{font-size:12px;font-weight:700;color:var(--color-main-bright,#4a90d9);
+            text-transform:uppercase;letter-spacing:1px; margin-bottom:10px;
+            font-family:"Titillium Web",Calibri,sans-serif; border-bottom:1px solid rgba(255,255,255,.1); padding-bottom:4px;}
         .ai-stats-r{display:flex;justify-content:space-between;font-size:11px;color:#888;
             margin-bottom:5px;font-family:"Titillium Web",Calibri,sans-serif;}
         .ai-stats-r span{color:#ccc;font-weight:600;font-family:"Titillium Web",Calibri,sans-serif;}
@@ -987,11 +1042,11 @@
             color:#888;margin-bottom:5px;font-family:"Titillium Web",Calibri,sans-serif;
             background:rgba(200,160,32,.08);border-radius:4px;padding:3px 6px;}
         .ai-stats-ref span{color:#c8a020;font-weight:600;}
-        .ai-stats-leg{font-size:9px;color:#555;margin-top:8px;line-height:2;
+        .ai-stats-leg{font-size:9px;color:#555;margin-top:auto;line-height:2;
             font-family:"Titillium Web",Calibri,sans-serif;}
         .rdiv{border:none;border-top:1px solid rgba(255,255,255,.07);margin:7px 0;}
-        #rdsm-panel.drag{opacity:.85;cursor:move;}
-		#rdsm-status{overflow:visible;line-height:1.8;}
+        #rdsm-panel-container.drag{opacity:.85;cursor:move;}
+        #rdsm-status{overflow:visible;line-height:1.8;}
         `;
         document.head.appendChild(s);
     }
@@ -1002,10 +1057,11 @@
 
     // ── Panel HTML ────────────────────────────────────────────
     function createPanel() {
-        if (document.getElementById('rdsm-panel')) return;
-        const d = document.createElement('div');
-        d.id = 'rdsm-panel';
-        d.innerHTML = `
+        if (document.getElementById('rdsm-panel-container')) return;
+        const c = document.createElement('div');
+        c.id = 'rdsm-panel-container';
+        c.innerHTML = `
+        <div id="rdsm-panel">
           <div id="rdsm-hdr">
             <span class="rdsm-ht">${pluginName}</span>
             <span style="display:flex;align-items:center;gap:5px">
@@ -1020,7 +1076,10 @@
           <div id="rdsm-body">
             <div class="rr">
               <span class="rl">Freq</span>
-              <span class="rv" id="rdsm-freq">—</span>
+              <span class="rv">
+                <span id="rdsm-freq">-</span>
+                <span id="rdsm-stats-btn"><span id="rdsm-stats-arrow">▶</span> STATISTICS</span>
+              </span>
             </div>
             <div class="rr">
               <span class="rl">PI Code</span>
@@ -1049,16 +1108,16 @@
             <hr class="rdiv">
             <div class="rr">
               <span class="rl">PTY</span>
-              <span class="rv" id="rdsm-pty">—</span>
+              <span class="rv" id="rdsm-pty">-</span>
             </div>
             <hr class="rdiv">
             <div class="rr" style="align-items:flex-start">
               <span class="rl" style="margin-top:1px">RT</span>
               <div id="rdsm-rt-wrap">
                 <span class="rt-line-label">previous RT</span>
-                <span class="rt-line" id="rdsm-rt1"><span style="color:#333">—</span></span>
+                <span class="rt-line" id="rdsm-rt1"><span style="color:#333">-</span></span>
                 <span class="rt-line-label">current</span>
-                <span class="rt-line" id="rdsm-rt2"><span style="color:#333">—</span></span>
+                <span class="rt-line" id="rdsm-rt2"><span style="color:#333">-</span></span>
               </div>
             </div>
             <hr class="rdiv">
@@ -1100,25 +1159,23 @@
               <span id="rdsm-bp">0%</span>
             </span>
           </div>
-          <div id="rdsm-stats-hdr">
-            <span id="rdsm-stats-arrow">▶</span>
-            <span class="stats-title">Statistics</span>
-          </div>
-          <div id="rdsm-stats-pan">
+        </div>
+        <div id="rdsm-stats-pan">
+            <div class="ai-stats-title">STATISTICS</div>
             <div class="ai-stats-r">AI connection: <span id="ai-active">⏳</span></div>
-            <div class="ai-stats-r">Current PI: <span id="ai-cur-pi">—</span></div>
-            <div class="ai-stats-r">PS type: <span id="ai-dynamic">—</span></div>
-            <div class="ai-stats-r">Groups received: <span id="ai-seen">—</span></div>
-            <div class="ai-stats-r">PS votes total: <span id="ai-votes">—</span></div>
-            <div class="ai-stats-r">Last seen on: <span id="ai-freq">—</span></div>
+            <div class="ai-stats-r">Current PI: <span id="ai-cur-pi">-</span></div>
+            <div class="ai-stats-r">PS type: <span id="ai-dynamic">-</span></div>
+            <div class="ai-stats-r">Groups received: <span id="ai-seen">-</span></div>
+            <div class="ai-stats-r">PS votes total: <span id="ai-votes">-</span></div>
+            <div class="ai-stats-r">Last seen on: <span id="ai-freq">-</span></div>
             <div class="ai-stats-ref" id="ai-ref-row" style="display:none">
               <span style="color:#888">🌐 fmdx.org</span>
               <span id="ai-ref-station" style="flex:1;margin:0 8px;overflow:hidden;
                 text-overflow:ellipsis;white-space:nowrap"></span>
               <span id="ai-ref-dist" style="margin-right:8px;color:#888"></span>
-              <span>match: <span id="ai-ref-match">—</span></span>
+              <span>match: <span id="ai-ref-match">-</span></span>
             </div>
-            <div class="ai-stats-r" style="flex-direction:column;gap:3px">
+            <div class="ai-stats-r" style="flex-direction:column;gap:3px; margin-top:8px;">
               PS slots:<br>
               <span id="ai-ps-breakdown"
                 style="color:#888;font-size:10px;
@@ -1129,18 +1186,19 @@
               🌐 = fmdx.org confirmed (gold) · 🔶 = fmdx.org seed (amber)<br>
               ✅ = raw-verified (2× err≤1, same char)
             </div>
-          </div>
+        </div>
         `;
-        document.body.appendChild(d);
+        document.body.appendChild(c);
+        
         document.getElementById('rdsm-close').addEventListener('click', hidePanel);
         document.getElementById('rdsm-follow-btn').addEventListener('click', toggleRdsFollow);
-        document.getElementById('rdsm-stats-hdr').addEventListener('click', () => {
+        document.getElementById('rdsm-stats-btn').addEventListener('click', () => {
             statsOpen = !statsOpen;
-            document.getElementById('rdsm-stats-hdr').classList.toggle('open', statsOpen);
-            document.getElementById('rdsm-stats-pan').classList.toggle('open', statsOpen);
+            c.classList.toggle('stats-open', statsOpen);
             if (statsOpen) refreshStatsPanel();
         });
-        makeDrag(d, document.getElementById('rdsm-hdr'));
+        
+        makeDrag(c, document.getElementById('rdsm-hdr'));
     }
 
     // ── Drag support ──────────────────────────────────────────
@@ -1176,10 +1234,11 @@
                 o2.disconnect();
                 btn.classList.add('hide-phone', 'bg-color-2');
                 btn.addEventListener('click', () => {
+                    const c = document.getElementById('rdsm-panel-container');
                     if (!panelVis) {
                         panelVis = true; btn.classList.add('active');
-                        $('#rdsm-panel').stop(true, true).fadeIn(400, () => {
-                            document.getElementById('rdsm-panel').classList.add('vis');
+                        $(c).stop(true, true).fadeIn(400, () => {
+                            c.classList.add('vis');
                         });
                     } else { hidePanel(); }
                 });
@@ -1195,10 +1254,13 @@
         panelVis = false;
         const btn = document.getElementById('rdsm-btn');
         if (btn) btn.classList.remove('active');
-        $('#rdsm-panel').stop(true, true).fadeOut(400, () => {
-            const p = document.getElementById('rdsm-panel');
-            if (p) { p.classList.remove('vis'); p.style.display = 'none'; }
-        });
+        const c = document.getElementById('rdsm-panel-container');
+        if (c) {
+            $(c).stop(true, true).fadeOut(400, () => {
+                c.classList.remove('vis'); 
+                c.style.display = '';
+            });
+        }
         syncFollowUI();
     }
 

@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.2)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.2a) //
 //                                                           //
-//  by Highpoint                last update: 2026-03-28      //
+//  by Highpoint                last update: 2026-01-04      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.2',
+    version:      '2.2a',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -41,6 +41,11 @@ const AI_BROADCAST_DELAY   = 80; // ms
 
 const FMDX_RADIUS_KM       = 3000;
 const FMDX_BULK_TTL_MS     = 6 * 60 * 60 * 1000;
+
+// Minimum distance (km) the GPS position must move before the fmdx.org
+// index is rebuilt from cache.  3000 km stations are already included,
+// so a 100 km shift doesn't change which transmitters are reachable.
+const FMDX_REINDEX_MIN_DIST_KM = 100;
 
 const PI_CONFIRM_THRESHOLD = 2;
 const GHOST_PI_THRESHOLD   = 8; // eslint-disable-line no-unused-vars
@@ -88,6 +93,12 @@ let qualWindow = [];
 let ownLat = null;
 let ownLon = null;
 
+// Last GPS position used for the fmdx.org index build.
+// Kept separate from ownLat/ownLon so that small GPS jitter
+// does not continuously retrigger expensive index rebuilds.
+let fmdxIndexLat = null;
+let fmdxIndexLon = null;
+
 let gpsWsClient      = null;
 let gpsWsReconnTimer = null;
 let gpsWsConnected   = false; // eslint-disable-line no-unused-vars
@@ -120,6 +131,13 @@ let currentState = {
     afSet: new Set(),
 };
 
+// ── Round GPS coordinates to 2 decimal places (~1 km) ─────────
+// This prevents GPS noise (sub-meter jitter) from causing
+// repeated index rebuilds.
+function roundGps(coord) {
+    return Math.round(coord * 100) / 100;
+}
+
 // ── GPS WebSocket listener ────────────────────────────────────
 function startGpsWsListener() {
     let wsPort = 8080;
@@ -145,15 +163,35 @@ function startGpsWsListener() {
             try {
                 const msg = JSON.parse(raw);
                 if (msg.type === 'GPS' && msg.value) {
-                    const lat = parseFloat(msg.value.lat);
-                    const lon = parseFloat(msg.value.lon);
-                    if (!isNaN(lat) && !isNaN(lon) && msg.value.status === 'active') {
-                        if (lat !== ownLat || lon !== ownLon) {
-                            ownLat = lat; ownLon = lon;
-                            if (fmdxLoadedAt > 0) {
+                    const rawLat = parseFloat(msg.value.lat);
+                    const rawLon = parseFloat(msg.value.lon);
+                    if (!isNaN(rawLat) && !isNaN(rawLon) && msg.value.status === 'active') {
+                        // Round to ~1 km precision to absorb GPS jitter
+                        const lat = roundGps(rawLat);
+                        const lon = roundGps(rawLon);
+
+                        // Always update current position (used for distance calcs etc.)
+                        ownLat = lat;
+                        ownLon = lon;
+
+                        // Only rebuild the index when we have moved more than
+                        // FMDX_REINDEX_MIN_DIST_KM from the position used for
+                        // the last build.  Since the DB already covers 3000 km,
+                        // a small drift doesn't change which stations are included.
+                        if (fmdxLoadedAt > 0) {
+                            const needsRebuild =
+                                fmdxIndexLat === null ||
+                                fmdxIndexLon === null ||
+                                haversineKm(fmdxIndexLat, fmdxIndexLon, lat, lon) >= FMDX_REINDEX_MIN_DIST_KM;
+
+                            if (needsRebuild) {
                                 try {
                                     const cached = JSON.parse(fs.readFileSync(FMDX_BULK_FILE, 'utf8'));
-                                    if (cached && cached.raw) buildFmdxIndex(cached.raw);
+                                    if (cached && cached.raw) {
+                                        buildFmdxIndex(cached.raw);
+                                        fmdxIndexLat = lat;
+                                        fmdxIndexLon = lon;
+                                    }
                                 } catch(e) { /* no cache yet */ }
                             }
                         }
@@ -182,8 +220,9 @@ function loadOwnLocation() {
             const lat = parseFloat(cfg?.identification?.lat);
             const lon = parseFloat(cfg?.identification?.lon);
             if (!isNaN(lat) && !isNaN(lon)) {
-                ownLat = lat; ownLon = lon;
-                logInfo(`[${PLUGIN_NAME}] Own location: ${lat}, ${lon}`);
+                ownLat = roundGps(lat);
+                ownLon = roundGps(lon);
+                logInfo(`[${PLUGIN_NAME}] Own location: ${ownLat}, ${ownLon}`);
             } else {
                 logWarn(`[${PLUGIN_NAME}] No valid lat/lon in config.json – distance filter disabled`);
             }
@@ -253,6 +292,9 @@ async function loadFmdxBulk() {
             if (fresh && hasRaw) {
                 fmdxLoadedAt = cached._ts;
                 buildFmdxIndex(cached.raw);
+                // Record the position used for this index build
+                fmdxIndexLat = ownLat;
+                fmdxIndexLon = ownLon;
                 if (Object.keys(fmdxByFreq).length > 0) {
                     logInfo(`[${PLUGIN_NAME}] fmdx.org DB restored from cache`);
                     const remaining = FMDX_BULK_TTL_MS - (Date.now() - cached._ts);
@@ -270,6 +312,8 @@ async function loadFmdxBulk() {
 
 async function downloadFmdxBulk() {
     if (ownLat === null || ownLon === null) return;
+    // Use rounded coordinates in the API URL to avoid unnecessary re-downloads
+    // when GPS drifts by a few meters.
     const url = `https://maps.fmdx.org/api/?qth=${ownLat},${ownLon}`;
     logInfo(`[${PLUGIN_NAME}] fmdx.org downloading: ${url}`);
     let raw;
@@ -295,6 +339,9 @@ async function downloadFmdxBulk() {
     }
     fmdxLoadedAt = Date.now();
     buildFmdxIndex(raw);
+    // Record the position used for this fresh download
+    fmdxIndexLat = ownLat;
+    fmdxIndexLon = ownLon;
     logInfo(`[${PLUGIN_NAME}] fmdx.org download complete – ${txCount} tx locations`);
     try {
         fs.writeFileSync(FMDX_BULK_FILE, JSON.stringify({ _ts: fmdxLoadedAt, raw }), 'utf8');
@@ -408,7 +455,7 @@ let dataHandler = null;
 try { dataHandler = require('../../server/datahandler'); }
 catch(e) { logWarn(`[${PLUGIN_NAME}] Could not load datahandler: ${e.message}`); }
 
-// ── RDS character set (ETSI EN 50067) ────────────────────────
+// ── RDS character set (ETSI EN 50067) ─────────────────��──────
 const RDS_CHARSET = [
     ' ','!','"','#','¤','%','&',"'",
     '(',')', '*','+',',','-','.','/',
@@ -546,33 +593,23 @@ function qualityAllowsLock() {
 //  ECC COUNTRY PLAUSIBILITY  (soft penalty only – never hard block)
 // ═══════════════════════════════════════════════════════════════
 
-// Returns a multiplier (0.0–1.0).
-//   1.0 = country matches, no ECC yet, or PI not confirmed (no penalty)
-//   0.5 = ECC decoded + confirmed, but country does not match ref
-//
-// Fix: only apply penalty when piConfirmed is true AND the ECC entry
-// exists in a db entry whose PI matches the current confirmed PI, to
-// avoid spurious penalties from stale ECC data of a previous station.
 function eccCountryMultiplier(refEntry) {
     if (!refEntry) return 1.0;
-    // Gate: only penalise when PI is fully confirmed
     if (!piConfirmed) return 1.0;
     const pi      = currentState.pi;
     const dbEntry = (pi && !isSpecialPI(pi)) ? db[pi] : null;
-    if (!dbEntry?.ecc) return 1.0; // no ECC for this PI yet → no penalty
+    if (!dbEntry?.ecc) return 1.0;
 
     const eccByte    = parseInt(dbEntry.ecc, 16);
     const currentISO = (() => {
         const c = lookupCountry(pi, eccByte);
         return c ? c.iso : null;
     })();
-    if (!currentISO) return 1.0; // cannot determine expected country
+    if (!currentISO) return 1.0;
 
-    // Compare against the country implied by the ref's PI code + same ECC byte
     const refCountry = lookupCountry(refEntry.pi, eccByte);
     if (refCountry && refCountry.iso === currentISO) return 1.0;
 
-    // Soft penalty
     return 0.5;
 }
 
@@ -580,9 +617,6 @@ function eccCountryMultiplier(refEntry) {
 //  AF NETWORK COVERAGE
 // ═══════════════════════════════════════════════════════════════
 
-// Returns fraction 0..1 of fmdx.org altFreqs actually received.
-// Fix: build a single receivedFreqSet (afSet + current freq) to avoid
-// double-counting when current freq is already in afSet.
 function computeAFCoverage(pi) {
     if (!pi || isSpecialPI(pi)) return 0;
     const altFreqs = getAltFreqsForPI(pi);
@@ -591,7 +625,6 @@ function computeAFCoverage(pi) {
     const dbFreqs = new Set(altFreqs.map(item => parseFloat(item.freq).toFixed(1)));
     if (dbFreqs.size === 0) return 0;
 
-    // Build a unified set of received frequencies (no duplicates)
     const receivedFreqSet = new Set();
     for (const f of currentState.afSet)
         receivedFreqSet.add(parseFloat(f).toFixed(1));
@@ -619,7 +652,6 @@ function countCleanRawPositions() {
     return n;
 }
 
-// Station-level confidence score (0..1).
 function computeStationConfidence(pi) {
     if (!pi || pi === '----' || pi === '?') return 0;
     if (isSpecialPI(pi)) return 0.8;
@@ -630,7 +662,6 @@ function computeStationConfidence(pi) {
     const cleanRawPos = countCleanRawPositions();
     const rawFactor   = Math.min(1, cleanRawPos / 8);
 
-    // ECC-weighted ref match score
     const baseRefScore = computeRefMatchScore(pi);
     const eccMult      = ref ? eccCountryMultiplier(ref) : 1.0;
     const refFactor    = ref ? (baseRefScore * eccMult) : 0;
@@ -642,14 +673,11 @@ function computeStationConfidence(pi) {
     const afterConfirmBonus = currentState.psRoundReceivedAfterConfirm ? 0.10 : 0.0;
     const dynamicPenalty    = (entry?.psIsDynamic || (ref?.psVariants?.length > 1)) ? 0.15 : 0.0;
 
-    // ECC country adjustment: +0.08 on match, -0.15 on mismatch
-    // Only applied when piConfirmed (eccCountryMultiplier handles the gate)
     let eccAdjust = 0.0;
     if (entry?.ecc && ref && piConfirmed) {
         eccAdjust = eccMult >= 1.0 ? +0.08 : -0.15;
     }
 
-    // AF network coverage bonus (up to +0.10, only when coverage ≥ 50%)
     const afCoverage      = computeAFCoverage(pi);
     const afCoverageBonus = afCoverage >= 0.5 ? afCoverage * 0.10 : 0.0;
 
@@ -663,7 +691,6 @@ function computeStationConfidence(pi) {
     return Math.min(1, Math.max(0, conf));
 }
 
-// Best-effort provisional PS string (8 chars), or null.
 function computeProvisionalPS(pi) {
     if (!pi || pi === '----' || pi === '?') return null;
     if (psLocked && lastBroadcastPS)
@@ -717,8 +744,6 @@ function computeProvisionalPS(pi) {
 
 // ═══════════════════════════════════════════════════════════════
 //  fmdx.org REFERENCE MATCHING
-//  (declared before database / vote engine because computeStationConfidence
-//   calls computeRefMatchScore which calls findRefEntry)
 // ═══════════════════════════════════════════════════════════════
 
 function findBestRefEntry(pi) {
@@ -770,7 +795,6 @@ function computeRefMatchScore(pi) {
         }
     }
 
-    // Apply ECC country multiplier (soft penalty, never hard block)
     return best * eccCountryMultiplier(ref);
 }
 
@@ -785,7 +809,6 @@ function isPIAllowed(pi) {
     return true;
 }
 
-// Dynamic PI confirmation threshold
 function getConfirmThreshold(pi) {
     if (isSpecialPI(pi)) return PI_CONFIRM_THRESHOLD;
     const refs = currentState.freqRefs;
@@ -799,7 +822,6 @@ function getConfirmThreshold(pi) {
         if ((ref?.distKm ?? 9999) < 500) threshold = 1;
     }
 
-    // Evidence bonuses: each lowers threshold (floor 1)
     let evidenceScore = 0;
     const entry = db[pi];
     if (entry?.ecc)                        evidenceScore++;
@@ -976,7 +998,7 @@ function cacheAF(pi, freqMHz) {
 
 // ═══════════════════════════════════════════════════════════════
 //  VOTE ENGINE
-// ═══════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════��
 function votePS(pi, pos, char, weight, errLevel) {
     if (!pi || pi === '----' || !char || char < ' ') return;
     if (isSpecialPI(pi)) return;
@@ -1114,22 +1136,20 @@ function detectChangingPS(buf) {
 // ═══════════════════════════════════════════════════════════════
 function checkAndLockPS(pi) {
     if (isSpecialPI(pi)) return;
-    if (!piConfirmed) return; // never lock before PI is confirmed
+    if (!piConfirmed) return;
     const entry = pi ? db[pi] : null;
     if (!entry) return;
 
     const ref         = findRefEntry(pi);
     const stationConf = computeStationConfidence(pi);
 
-    // Read stability duration from module-level vars (written only in buildAIPrediction)
     const stableMs = (lastProvisionalPS && provisionalFirstSeenTs)
         ? (Date.now() - provisionalFirstSeenTs) : 0;
 
     const allRawVerified = currentState.psErrBuf.every(e => e <= 1) &&
-                           currentState.psBuf.every(c => c && c !== ' ') &&
+                           currentState.psBuf.filter(c => c && c !== ' ').length >= 4 &&
                            currentState.psRoundReceivedAfterConfirm;
 
-    // fmdx.org best variant matching
     let bestVariant = null, bestScore = 0;
     if (ref?.psVariants?.length > 0) {
         const psBufUpper = currentState.psBuf.join('').toUpperCase();
@@ -1146,10 +1166,8 @@ function checkAndLockPS(pi) {
     }
     const refMatchIsGood = bestVariant && bestScore >= 0.75;
 
-    // Strong evidence: near-perfect ref + many clean positions
     const strongEvidence = (computeRefMatchScore(pi) >= 0.98 && countCleanRawPositions() >= 6);
 
-    // Lock gate: qualityAllowsLock() uses rolling block-error window
     const allowLock =
         strongEvidence ||
         (stationConf >= LOCK_MIN_CONF &&
@@ -1173,11 +1191,12 @@ function checkAndLockPS(pi) {
 
         let newPS = null, lockReason = '';
 
+        // ── Bug 3 fix: else statt else if (!ref?.psVariants?.length) ──
         if (entry.psVerifiedRaw && isPSStringClean(entry.psVerifiedRaw) &&
             entry.psVerifiedRaw.trim().length > 0) {
             if (ref?.psVariants?.length > 0) {
                 if (refMatchIsGood && bestScore >= 0.8) newPS = buildHybridPS(bestVariant);
-                else if (!ref?.psVariants?.length)      newPS = entry.psVerifiedRaw;
+                else                                     newPS = entry.psVerifiedRaw;
             } else {
                 newPS = entry.psVerifiedRaw;
             }
@@ -1189,23 +1208,29 @@ function checkAndLockPS(pi) {
             lockReason = `FMDX match ${Math.round(bestScore * 100)}%`;
         }
 
+        // ── Bug 2 fix: psVerifiedRaw auch bei refMatchIsGood setzen ──
+        if (allRawVerified) {
+            const candidate = currentState.psBuf.join('');
+            if (isPSStringClean(candidate)) {
+                const nu = candidate.trim().toUpperCase();
+                const ok = !ref?.psVariants?.length ||
+                    ref.psVariants.some(v =>
+                        v.trim().toUpperCase() === nu ||
+                        v.trim().toUpperCase().startsWith(nu) ||
+                        nu.startsWith(v.trim().toUpperCase()));
+                if (ok && !entry.psVerifiedRaw) {
+                    entry.psVerifiedRaw    = candidate;
+                    entry.psVerifiedRawTs  = Date.now();
+                    dbDirty = true;
+                    if (DEBUG) logInfo(`[${PLUGIN_NAME}] psVerifiedRaw set for PI=${pi}: "${candidate}"`);
+                }
+            }
+        }
+
         if (!newPS && allRawVerified) {
             const candidate = currentState.psBuf.join('');
             if (isPSStringClean(candidate)) {
                 newPS = candidate;
-                if (ref?.psVariants?.length > 0) {
-                    const nu = newPS.trim().toUpperCase();
-                    if (ref.psVariants.some(v =>
-                        v.trim().toUpperCase() === nu ||
-                        v.trim().toUpperCase().startsWith(nu) ||
-                        nu.startsWith(v.trim().toUpperCase()))) {
-                        entry.psVerifiedRaw = newPS; entry.psVerifiedRawTs = Date.now();
-                        dbDirty = true;
-                    }
-                } else {
-                    entry.psVerifiedRaw = newPS; entry.psVerifiedRawTs = Date.now();
-                    dbDirty = true;
-                }
                 lockReason = 'Raw RDS fully verified';
             }
         }
@@ -1222,7 +1247,6 @@ function checkAndLockPS(pi) {
             }, AI_BROADCAST_DELAY);
         }
     } else {
-        // Already locked – handle dynamic FMDX variant jump
         if (ref?.psVariants?.length > 1 && refMatchIsGood) {
             const cu = (lastBroadcastPS || '').toUpperCase().padEnd(8, ' ');
             const bv = bestVariant.toUpperCase().padEnd(8, ' ');
@@ -1239,7 +1263,6 @@ function checkAndLockPS(pi) {
                 }, AI_BROADCAST_DELAY);
             }
         }
-        // Live DB improvement on clean round
         if (allRawVerified) {
             const freshPS = currentState.psBuf.join('');
             if (isPSStringClean(freshPS)) {
@@ -1321,6 +1344,12 @@ function clearRDSInDataHandler() {
     else dataHandler.initialData.af = dataHandler.dataToSend.af;
     piConfirmCount = 0; piConfirmed = false; piPendingBroadcast = false;
     currentState.lastPrediction = null;
+	
+	if (currentState.freq) {
+        const freqFmt = parseFloat(currentState.freq).toFixed(3);
+        dataHandler.dataToSend.freq  = freqFmt;
+        dataHandler.initialData.freq = freqFmt;
+    }
 }
 
 function applyAFToDataHandler() {
@@ -1535,7 +1564,6 @@ function applyFollowToDataHandler() {
 function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
     if (!b2hex) return;
 
-    // Update rolling block-quality window for every decoded group
     updateQualWindow(errB);
 
     const g2 = parseInt(b2hex, 16);
@@ -1813,7 +1841,6 @@ function buildAIPrediction(pi) {
     const provisionalPS = computeProvisionalPS(pi);
     const afCoverage    = computeAFCoverage(pi);
 
-    // Stability clock – ONLY written here, read-only everywhere else
     const now = Date.now();
     if (provisionalPS && provisionalPS !== lastProvisionalPS) {
         lastProvisionalPS      = provisionalPS;
@@ -1895,6 +1922,16 @@ function onPIConfirmed(pi) {
 
     const entry = ensurePI(pi);
     const ref   = findRefEntry(pi);
+
+    // ── Bug 1 fix: psIsDynamic zurücksetzen wenn fmdx nur eine statische Variante kennt ──
+    if (entry.psIsDynamic && ref?.psVariants?.length === 1) {
+        entry.psIsDynamic = false;
+        entry.ps          = {};
+        entry.psResolved  = null;
+        entry.psConf      = new Array(8).fill(0);
+        dbDirty = true;
+        if (DEBUG) logInfo(`[${PLUGIN_NAME}] PI ${pi}: psIsDynamic reset (fmdx ref has 1 static variant)`);
+    }
 
     if (ref?.psVariants?.length > 0 && Object.keys(entry.ps).length === 0) {
         const refPS = ref.psVariants[0].padEnd(8, ' ');
@@ -1996,7 +2033,7 @@ function parseAndDispatch(raw) {
         lastProvisionalPS      = null;
         provisionalFirstSeenTs = 0;
         lastLockReason         = null;
-        qualWindow             = []; // reset quality window on PI change
+        qualWindow             = [];
 
         currentState.psBuf.fill(' '); currentState.psErrBuf.fill(3);
         currentState.psSegsSeen.clear();
@@ -2087,7 +2124,7 @@ function interceptLines(data) {
         if (l.startsWith('P') && l.length >= 5) {
             legacyPiCache = l.slice(1).trim();
         } else if (l.startsWith('T') && l.length >= 2) {
-            const freq = (parseFloat(l.slice(1)) / 1000).toFixed(2);
+            const freq = (parseFloat(l.slice(1)) / 1000).toFixed(3);
             if (freq !== currentState.freq) {
                 currentState.freq  = freq;
                 currentFreq        = freq;
