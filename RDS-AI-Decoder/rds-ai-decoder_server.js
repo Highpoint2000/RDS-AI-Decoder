@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.2a) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.3)  //
 //                                                           //
-//  by Highpoint                last update: 2026-01-04      //
+//  by Highpoint                last update: 2026-04-12      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.2a',
+    version:      '2.3',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -361,6 +361,84 @@ function extractLocations(raw) {
     return {};
 }
 
+function sanitizeDatabaseWithFmdx() {
+    let cleanedCount = 0;
+    
+    for (const [pi, entry] of Object.entries(db)) {
+        if (pi === '_meta' || isSpecialPI(pi)) continue;
+        
+        if (entry.psVerifiedRaw) {
+            const candidate = entry.psVerifiedRaw.trim().toUpperCase();
+            const altFreqs = fmdxByPI[pi.toUpperCase()] || [];
+            
+            // Only validate if we have FMDX data for this PI
+            if (altFreqs.length > 0) {
+                const allVariants = [];
+                altFreqs.forEach(f => { 
+                    if (f.psVariants) allVariants.push(...f.psVariants); 
+                });
+                
+                if (allVariants.length > 0) {
+                    const isValid = allVariants.some(v => {
+                        const refStr = v.trim().toUpperCase();
+                        if (refStr === candidate) return true;
+                        if (refStr.startsWith(candidate)) return true;
+                        
+                        if (candidate.startsWith(refStr)) {
+                            // If FMDX strictly says there is only 1 variant, NEVER allow suffixes.
+                            // This completely purges any corrupted "Dlf ££" entries.
+                            if (allVariants.length === 1) return false;
+                            
+                            const suffix = candidate.substring(refStr.length);
+                            return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
+                        }
+                        return false;
+                    });
+
+                    if (!isValid) {
+                        if (DEBUG) logInfo(`[${PLUGIN_NAME}] DB Cleanup: Removing garbage PS "${entry.psVerifiedRaw}" for PI=${pi}`);
+                        
+                        entry.psVerifiedRaw   = null;
+                        entry.psVerifiedRawTs = 0;
+                        entry.ps              = {};
+                        entry.psResolved      = null;
+                        entry.psConf          = new Array(8).fill(0);
+                        
+                        dbDirty = true;
+                        cleanedCount++;
+                    }
+                }
+            }
+        }
+    }
+    
+    if (cleanedCount > 0) {
+        logInfo(`[${PLUGIN_NAME}] Database cleanup finished. Purged ${cleanedCount} corrupted stations.`);
+        saveDB();
+    }
+}
+
+// ... inside existing buildFmdxIndex() ...
+function buildFmdxIndex(raw) {
+    // ... [keep all existing logic at the top of the function] ...
+
+    for (const f  of Object.keys(byFreq)) byFreq[f].sort((a, b) => a.distKm - b.distKm);
+    for (const pi of Object.keys(byPI))   byPI[pi].sort((a, b) => a.distKm - b.distKm);
+
+    fmdxByFreq = byFreq;
+    fmdxByPI   = byPI;
+
+    logInfo(
+        `[${PLUGIN_NAME}] fmdx.org index built: ${totalEntries} entries on ` +
+        `${Object.keys(byFreq).length} frequencies, ` +
+        `${Object.keys(byPI).length} unique PI/PIreg codes ` +
+        `(${skippedDist} tx outside ${FMDX_RADIUS_KM} km)`
+    );
+    
+    // NEW: Trigger database cleanup against the fresh FMDX index
+    sanitizeDatabaseWithFmdx();
+}
+
 function buildFmdxIndex(raw) {
     const byFreq     = {};
     const byPI       = {};
@@ -418,6 +496,8 @@ function buildFmdxIndex(raw) {
         `${Object.keys(byPI).length} unique PI/PIreg codes ` +
         `(${skippedDist} tx outside ${FMDX_RADIUS_KM} km)`
     );
+	
+	sanitizeDatabaseWithFmdx();
 }
 
 function getFreqRefs(freq) {
@@ -646,8 +726,10 @@ function countCleanRawPositions() {
     let n = 0;
     for (let i = 0; i < 8; i++) {
         const e = currentState.psErrBuf?.[i] ?? 3;
-        const c = currentState.psBuf?.[i] ?? ' ';
-        if (e <= 1 && c && c !== ' ') n++;
+        // If the error level is 0 or 1, the receiver actually decoded this 
+        // position from the live signal. Valid spaces MUST count to prevent 
+        // penalizing short station names like "Dlf     ".
+        if (e <= 1) n++;
     }
     return n;
 }
@@ -661,6 +743,15 @@ function computeStationConfidence(pi) {
 
     const cleanRawPos = countCleanRawPositions();
     const rawFactor   = Math.min(1, cleanRawPos / 8);
+
+    // LOCAL TRUTH OVERRIDE:
+    // If we receive a perfectly clean 8-character RDS round, AND it exactly matches 
+    // a previously fully verified string from our local memory (rdsm_memory.json),
+    // we bypass all external databases and jump straight to 100% (1.0) confidence.
+    const livePS = currentState.psBuf.join('');
+    if (cleanRawPos === 8 && entry?.psVerifiedRaw === livePS) {
+        return 1.0; 
+    }
 
     const baseRefScore = computeRefMatchScore(pi);
     const eccMult      = ref ? eccCountryMultiplier(ref) : 1.0;
@@ -688,6 +779,13 @@ function computeStationConfidence(pi) {
                afCoverageBonus +
                eccAdjust -
                dynamicPenalty;
+
+    // FALLBACK BOOST: If raw reception is perfect (8/8 clean chars) but we missed 
+    // the AF bonus due to a DB collision (e.g. Croatia / UK), artificially boost to allow locking.
+    if (cleanRawPos === 8 && conf < 0.95) {
+        conf += 0.10;
+    }
+
     return Math.min(1, Math.max(0, conf));
 }
 
@@ -1146,8 +1244,11 @@ function checkAndLockPS(pi) {
     const stableMs = (lastProvisionalPS && provisionalFirstSeenTs)
         ? (Date.now() - provisionalFirstSeenTs) : 0;
 
+    // Allow saving short station names like "RSA" or "Dlf".
+    // We lower the required non-space characters from 4 to 2.
+    // The strong CRC checks and our new strict FMDX rules prevent garbage anyway.
     const allRawVerified = currentState.psErrBuf.every(e => e <= 1) &&
-                           currentState.psBuf.filter(c => c && c !== ' ').length >= 4 &&
+                           currentState.psBuf.filter(c => c && c !== ' ').length >= 2 &&
                            currentState.psRoundReceivedAfterConfirm;
 
     let bestVariant = null, bestScore = 0;
@@ -1191,7 +1292,6 @@ function checkAndLockPS(pi) {
 
         let newPS = null, lockReason = '';
 
-        // ── Bug 3 fix: else statt else if (!ref?.psVariants?.length) ──
         if (entry.psVerifiedRaw && isPSStringClean(entry.psVerifiedRaw) &&
             entry.psVerifiedRaw.trim().length > 0) {
             if (ref?.psVariants?.length > 0) {
@@ -1208,16 +1308,29 @@ function checkAndLockPS(pi) {
             lockReason = `FMDX match ${Math.round(bestScore * 100)}%`;
         }
 
-        // ── Bug 2 fix: psVerifiedRaw auch bei refMatchIsGood setzen ──
         if (allRawVerified) {
             const candidate = currentState.psBuf.join('');
             if (isPSStringClean(candidate)) {
                 const nu = candidate.trim().toUpperCase();
+                
                 const ok = !ref?.psVariants?.length ||
-                    ref.psVariants.some(v =>
-                        v.trim().toUpperCase() === nu ||
-                        v.trim().toUpperCase().startsWith(nu) ||
-                        nu.startsWith(v.trim().toUpperCase()));
+                    ref.psVariants.some(v => {
+                        const refStr = v.trim().toUpperCase();
+                        if (refStr === nu) return true;
+                        if (refStr.startsWith(nu)) return true;
+                        if (nu.startsWith(refStr)) {
+                            // STRICT ENFORCEMENT: If FMDX strictly says there is only 1 variant, 
+                            // NEVER allow suffixes. This completely blocks "Dlf az".
+                            if (ref.psVariants.length === 1) return false;
+                            
+                            // For multi-variant stations, block garbage suffixes like "££" 
+                            // by forcing alphanumeric characters only.
+                            const suffix = nu.substring(refStr.length);
+                            return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
+                        }
+                        return false;
+                    });
+                    
                 if (ok && !entry.psVerifiedRaw) {
                     entry.psVerifiedRaw    = candidate;
                     entry.psVerifiedRawTs  = Date.now();
@@ -1230,8 +1343,29 @@ function checkAndLockPS(pi) {
         if (!newPS && allRawVerified) {
             const candidate = currentState.psBuf.join('');
             if (isPSStringClean(candidate)) {
-                newPS = candidate;
-                lockReason = 'Raw RDS fully verified';
+                // STRICT FMDX ENFORCEMENT ON LIVE LOCK:
+                // Do not lock onto a raw string if it blatantly violates FMDX.
+                // This prevents CRC-collision garbage (like "PUPSTNIK") from locking the UI session.
+                const nu = candidate.trim().toUpperCase();
+                const ok = !ref?.psVariants?.length ||
+                    ref.psVariants.some(v => {
+                        const refStr = v.trim().toUpperCase();
+                        if (refStr === nu) return true;
+                        if (refStr.startsWith(nu)) return true;
+                        if (nu.startsWith(refStr)) {
+                            if (ref.psVariants.length === 1) return false;
+                            const suffix = nu.substring(refStr.length);
+                            return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
+                        }
+                        return false;
+                    });
+
+                if (ok) {
+                    newPS = candidate;
+                    lockReason = 'Raw RDS fully verified';
+                } else {
+                    if (DEBUG) console.log(`[RDS AI Decoder] Rejected live raw lock for PI=${pi}: "${candidate}" violates strict FMDX rules.`);
+                }
             }
         }
 
@@ -1270,10 +1404,18 @@ function checkAndLockPS(pi) {
                 const eu = (entry.psVerifiedRaw || '').trim().toUpperCase();
                 if (fu !== eu) {
                     const ok = !ref?.psVariants?.length ||
-                        ref.psVariants.some(v =>
-                            v.trim().toUpperCase() === fu ||
-                            v.trim().toUpperCase().startsWith(fu) ||
-                            fu.startsWith(v.trim().toUpperCase()));
+                        ref.psVariants.some(v => {
+                            const refStr = v.trim().toUpperCase();
+                            if (refStr === fu) return true;
+                            if (refStr.startsWith(fu)) return true;
+                            if (fu.startsWith(refStr)) {
+                                if (ref.psVariants.length === 1) return false;
+                                const suffix = fu.substring(refStr.length);
+                                return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
+                            }
+                            return false;
+                        });
+                        
                     if (ok) {
                         entry.psVerifiedRaw = freshPS; entry.psVerifiedRawTs = Date.now();
                         dbDirty = true;
@@ -1372,11 +1514,42 @@ function applyFollowToDataHandler() {
     dataHandler.initialData.pi = dataHandler.dataToSend.pi;
 
     const getDbMixedCasePS = () => {
+        let candidate = null;
         if (entry?.psVerifiedRaw && isPSStringClean(entry.psVerifiedRaw) &&
-            entry.psVerifiedRaw.trim().length > 0) return entry.psVerifiedRaw;
-        if (entry?.psResolved && entry.psResolved.trim().length > 0 &&
-            !entry.psResolved.includes('?')) return entry.psResolved;
-        return null;
+            entry.psVerifiedRaw.trim().length > 0) {
+            candidate = entry.psVerifiedRaw;
+        } else if (entry?.psResolved && entry.psResolved.trim().length > 0 &&
+            !entry.psResolved.includes('?')) {
+            candidate = entry.psResolved;
+        }
+
+        // STRICT FMDX ENFORCEMENT ON READ:
+        // Before we hand over any database string (voted or verified) to the webserver,
+        // we strictly validate it against the known FMDX variants. 
+        // This stops garbage votes (like "Dlf   Dl") from leaking into the webserver UI.
+        if (candidate && ref?.psVariants?.length > 0) {
+            const isValid = ref.psVariants.some(v => {
+                const refStr = v.trim().toUpperCase();
+                const cand = candidate.trim().toUpperCase();
+                
+                if (refStr === cand) return true;
+                if (refStr.startsWith(cand)) return true;
+                
+                if (cand.startsWith(refStr)) {
+                    // If FMDX strictly says there is only 1 variant, NEVER allow suffixes.
+                    if (ref.psVariants.length === 1) return false;
+                    
+                    const suffix = cand.substring(refStr.length);
+                    return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
+                }
+                return false;
+            });
+            
+            // Reject garbage candidate. applyFollowToDataHandler will fall back to FMDX variant.
+            if (!isValid) return null; 
+        }
+
+        return candidate;
     };
 
     if (isSpecialPI(pi)) {
@@ -1470,32 +1643,14 @@ function applyFollowToDataHandler() {
             }
         }
     } else if (pred?.ps && Array.isArray(pred.ps)) {
-        if (computeRefMatchScore(pi) >= 0.8 && ref?.psVariants?.length > 0) {
+        const ms = computeRefMatchScore(pi);
+        
+        // STRICT FMDX ENFORCEMENT FOR WEBSERVER IN PROVISIONAL STATE:
+        // Always enforce the clean FMDX string if match score is reasonable.
+        if (ms >= 0.4 && ref?.psVariants?.length > 0) {
             const dbStr = getDbMixedCasePS();
-            let psStr;
-            if (dbStr) {
-                psStr = dbStr;
-            } else {
-                let bv = ref.psVariants[0], bs = 0;
-                for (const v of ref.psVariants) {
-                    const rv = v.toUpperCase().padEnd(8, ' ');
-                    const pb = currentState.psBuf.join('').toUpperCase().padEnd(8, ' ');
-                    let m = 0, c = 0;
-                    for (let i = 0; i < 8; i++) {
-                        if (rv[i] !== ' ' && currentState.psErrBuf[i] <= 1) { c++; if (rv[i] === pb[i]) m++; }
-                    }
-                    const s = c > 0 ? m / c : 0;
-                    if (s > bs) { bs = s; bv = v; }
-                }
-                let h = '';
-                const cv = bv.padEnd(8, ' ');
-                for (let i = 0; i < 8; i++) {
-                    const rc = currentState.psBuf[i] || ' ';
-                    const re = currentState.psErrBuf[i];
-                    h += (re <= 1 && rc.toUpperCase() === cv[i].toUpperCase()) ? rc : cv[i];
-                }
-                psStr = h;
-            }
+            const psStr = dbStr ? dbStr : ref.psVariants[0].padEnd(8, ' ');
+            
             lastBroadcastPS = psStr;
             dataHandler.dataToSend.ps        = psStr;
             dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
@@ -1807,16 +1962,31 @@ function buildAIPrediction(pi) {
                     }
                 }
             }
+            
             if (ref?.psVariants?.length > 0) {
                 const refPS = ref.psVariants[0].padEnd(8, ' ');
-                if (refPS[i] && refPS[i] !== ' ') {
-                    const ms  = computeRefMatchScore(pi);
+                const ms  = computeRefMatchScore(pi);
+                
+                if (ms >= 0.4) {
                     const src = ms >= 0.5 ? 'ref-match' : 'ref-seed';
-                    const dc  = (rawChar && rawChar !== ' ' && rawErr <= 1 &&
-                        rawChar.toUpperCase() === refPS[i].toUpperCase()) ? rawChar : refPS[i];
-                    psSlots.push({ char: dc, conf: 0.3 + ms * 0.4, src }); continue;
+                    
+                    // STRICT FMDX ENFORCEMENT: If FMDX says this position is a space, 
+                    // and the station is known to be static, FORCE a space.
+                    // This blocks TEF6686 garbage (like "az") from filling empty slots in the UI.
+                    if (refPS[i] === ' ' && (!entry?.psIsDynamic && ref.psVariants.length === 1)) {
+                        psSlots.push({ char: ' ', conf: 0.3 + ms * 0.4, src: 'ref-match' }); 
+                        continue;
+                    }
+                    
+                    if (refPS[i] !== ' ') {
+                        const dc  = (rawChar && rawChar !== ' ' && rawErr <= 1 &&
+                            rawChar.toUpperCase() === refPS[i].toUpperCase()) ? rawChar : refPS[i];
+                        psSlots.push({ char: dc, conf: 0.3 + ms * 0.4, src }); 
+                        continue;
+                    }
                 }
             }
+            
             if (i > 0 && psSlots[i-1]) {
                 const bg = Object.entries(BIGRAM[psSlots[i-1].char] || {}).sort((a, b) => b[1] - a[1]);
                 if (bg.length > 0) { psSlots.push({ char: bg[0][0], conf: 0.1, src: 'ai-bigram' }); continue; }
