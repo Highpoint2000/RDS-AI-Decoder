@@ -3,13 +3,9 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 <img width="1913" height="836" alt="Screenshot 2026-04-14 105410" src="https://github.com/user-attachments/assets/145f8528-566e-403a-a4d9-4f4cd49cfb44" />
 
 
-## Version 2.3
+## Version 2.3a
 
-- Added robust validation to completely block hardware CRC collisions (false 100% error-free reports) from locking or displaying garbage PS names
-- Lowered the minimum character requirement to allow proper database saving and locking of 2-3 letter station names 
-- Implemented an active filter that strictly validates the locally voted string against FMDX variants before feeding it to the webserver UI, preventing trailing garbage
-- Added a startup routine (sanitizeDatabaseWithFmdx) that scans the local memory and automatically purges historically corrupted PS entries using the latest FMDX reference data
-- Forced empty slots to remain as spaces for known static stations, preventing random hardware noise from filling gaps in the UI
+- Stationsdaten hinzugefügt
 
 ## Installation notes:
 
@@ -44,6 +40,15 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 2.3
+
+- Added robust validation to completely block hardware CRC collisions (false 100% error-free reports) from locking or displaying garbage PS names
+- Lowered the minimum character requirement to allow proper database saving and locking of 2-3 letter station names 
+- Implemented an active filter that strictly validates the locally voted string against FMDX variants before feeding it to the webserver UI, preventing trailing garbage
+- Added a startup routine (sanitizeDatabaseWithFmdx) that scans the local memory and automatically purges historically corrupted PS entries using the latest FMDX reference data
+- Forced empty slots to remain as spaces for known static stations, preventing random hardware noise from filling gaps in the UI
+
 
 ### Version 2.2a
 
