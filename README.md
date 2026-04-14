@@ -2,14 +2,14 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="1913" height="836" alt="Screenshot 2026-04-14 105410" src="https://github.com/user-attachments/assets/145f8528-566e-403a-a4d9-4f4cd49cfb44" />
 
+### Version 2.4
 
-## Version 2.3
+- Local Database Viewer: Added a new "LOCAL DB" section to the client panel that displays all historically saved database entries (PI, PS, seen count, and dynamic status) specifically for the currently tuned frequency
+- Admin Database Management: Logged-in administrators now see a red '✕' button next to each local database entry. Clicking this prompts a confirmation dialog and allows admins to permanently delete corrupted or outdated entries from the AI's local memory.
+- Improved UI Reliability: Switched the delete button's event listener from click to mousedown with event delegation. This fixes the issue where rapid UI updates (DOM refreshes) would cause the delete action or confirmation popup to be ignored.
+- Persistent Panel Position: The draggable decoder panel now saves its position to the browser's localStorage. When you refresh the page, the panel will reappear exactly where you left it instead of resetting to the default position.
+- Smart Propagation Scoring: Replaced basic distance sorting with an advanced calculatePropagationScore algorithm. The system now factors in ERP (transmitter power), Tropospheric/Sporadic-E distance ranges, and shared transmitter sites to find the most realistic fmdx.org reference match.
 
-- Added robust validation to completely block hardware CRC collisions (false 100% error-free reports) from locking or displaying garbage PS names
-- Lowered the minimum character requirement to allow proper database saving and locking of 2-3 letter station names 
-- Implemented an active filter that strictly validates the locally voted string against FMDX variants before feeding it to the webserver UI, preventing trailing garbage
-- Added a startup routine (sanitizeDatabaseWithFmdx) that scans the local memory and automatically purges historically corrupted PS entries using the latest FMDX reference data
-- Forced empty slots to remain as spaces for known static stations, preventing random hardware noise from filling gaps in the UI
 
 ## Installation notes:
 
@@ -27,7 +27,7 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 - Click the RDS Decoder button to open the RDS monitor panel 
 - As an administrator, you can activate RDS Follow Mode. This will feed the plugin's RDS data directly into the web server
 
-Detailed documentation on how the plugin works can be found [here](https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation-v2.3.html)
+Detailed documentation on how the plugin works can be found [here](https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation-v2.4.html)
 A demo video can be viewed [here](https://highpoint.fmdx.org/videos/RDS-AI-Decoder-Demo.mp4)
 A live demo with the RDS Follow function activated is available [here](http://highpoint2000.selfhost.de:8080)
 
@@ -44,6 +44,15 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 2.3
+
+- Added robust validation to completely block hardware CRC collisions (false 100% error-free reports) from locking or displaying garbage PS names
+- Lowered the minimum character requirement to allow proper database saving and locking of 2-3 letter station names 
+- Implemented an active filter that strictly validates the locally voted string against FMDX variants before feeding it to the webserver UI, preventing trailing garbage
+- Added a startup routine (sanitizeDatabaseWithFmdx) that scans the local memory and automatically purges historically corrupted PS entries using the latest FMDX reference data
+- Forced empty slots to remain as spaces for known static stations, preventing random hardware noise from filling gaps in the UI
+
 
 ### Version 2.2a
 

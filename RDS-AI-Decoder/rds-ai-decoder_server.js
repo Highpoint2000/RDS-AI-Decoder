@@ -1,6 +1,6 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.3)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4)  //
 //                                                           //
 //  by Highpoint                last update: 2026-04-12      //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.3',
+    version:      '2.4',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -66,7 +66,7 @@ function isSpecialPI(pi) {
     return !pi || SPECIAL_PI_CODES.has(pi.toUpperCase());
 }
 
-// ── Module-level state ────────────────────────────────────────
+// ── Module-level state ───────────────────────────────────────
 let aiExclusiveMode    = false;
 let rdsFollowMode      = false;
 let nativeRDSDisabled  = false;
@@ -130,6 +130,32 @@ let currentState = {
     freqRefs: [],
     afSet: new Set(),
 };
+
+// ── Database entry extractor for current frequency ────────────
+function getDbEntriesForFreq(freq) {
+    if (!freq) return [];
+    const rounded = roundFreq(freq);
+    const results = [];
+    for (const [pi, entry] of Object.entries(db)) {
+        if (pi === '_meta' || isSpecialPI(pi)) continue;
+        if (entry.freq === rounded) {
+            const ps = entry.psVerifiedRaw || entry.psResolved || '';
+            // Only add to results if PS is not empty
+            if (ps.trim().length > 0) {
+                results.push({
+                    pi: pi,
+                    ps: ps.trim(),
+                    seenCount: entry.seenCount || 0,
+                    pty: entry.pty,
+                    isDynamic: !!entry.psIsDynamic
+                });
+            }
+        }
+    }
+    // Sort by seenCount descending
+    results.sort((a, b) => b.seenCount - a.seenCount);
+    return results;
+}
 
 // ── Round GPS coordinates to 2 decimal places (~1 km) ─────────
 // This prevents GPS noise (sub-meter jitter) from causing
@@ -232,7 +258,7 @@ function loadOwnLocation() {
     }
 }
 
-// ── Haversine distance ────────────────────────────────────────
+// ── Haversine distance & Bearing ──────────────────────────────
 function haversineKm(lat1, lon1, lat2, lon2) {
     const R  = 6371;
     const dL = (lat2 - lat1) * Math.PI / 180;
@@ -241,6 +267,20 @@ function haversineKm(lat1, lon1, lat2, lon2) {
              + Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180)
              * Math.sin(dO/2) * Math.sin(dO/2);
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function calculateBearing(lat1, lon1, lat2, lon2) {
+    const phi1 = lat1 * Math.PI / 180;
+    const phi2 = lat2 * Math.PI / 180;
+    const lam1 = lon1 * Math.PI / 180;
+    const lam2 = lon2 * Math.PI / 180;
+
+    const y = Math.sin(lam2 - lam1) * Math.cos(phi2);
+    const x = Math.cos(phi1) * Math.sin(phi2) -
+              Math.sin(phi1) * Math.cos(phi2) * Math.cos(lam2 - lam1);
+    const theta = Math.atan2(y, x);
+    const brng = (theta * 180 / Math.PI + 360) % 360;
+    return Math.round(brng);
 }
 
 function roundFreq(freqStr) {
@@ -418,27 +458,6 @@ function sanitizeDatabaseWithFmdx() {
     }
 }
 
-// ... inside existing buildFmdxIndex() ...
-function buildFmdxIndex(raw) {
-    // ... [keep all existing logic at the top of the function] ...
-
-    for (const f  of Object.keys(byFreq)) byFreq[f].sort((a, b) => a.distKm - b.distKm);
-    for (const pi of Object.keys(byPI))   byPI[pi].sort((a, b) => a.distKm - b.distKm);
-
-    fmdxByFreq = byFreq;
-    fmdxByPI   = byPI;
-
-    logInfo(
-        `[${PLUGIN_NAME}] fmdx.org index built: ${totalEntries} entries on ` +
-        `${Object.keys(byFreq).length} frequencies, ` +
-        `${Object.keys(byPI).length} unique PI/PIreg codes ` +
-        `(${skippedDist} tx outside ${FMDX_RADIUS_KM} km)`
-    );
-    
-    // NEW: Trigger database cleanup against the fresh FMDX index
-    sanitizeDatabaseWithFmdx();
-}
-
 function buildFmdxIndex(raw) {
     const byFreq     = {};
     const byPI       = {};
@@ -450,9 +469,13 @@ function buildFmdxIndex(raw) {
         if (!txData || !Array.isArray(txData.stations)) continue;
         const txLat  = parseFloat(txData.lat);
         const txLon  = parseFloat(txData.lon);
-        const txName = txData.name || txId;
+        const txName = txData.name || txId; 
+        const txItu  = txData.itu  || null;
+
         if (isNaN(txLat) || isNaN(txLon)) continue;
-        const distKm = Math.round(haversineKm(ownLat, ownLon, txLat, txLon));
+        const distKm  = Math.round(haversineKm(ownLat, ownLon, txLat, txLon));
+        const azimuth = calculateBearing(ownLat, ownLon, txLat, txLon);
+
         if (distKm > FMDX_RADIUS_KM) { skippedDist++; continue; }
 
         for (const st of txData.stations) {
@@ -460,24 +483,31 @@ function buildFmdxIndex(raw) {
             const f       = roundFreq(String(st.freq));
             const piUp    = st.pi.toUpperCase();
             const piRegUp = st.pireg ? st.pireg.toUpperCase() : null;
+            
+            const stErp   = st.erp !== undefined ? st.erp : null;
+            const stPol   = st.pol ? st.pol.toUpperCase() : null;
 
             const entry = {
                 pi: piUp, pireg: piRegUp,
                 psVariants: parsePSVariants(st.ps),
                 station: st.station || txName,
-                lat: txLat, lon: txLon, distKm,
+                txName: txName, itu: txItu,
+                lat: txLat, lon: txLon, distKm, azimuth,
+                erp: stErp, pol: stPol
             };
 
             if (!byFreq[f]) byFreq[f] = [];
             byFreq[f].push(entry);
 
             if (!byPI[piUp]) byPI[piUp] = [];
-            byPI[piUp].push({ freq: f, distKm, station: entry.station,
+            byPI[piUp].push({ freq: f, distKm, azimuth, station: entry.station,
+                txName: txName, itu: txItu, erp: stErp, pol: stPol,
                 psVariants: entry.psVariants, pireg: piRegUp });
 
             if (piRegUp && piRegUp !== piUp) {
                 if (!byPI[piRegUp]) byPI[piRegUp] = [];
-                byPI[piRegUp].push({ freq: f, distKm, station: entry.station,
+                byPI[piRegUp].push({ freq: f, distKm, azimuth, station: entry.station,
+                    txName: txName, itu: txItu, erp: stErp, pol: stPol,
                     psVariants: entry.psVariants, pireg: piRegUp, piMain: piUp });
             }
             totalEntries++;
@@ -535,7 +565,7 @@ let dataHandler = null;
 try { dataHandler = require('../../server/datahandler'); }
 catch(e) { logWarn(`[${PLUGIN_NAME}] Could not load datahandler: ${e.message}`); }
 
-// ── RDS character set (ETSI EN 50067) ─────────────────��──────
+// ── RDS character set (ETSI EN 50067) ───────────────────────
 const RDS_CHARSET = [
     ' ','!','"','#','¤','%','&',"'",
     '(',')', '*','+',',','-','.','/',
@@ -844,18 +874,80 @@ function computeProvisionalPS(pi) {
 //  fmdx.org REFERENCE MATCHING
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+//  fmdx.org REFERENCE MATCHING
+// ═══════════════════════════════════════════════════════════════
+
+function calculatePropagationScore(ref, dbEntry) {
+    if (!ref) return 0;
+    
+    // Base score from distance (closer is better, but not the only factor)
+    const distKm = ref.distKm || 9999;
+    let distScore = 0;
+    
+    // Normal Tropo / Line of sight
+    if (distKm <= 100) distScore = 100;
+    else if (distKm <= 300) distScore = 80;
+    else if (distKm <= 800) distScore = 40; // Enhanced Tropo
+    else if (distKm <= 2500) distScore = 20; // Sporadic E range
+    else distScore = 5;
+    
+    // Power (ERP) factor
+    const erp = ref.erp || 0.1; // fallback to 0.1kW if unknown
+    const pwrScore = Math.min(50, Math.log10(Math.max(1, erp * 10)) * 15);
+    
+    // Site verification (are we receiving other frequencies from this site?)
+    let siteBonus = 0;
+    if (ref.txName) {
+        // Simple check: count how many active AFs or other known PIs share this site
+        let sharedSites = 0;
+        for (const f of currentState.afSet) {
+            const freqRefs = getFreqRefs(f);
+            if (freqRefs.some(r => r.txName === ref.txName)) {
+                sharedSites++;
+            }
+        }
+        siteBonus = Math.min(30, sharedSites * 10);
+    }
+    
+    // Sporadic-E characteristic check (if distance is huge, but signal is strong)
+    let spEBonus = 0;
+    if (distKm > 800 && distKm < 2500) {
+        // If we are getting good data despite the distance, it might be SpE
+        const cleanCount = countCleanRawPositions();
+        if (cleanCount >= 4) spEBonus = 20;
+    }
+    
+    // Historical confirmation bonus
+    let histBonus = 0;
+    if (dbEntry && dbEntry.seenCount > 10) {
+        // We've seen this PI often, likely a regular catch
+        histBonus = 15;
+    }
+    
+    return distScore + pwrScore + siteBonus + spEBonus + histBonus;
+}
+
 function findBestRefEntry(pi) {
     if (!currentState.freqRefs || !pi || !currentState.freq) return null;
     if (isSpecialPI(pi)) return null;
     const piUp = pi.toUpperCase();
+    const dbEntry = db[pi];
+    
     const exact = currentState.freqRefs.filter(r => r.pi === piUp);
-    if (exact.length >= 1)
-        return exact.sort((a, b) => (a.distKm ?? 99999) - (b.distKm ?? 99999))[0];
+    if (exact.length >= 1) {
+        // Sort by smart propagation score instead of just distance
+        return exact.sort((a, b) => calculatePropagationScore(b, dbEntry) - calculatePropagationScore(a, dbEntry))[0];
+    }
+    
     const pireg = currentState.freqRefs.filter(r => r.pireg && r.pireg === piUp);
-    if (pireg.length >= 1)
-        return pireg.sort((a, b) => (a.distKm ?? 99999) - (b.distKm ?? 99999))[0];
+    if (pireg.length >= 1) {
+        return pireg.sort((a, b) => calculatePropagationScore(b, dbEntry) - calculatePropagationScore(a, dbEntry))[0];
+    }
+    
     return null;
 }
+
 function findRefEntry(pi) { return findBestRefEntry(pi); }
 
 function computeRefMatchScore(pi) {
@@ -1094,9 +1186,9 @@ function cacheAF(pi, freqMHz) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
 //  VOTE ENGINE
-// ══════════════════════════════════════════════════════════════��
+// ══════════════════════════════════════════════════════════════
 function votePS(pi, pos, char, weight, errLevel) {
     if (!pi || pi === '----' || !char || char < ' ') return;
     if (isSpecialPI(pi)) return;
@@ -1913,7 +2005,7 @@ function buildRTString() {
     return rt.trimEnd();
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════���═══════
 //  AI PREDICTION ENGINE
 // ═══════════════════════════════════════════════════════════════
 function buildAIPrediction(pi) {
@@ -1970,9 +2062,6 @@ function buildAIPrediction(pi) {
                 if (ms >= 0.4) {
                     const src = ms >= 0.5 ? 'ref-match' : 'ref-seed';
                     
-                    // STRICT FMDX ENFORCEMENT: If FMDX says this position is a space, 
-                    // and the station is known to be static, FORCE a space.
-                    // This blocks TEF6686 garbage (like "az") from filling empty slots in the UI.
                     if (refPS[i] === ' ' && (!entry?.psIsDynamic && ref.psVariants.length === 1)) {
                         psSlots.push({ char: ' ', conf: 0.3 + ms * 0.4, src: 'ref-match' }); 
                         continue;
@@ -2051,6 +2140,9 @@ function buildAIPrediction(pi) {
         .map(f => parseFloat(f.toFixed ? f.toFixed(1) : String(f)))
         .sort((a, b) => a - b);
 
+    // Fetch matching DB entries for the current frequency
+    const dbFreqEntries = getDbEntriesForFreq(currentState.freq);
+
     return {
         pi, ps: psSlots, rt: rtResult, af: afArray,
         psName, psNameSrc, psVariants: ref?.psVariants || [], altFreqs, psLocked,
@@ -2058,6 +2150,7 @@ function buildAIPrediction(pi) {
         psProvisionalConf: stationConf,
         psStableMs:        stableMs,
         psLockReason:      lastLockReason,
+        dbFreqEntries,
         stats: {
             freq:          entry?.freq    || currentState.freq,
             seenCount:     entry?.seenCount || 0,
@@ -2065,10 +2158,15 @@ function buildAIPrediction(pi) {
             psIsDynamic:   psIsDynamicEffective,
             psLocked,
             refStation:    ref?.station   || null,
+            refTxName:     ref?.txName    || null,
+            refItu:        ref?.itu       || null,
             refDistKm:     ref?.distKm    ?? null,
+            refAzimuth:    ref?.azimuth   ?? null,
+            refErp:        ref?.erp       ?? null,
+            refPol:        ref?.pol       || null,
             refMatchScore: Math.round(refMatchScore * 100),
-            pireg:         ref?.pireg  || null,
-            piMain:        ref?.piMain || null,
+            pireg:         ref?.pireg     || null,
+            piMain:        ref?.piMain    || null,
             stationConf:   Math.round(stationConf * 100),
             afCoverage:    Math.round(afCoverage * 100),
             qualZeroErr:   Math.round(recentZeroErrFraction() * 100),
@@ -2327,6 +2425,7 @@ function interceptLines(data) {
                     reset: true,
                     pi:    null,
                     ps:    null,
+                    dbFreqEntries: getDbEntriesForFreq(freq),
                     stats: {
                         freq,
                         seenCount:     0,
@@ -2448,6 +2547,15 @@ function handlePluginMessage(ws, raw) {
             else if (piConfirmed) applyFollowToDataHandler();
         }
         broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode });
+        return;
+    }
+    if (msg.type === 'rdsm_delete_pi') {
+        const piToDel = msg.pi ? msg.pi.toUpperCase() : null;
+        if (piToDel && db[piToDel]) {
+            delete db[piToDel];
+            dbDirty = true;
+            logInfo(`[${PLUGIN_NAME}] PI ${piToDel} deleted from local database by admin request.`);
+        }
         return;
     }
 }

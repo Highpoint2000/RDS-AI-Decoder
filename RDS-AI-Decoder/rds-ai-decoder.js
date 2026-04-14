@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.3)  //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.4)  //
 //                                                           //
-//  by Highpoint                last update: 2026-04-12      //
+//  by Highpoint                last update: 2026-04-14      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -10,7 +10,7 @@
 
 (() => {
 
-    const pluginVersion         = '2.3';
+    const pluginVersion         = '2.4';
     const pluginName            = 'RDS AI Decoder';
     const pluginHomepageUrl     = 'https://github.com/Highpoint2000/RDS-AI-Decoder/releases';
     const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
@@ -216,11 +216,14 @@
         rtLine1:'', rtLine2:'',
         rdsFollow:false,
         refStation:null, refDistKm:null, refMatchScore:0,
+        refTxName:null, refItu:null, refAzimuth:null, refErp:null, refPol:null,
         af:[],
         psName:     null,
         psNameSrc:  null,
         psVariants: [],
         altFreqs:   [],
+
+        dbFreqEntries: [],
 
         // Provisional → locked UI support
         psProvisional: null,
@@ -275,6 +278,10 @@
         reset();
         st.freq = d.freq || '-';
         setEl('rdsm-freq', st.freq !== '-' ? st.freq + ' MHz' : '-');
+        if (d.dbFreqEntries) {
+            st.dbFreqEntries = d.dbFreqEntries;
+            renderDbEntries();
+        }
     }
 
     // ── Raw RDS group handler ─────────────────────────────────
@@ -349,8 +356,18 @@
         st.aiStats  = d.stats;
         if (d.stats) {
             st.refStation    = d.stats.refStation    || null;
-            st.refDistKm     = d.stats.refDistKm     || null;
+            st.refTxName     = d.stats.refTxName     || null;
+            st.refItu        = d.stats.refItu        || null;
+            st.refDistKm     = d.stats.refDistKm     ?? null;
+            st.refAzimuth    = d.stats.refAzimuth    ?? null;
+            st.refErp        = d.stats.refErp        ?? null;
+            st.refPol        = d.stats.refPol        || null;
             st.refMatchScore = d.stats.refMatchScore || 0;
+        }
+
+        if (d.dbFreqEntries) {
+            st.dbFreqEntries = d.dbFreqEntries;
+            renderDbEntries();
         }
 
         let psNameChanged = false;
@@ -490,6 +507,66 @@
             bEl.style.background = isRef ? '#c8a020' : 'var(--color-main-bright,#4a90d9)';
             bEl.style.opacity    = sl.src === 'empty' ? '0' : String(0.15 + sl.conf * 0.85);
             bEl.className        = 'cf';
+        }
+    }
+
+    // ── Render Database Entries for Frequency ─────────────────
+    function renderDbEntries() {
+        const el = document.getElementById('rdsm-dbentries-content');
+        if (!el) return;
+
+        if (!st.dbFreqEntries || st.dbFreqEntries.length === 0) {
+            el.innerHTML = '<div style="color:#555;font-size:11px;">No local data for this frequency.</div>';
+            return;
+        }
+
+        const items = st.dbFreqEntries.map(entry => {
+            const pi = entry.pi;
+            const ps = entry.ps ? entry.ps.padEnd(8, ' ') : '        ';
+            const cnt = entry.seenCount || 0;
+            const dyn = entry.isDynamic ? '⚡ dynamic' : '';
+            
+            const deleteBtn = isAdmin 
+                ? `<span class="rdsm-delete-pi" data-pi="${pi}" style="color:#ff4444; cursor:pointer; font-weight:bold; margin-left:8px; font-size:12px;" title="Delete this station from the local AI database">✕</span>` 
+                : '';
+
+            return `
+                <div style="display:flex; justify-content:space-between; align-items:center; background:#1c1c1c; padding:2px 6px; border-radius:4px; border:1px solid #2a2a2a;">
+                    <div style="display:flex; gap:8px; align-items:center;">
+                        <span style="font-weight:700; color:#fff; font-size:11px; letter-spacing:1px;">${pi}</span>
+                        <span style="color:#aaa; font-size:12px; white-space:pre; font-family:'Titillium Web',Calibri,sans-serif;">${ps} ${dyn}</span>
+                    </div>
+                    <div style="display:flex; align-items:center;">
+                        <span style="color:#666; font-size:10px;">seen: ${cnt}</span>
+                        ${deleteBtn}
+                    </div>
+                </div>
+            `;
+        });
+
+        el.innerHTML = items.join('');
+
+        // Use event delegation with 'mousedown' to prevent missed events 
+        // when the DOM updates rapidly between mousedown and mouseup.
+        if (isAdmin && !el._hasDeleteListener) {
+            el.addEventListener('mousedown', (e) => {
+                const btn = e.target.closest('.rdsm-delete-pi');
+                if (!btn) return;
+                
+                e.preventDefault();
+                e.stopPropagation();
+
+                const piToDelete = btn.getAttribute('data-pi');
+                if (confirm(`Are you sure you want to delete the database entry for PI ${piToDelete}?`)) {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'rdsm_delete_pi', pi: piToDelete }));
+                        // Optimistically remove from UI
+                        st.dbFreqEntries = st.dbFreqEntries.filter(en => en.pi !== piToDelete);
+                        renderDbEntries();
+                    }
+                }
+            });
+            el._hasDeleteListener = true;
         }
     }
 
@@ -757,15 +834,34 @@
             setEl('ai-freq',    st.aiStats.freq || '-');
             setEl('ai-dynamic', st.aiStats.psIsDynamic ? '⚡ dynamic' : '🔒 static');
         }
+        
         const refRow = document.getElementById('ai-ref-row');
         if (st.refStation) {
             setEl('ai-ref-station', st.refStation);
-            setEl('ai-ref-dist',    st.refDistKm !== null ? st.refDistKm + ' km' : '-');
-            setEl('ai-ref-match',   st.refMatchScore + '%');
-            if (refRow) refRow.style.display = '';
+            
+            let locText = [];
+            if (st.refTxName) locText.push(st.refTxName);
+            if (st.refItu) locText.push(`(${st.refItu})`);
+            setEl('ai-ref-loc', locText.join(' '));
+            
+            let distText = [];
+            if (st.refErp !== null) {
+                let erpStr = `${st.refErp} kW`;
+                if (st.refPol) erpStr += ` [${st.refPol}]`;
+                distText.push(erpStr);
+            } else if (st.refPol) {
+                distText.push(`[${st.refPol}]`);
+            }
+            if (st.refDistKm !== null) distText.push(`${st.refDistKm} km`);
+            if (st.refAzimuth !== null) distText.push(`${st.refAzimuth}°`);
+            
+            setEl('ai-ref-dist', distText.join(' · '));
+            setEl('ai-ref-match', st.refMatchScore + '%');
+            if (refRow) refRow.style.display = 'flex';
         } else {
             if (refRow) refRow.style.display = 'none';
         }
+        
         const rawN  = psSlots.filter(s => s.src.startsWith('raw')).length;
         const dbN   = psSlots.filter(s => s.src === 'ai-cached-db').length;
         const hvote = psSlots.filter(s => s.src === 'ai-voted-high').length;
@@ -847,11 +943,14 @@
         st.rtabFlag = -1; st.ecc = ''; st.grpTotal = 0; st.ber = [];
         st.aiStats = null; st.aiActive = false; st.rtLine1 = ''; st.rtLine2 = '';
         st.refStation = null; st.refDistKm = null; st.refMatchScore = 0;
+        st.refTxName = null; st.refItu = null; st.refAzimuth = null; st.refErp = null; st.refPol = null;
         st.af = [];
         st.psName     = null;
         st.psNameSrc  = null;
         st.psVariants = [];
         st.altFreqs   = [];
+
+        st.dbFreqEntries = [];
 
         st.psProvisional     = null;
         st.psProvisionalConf = 0;
@@ -876,7 +975,7 @@
         if (rt2) rt2.innerHTML = '<span style="color:#333">-</span>';
         
         const ptyEl = document.getElementById('rdsm-pty');
-        if (ptyEl) { ptyEl.textContent = '-'; ptyEl.title = ''; } // Hier war vorher noch ein leerer String ''
+        if (ptyEl) { ptyEl.textContent = '-'; ptyEl.title = ''; }
         
         const afEl = document.getElementById('rdsm-af-flag');
         if (afEl) { afEl.textContent = 'AF'; afEl.className = 'rf'; afEl.title = ''; }
@@ -890,6 +989,8 @@
                     <div style="min-height:4px;"></div>
                 </div>`;
         }
+        renderDbEntries();
+
         GA.forEach(g => { const el = document.getElementById(`rg-${g}`); if (el) el.classList.remove('on'); });
         setFlag('rdsm-tp', false); setFlag('rdsm-ta', false);
         const ms = document.getElementById('rdsm-ms');
@@ -993,6 +1094,12 @@
             padding:4px 0;gap:8px;
             box-sizing:border-box;flex-shrink:0;
             margin-bottom:8px;}
+        #rdsm-dbentries{
+            display:flex;align-items:flex-start;
+            min-height:28px;
+            padding:4px 0;gap:8px;
+            box-sizing:border-box;flex-shrink:0;
+            margin-bottom:8px;}
         #rdsm-stats{
             display:grid;grid-template-columns:96px auto auto;
             justify-content:space-between;align-items:center;
@@ -1030,6 +1137,8 @@
 
         #rdsm-panel #rdsm-psname { pointer-events:all; }
         #rdsm-panel #rdsm-psname * { pointer-events:all; }
+        #rdsm-panel #rdsm-dbentries { pointer-events:all; }
+        #rdsm-panel #rdsm-dbentries * { pointer-events:all; }
         #rdsm-freqscroller { touch-action:pan-y; }
         
         .ai-stats-title{font-size:12px;font-weight:700;color:var(--color-main-bright,#4a90d9);
@@ -1146,6 +1255,13 @@
                 <div style="min-height:4px;"></div>
               </div>
             </div>
+            <hr class="rdiv">
+            <div id="rdsm-dbentries">
+              <span class="rl" style="flex-shrink:0;padding-top:2px;">LOCAL DB</span>
+              <div id="rdsm-dbentries-content" style="display:flex;flex-direction:column;gap:4px;width:100%;">
+                <div style="color:#555;font-size:11px;">No local data for this frequency.</div>
+              </div>
+            </div>
           </div>
           <div id="rdsm-stats">
             <span id="rdsm-gc">Groups: 0</span>
@@ -1168,12 +1284,18 @@
             <div class="ai-stats-r">Groups received: <span id="ai-seen">-</span></div>
             <div class="ai-stats-r">PS votes total: <span id="ai-votes">-</span></div>
             <div class="ai-stats-r">Last seen on: <span id="ai-freq">-</span></div>
-            <div class="ai-stats-ref" id="ai-ref-row" style="display:none">
-              <span style="color:#888">🌐 fmdx.org</span>
-              <span id="ai-ref-station" style="flex:1;margin:0 8px;overflow:hidden;
-                text-overflow:ellipsis;white-space:nowrap"></span>
-              <span id="ai-ref-dist" style="margin-right:8px;color:#888"></span>
-              <span>match: <span id="ai-ref-match">-</span></span>
+            <div class="ai-stats-ref" id="ai-ref-row" style="display:none; flex-direction:column; gap:3px;">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <div style="display:flex; align-items:center; overflow:hidden;">
+                      <span style="color:#888; flex-shrink:0; margin-right:6px;">🌐 fmdx.org</span>
+                      <span id="ai-ref-station" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#c8a020; font-weight:600;"></span>
+                  </div>
+                  <span style="flex-shrink:0; margin-left:6px; color:#888;">match: <span id="ai-ref-match" style="color:#c8a020; font-weight:600;">-</span></span>
+              </div>
+              <div style="display:flex; justify-content:space-between; align-items:center; font-size:10px;">
+                  <span id="ai-ref-loc" style="color:#aaa; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-right:6px;"></span>
+                  <span id="ai-ref-dist" style="color:#888; flex-shrink:0; white-space:nowrap;"></span>
+              </div>
             </div>
             <div class="ai-stats-r" style="flex-direction:column;gap:3px; margin-top:8px;">
               PS slots:<br>
@@ -1204,6 +1326,20 @@
     // ── Drag support ──────────────────────────────────────────
     function makeDrag(el, h) {
         let sx, sy, sl, st2, dr = false;
+
+        // Restore saved position
+        try {
+            const savedPos = localStorage.getItem('rdsm_panel_pos');
+            if (savedPos) {
+                const pos = JSON.parse(savedPos);
+                if (pos.left && pos.top) {
+                    el.style.left = pos.left;
+                    el.style.top = pos.top;
+                    el.style.right = 'auto';
+                }
+            }
+        } catch(e) {}
+
         h.addEventListener('mousedown', e => {
             if (e.target.id === 'rdsm-close' || e.target.id === 'rdsm-manual-link') return;
             dr = true; el.classList.add('drag');
@@ -1211,13 +1347,27 @@
             const r = el.getBoundingClientRect(); sl = r.left; st2 = r.top;
             e.preventDefault();
         });
+
         document.addEventListener('mousemove', e => {
             if (!dr) return;
             el.style.left  = Math.max(0, sl + e.clientX - sx) + 'px';
             el.style.top   = Math.max(0, st2 + e.clientY - sy) + 'px';
             el.style.right = 'auto';
         });
-        document.addEventListener('mouseup', () => { dr = false; el.classList.remove('drag'); });
+
+        document.addEventListener('mouseup', () => { 
+            if (!dr) return;
+            dr = false; 
+            el.classList.remove('drag'); 
+            
+            // Save position
+            try {
+                localStorage.setItem('rdsm_panel_pos', JSON.stringify({
+                    left: el.style.left,
+                    top: el.style.top
+                }));
+            } catch(e) {}
+        });
     }
 
     // ── Toolbar button ────────────────────────────────────────
