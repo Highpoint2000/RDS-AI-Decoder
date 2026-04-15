@@ -4,11 +4,11 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 
 ### Version 2.4
 
-- Local Database Viewer: Added a new "LOCAL DB" section to the client panel that displays all historically saved database entries (PI, PS, seen count, and dynamic status) specifically for the currently tuned frequency
-- Admin Database Management: Logged-in administrators now see a red '✕' button next to each local database entry. Clicking this prompts a confirmation dialog and allows admins to permanently delete corrupted or outdated entries from the AI's local memory.
-- Improved UI Reliability: Switched the delete button's event listener from click to mousedown with event delegation. This fixes the issue where rapid UI updates (DOM refreshes) would cause the delete action or confirmation popup to be ignored.
-- Persistent Panel Position: The draggable decoder panel now saves its position to the browser's localStorage. When you refresh the page, the panel will reappear exactly where you left it instead of resetting to the default position.
-- Smart Propagation Scoring: Replaced basic distance sorting with an advanced calculatePropagationScore algorithm. The system now factors in ERP (transmitter power), Tropospheric/Sporadic-E distance ranges, and shared transmitter sites to find the most realistic fmdx.org reference match.
+- Added a new "LOCAL DB" section to the client panel that displays all historically saved database entries (PI, PS, seen count, and dynamic status) specifically for the currently tuned frequency
+- Logged-in administrators now see a red '✕' button next to each local database entry. Clicking this prompts a confirmation dialog and allows admins to permanently delete corrupted or outdated entries from the AI's local memory.
+- Switched the delete button's event listener from click to mousedown with event delegation. This fixes the issue where rapid UI updates (DOM refreshes) would cause the delete action or confirmation popup to be ignored.
+- The draggable decoder panel now saves its position to the browser's localStorage. When you refresh the page, the panel will reappear exactly where you left it instead of resetting to the default position.
+- Replaced basic distance sorting with an advanced calculatePropagationScore algorithm. The system now factors in ERP (transmitter power), Tropospheric/Sporadic-E distance ranges, and shared transmitter sites to find the most realistic fmdx.org reference match.
 
 
 ## Installation notes:
