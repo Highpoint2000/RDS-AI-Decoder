@@ -68,8 +68,8 @@ function isSpecialPI(pi) {
 
 // ── Module-level state ───────────────────────────────────────
 let aiExclusiveMode    = false;
-let rdsFollowMode      = false;
-let nativeRDSDisabled  = false;
+let rdsFollowMode      = true;
+let nativeRDSDisabled  = true;
 let pluginsWss         = null;
 let pluginsMainWss     = null;
 let currentFreq        = null;
@@ -1085,12 +1085,12 @@ function loadDB() {
             db = raw;
             logInfo(`[${PLUGIN_NAME}] AI memory loaded: ${Object.keys(db).filter(k => k !== '_meta').length} stations`);
         } else {
-            db = { _meta: { rdsFollowMode: false, dbVersion: DB_VERSION } };
+            db = { _meta: { rdsFollowMode: true, dbVersion: DB_VERSION } };
             logInfo(`[${PLUGIN_NAME}] AI memory: new database created`);
         }
     } catch(e) {
         logWarn(`[${PLUGIN_NAME}] Could not load AI DB: ${e.message} – starting fresh`);
-        db = { _meta: { rdsFollowMode: false, dbVersion: DB_VERSION } };
+        db = { _meta: { rdsFollowMode: true, dbVersion: DB_VERSION } };
     }
 }
 
