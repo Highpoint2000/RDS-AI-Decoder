@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4a) //
 //                                                           //
-//  by Highpoint                last update: 2026-04-12      //
+//  by Highpoint                last update: 2026-04-15      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.4',
+    version:      '2.4a',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -618,13 +618,13 @@ const RDS_COUNTRY = (() => {
                 0x6:'FI', 0x7:'LU', 0x8:'BG', 0x9:'DK', 0xA:'GI',
                 0xB:'IQ', 0xC:'GB', 0xD:'LY', 0xE:'RO', 0xF:'FR' },
         0xE2: { 0x1:'MA', 0x2:'CZ', 0x3:'PL', 0x4:'VA', 0x5:'SK',
-                0x6:'SY', 0x7:'TN', 0x9:'LI', 0xA:'IS',
+                0x6:'SY', 0x7:'TN', 0x8:'ES', 0x9:'LI', 0xA:'IS',
                 0xB:'MC', 0xC:'LT', 0xD:'RS', 0xE:'ES', 0xF:'NO' },
         0xE3: { 0x1:'IE', 0x2:'TR', 0x3:'MK', 0x4:'TJ',
-                0x6:'SE', 0x7:'BY', 0x8:'MN', 0x9:'MD', 0xA:'EE',
+                0x6:'ME', 0x7:'BY', 0x8:'MN', 0x9:'MD', 0xA:'EE',
                 0xB:'KG', 0xD:'UA', 0xF:'PT' },
         0xE4: { 0x1:'NL', 0x2:'LV', 0x3:'LB', 0x4:'AZ', 0x5:'HR',
-                0x6:'KZ', 0x7:'SE', 0x8:'UZ', 0x9:'AM',
+                0x6:'KZ', 0x7:'SE', 0x8:'PT', 0x9:'AM',          
                 0xB:'BA', 0xC:'TM', 0xF:'SI' },
     };
     const NAMES = {
@@ -649,7 +649,7 @@ const RDS_COUNTRY = (() => {
         'NL':'Netherlands',   'LV':'Latvia',         'LB':'Lebanon',
         'AZ':'Azerbaijan',    'HR':'Croatia',        'KZ':'Kazakhstan',
         'UZ':'Uzbekistan',    'AM':'Armenia',        'BA':'Bosnia',
-        'TM':'Turkmenistan',  'SI':'Slovenia',
+        'TM':'Turkmenistan',  'SI':'Slovenia',       'ME':'Montenegro'
     };
     return { T, NAMES };
 })();
@@ -657,12 +657,27 @@ const RDS_COUNTRY = (() => {
 function lookupCountry(pi, eccByte) {
     if (!pi || pi === '?' || pi === '----') return null;
     if (!eccByte || eccByte === 0) return null;
+    
     const piNibble = (parseInt(pi, 16) >> 12) & 0xF;
     if (piNibble === 0) return null;
+    
+    // Debugging log to help trace country resolving issues
+    if (DEBUG) logInfo(`[${PLUGIN_NAME}] lookupCountry() checking: PI=${pi} (Nibble=${piNibble}), ECC=${eccByte.toString(16).toUpperCase()}`);
+    
     const eccMap = RDS_COUNTRY.T[eccByte];
-    if (!eccMap) return null;
+    if (!eccMap) {
+        if (DEBUG) logInfo(`[${PLUGIN_NAME}] lookupCountry() failed: ECC ${eccByte.toString(16).toUpperCase()} not found in RDS_COUNTRY table.`);
+        return null;
+    }
+    
     const iso = eccMap[piNibble];
-    if (!iso) return null;
+    if (!iso) {
+        if (DEBUG) logInfo(`[${PLUGIN_NAME}] lookupCountry() failed: PI Nibble ${piNibble} not found for ECC ${eccByte.toString(16).toUpperCase()}.`);
+        return null;
+    }
+    
+    if (DEBUG) logInfo(`[${PLUGIN_NAME}] lookupCountry() matched: ISO=${iso}, Name=${RDS_COUNTRY.NAMES[iso] || iso}`);
+    
     return { iso, name: RDS_COUNTRY.NAMES[iso] || iso };
 }
 

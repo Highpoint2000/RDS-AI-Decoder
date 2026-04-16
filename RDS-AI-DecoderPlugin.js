@@ -1,7 +1,7 @@
 // Plugin configuration, this is used in the administration when plugins are loaded
 var pluginConfig = {
     name: 'RDS AI Decoder',
-    version: '2.4',
+    version: '2.4a',
     author: 'Highpoint',
     frontEndPath: 'RDS-AI-Decoder/rds-ai-decoder.js'
 }

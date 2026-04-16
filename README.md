@@ -2,13 +2,9 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="1913" height="836" alt="Screenshot 2026-04-14 105410" src="https://github.com/user-attachments/assets/145f8528-566e-403a-a4d9-4f4cd49cfb44" />
 
-### Version 2.4
+## Version 2.4a
 
-- Added a new "LOCAL DB" section to the client panel that displays all historically saved database entries (PI, PS, seen count, and dynamic status) specifically for the currently tuned frequency
-- Logged-in administrators now see a red '✕' button next to each local database entry. Clicking this prompts a confirmation dialog and allows admins to permanently delete corrupted or outdated entries from the AI's local memory.
-- Switched the delete button's event listener from click to mousedown with event delegation. This fixes the issue where rapid UI updates (DOM refreshes) would cause the delete action or confirmation popup to be ignored.
-- The draggable decoder panel now saves its position to the browser's localStorage. When you refresh the page, the panel will reappear exactly where you left it instead of resetting to the default position.
-- Replaced basic distance sorting with an advanced calculatePropagationScore algorithm. The system now factors in ERP (transmitter power), Tropospheric/Sporadic-E distance ranges, and shared transmitter sites to find the most realistic fmdx.org reference match.
+- Faulty ECC codes fixed (e.g. Portugal)
 
 
 ## Installation notes:
@@ -44,6 +40,15 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 2.4
+
+- Added a new "LOCAL DB" section to the client panel that displays all historically saved database entries (PI, PS, seen count, and dynamic status) specifically for the currently tuned frequency
+- Logged-in administrators now see a red '✕' button next to each local database entry. Clicking this prompts a confirmation dialog and allows admins to permanently delete corrupted or outdated entries from the AI's local memory.
+- Switched the delete button's event listener from click to mousedown with event delegation. This fixes the issue where rapid UI updates (DOM refreshes) would cause the delete action or confirmation popup to be ignored.
+- The draggable decoder panel now saves its position to the browser's localStorage. When you refresh the page, the panel will reappear exactly where you left it instead of resetting to the default position.
+- Replaced basic distance sorting with an advanced calculatePropagationScore algorithm. The system now factors in ERP (transmitter power), Tropospheric/Sporadic-E distance ranges, and shared transmitter sites to find the most realistic fmdx.org reference match.
+
 
 ### Version 2.3
 
