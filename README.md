@@ -13,7 +13,7 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 2. Unpack all files from the plugins folder to ..fm-dx-webserver-main\plugins\ 
 3. Stop or close the fm-dx-webserver
 4. Start/Restart the fm-dx-webserver with "npm run webserver" on node.js console, check the console informations
-5. Activate the sysinfo plugin in the settings
+5. Activate the RDS AI Decoder plugin  in the settings
 6. Stop or close the fm-dx-webserver
 7. Start/Restart the fm-dx-webserver with "npm run webserver" on node.js console, check the console informations 
 8. Reload the browser
