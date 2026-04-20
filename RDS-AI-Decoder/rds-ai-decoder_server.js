@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4a) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4b) //
 //                                                           //
-//  by Highpoint                last update: 2026-04-15      //
+//  by Highpoint                last update: 2026-04-20      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.4a',
+    version:      '2.4b',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -613,43 +613,47 @@ const RDS_COUNTRY = (() => {
     const T = {
         0xE0: { 0x1:'DE', 0x2:'DZ', 0x3:'AD', 0x4:'IL', 0x5:'IT',
                 0x6:'BE', 0x7:'RU', 0x8:'PS', 0x9:'AL', 0xA:'AT',
-                0xB:'HU', 0xC:'MT', 0xD:'DE', 0xE:'GE', 0xF:'IT' },
+                0xB:'HU', 0xC:'MT', 0xD:'DE', 0xF:'EG' },
         0xE1: { 0x1:'GR', 0x2:'CY', 0x3:'SM', 0x4:'CH', 0x5:'JO',
                 0x6:'FI', 0x7:'LU', 0x8:'BG', 0x9:'DK', 0xA:'GI',
                 0xB:'IQ', 0xC:'GB', 0xD:'LY', 0xE:'RO', 0xF:'FR' },
         0xE2: { 0x1:'MA', 0x2:'CZ', 0x3:'PL', 0x4:'VA', 0x5:'SK',
-                0x6:'SY', 0x7:'TN', 0x8:'ES', 0x9:'LI', 0xA:'IS',
+                0x6:'SY', 0x7:'TN', 0x9:'LI', 0xA:'IS',
                 0xB:'MC', 0xC:'LT', 0xD:'RS', 0xE:'ES', 0xF:'NO' },
-        0xE3: { 0x1:'IE', 0x2:'TR', 0x3:'MK', 0x4:'TJ',
-                0x6:'ME', 0x7:'BY', 0x8:'MN', 0x9:'MD', 0xA:'EE',
-                0xB:'KG', 0xD:'UA', 0xF:'PT' },
-        0xE4: { 0x1:'NL', 0x2:'LV', 0x3:'LB', 0x4:'AZ', 0x5:'HR',
-                0x6:'KZ', 0x7:'SE', 0x8:'PT', 0x9:'AM',          
-                0xB:'BA', 0xC:'TM', 0xF:'SI' },
+        0xE3: { 0x1:'ME', 0x2:'IE', 0x3:'TR', 0x5:'TJ',
+                0x8:'NL', 0x9:'LV', 0xA:'LB', 0xB:'AZ',
+                0xC:'HR', 0xD:'KZ', 0xE:'SE', 0xF:'BY' },
+        0xE4: { 0x1:'MD', 0x2:'EE', 0x3:'MK',
+                0x6:'UA', 0x7:'XK',
+                0x8:'PT', 0x9:'SI',
+                0xA:'AM', 0xB:'UZ', 0xC:'GE',
+                0xE:'TM', 0xF:'BA' },
+        0xE5: { 0x3:'KG' },
     };
     const NAMES = {
-        'DE':'Germany',       'DZ':'Algeria',       'AD':'Andorra',
-        'IL':'Israel',        'IT':'Italy',          'BE':'Belgium',
-        'RU':'Russia',        'PS':'Palestine',      'AL':'Albania',
-        'AT':'Austria',       'HU':'Hungary',        'MT':'Malta',
-        'GE':'Georgia',       'GR':'Greece',         'CY':'Cyprus',
-        'SM':'San Marino',    'CH':'Switzerland',    'JO':'Jordan',
-        'FI':'Finland',       'LU':'Luxembourg',     'BG':'Bulgaria',
-        'DK':'Denmark',       'GI':'Gibraltar',      'IQ':'Iraq',
-        'GB':'United Kingdom','LY':'Libya',          'RO':'Romania',
-        'FR':'France',        'MA':'Morocco',        'CZ':'Czech Republic',
-        'PL':'Poland',        'VA':'Vatican',        'SK':'Slovakia',
-        'SY':'Syria',         'TN':'Tunisia',        'LI':'Liechtenstein',
-        'IS':'Iceland',       'MC':'Monaco',         'LT':'Lithuania',
-        'RS':'Serbia',        'ES':'Spain',          'NO':'Norway',
-        'IE':'Ireland',       'TR':'Turkey',         'MK':'North Macedonia',
-        'TJ':'Tajikistan',    'SE':'Sweden',         'BY':'Belarus',
-        'MN':'Mongolia',      'MD':'Moldova',        'EE':'Estonia',
-        'KG':'Kyrgyzstan',    'UA':'Ukraine',        'PT':'Portugal',
-        'NL':'Netherlands',   'LV':'Latvia',         'LB':'Lebanon',
-        'AZ':'Azerbaijan',    'HR':'Croatia',        'KZ':'Kazakhstan',
-        'UZ':'Uzbekistan',    'AM':'Armenia',        'BA':'Bosnia',
-        'TM':'Turkmenistan',  'SI':'Slovenia',       'ME':'Montenegro'
+        'DE':'Germany',         'DZ':'Algeria',         'AD':'Andorra',
+        'IL':'Israel',          'IT':'Italy',            'BE':'Belgium',
+        'RU':'Russia',          'PS':'Palestine',        'AL':'Albania',
+        'AT':'Austria',         'HU':'Hungary',          'MT':'Malta',
+        'EG':'Egypt',           'GR':'Greece',           'CY':'Cyprus',
+        'SM':'San Marino',      'CH':'Switzerland',      'JO':'Jordan',
+        'FI':'Finland',         'LU':'Luxembourg',       'BG':'Bulgaria',
+        'DK':'Denmark',         'GI':'Gibraltar',        'IQ':'Iraq',
+        'GB':'United Kingdom',  'LY':'Libya',            'RO':'Romania',
+        'FR':'France',          'MA':'Morocco',          'CZ':'Czech Republic',
+        'PL':'Poland',          'VA':'Vatican',          'SK':'Slovakia',
+        'SY':'Syria',           'TN':'Tunisia',          'LI':'Liechtenstein',
+        'IS':'Iceland',         'MC':'Monaco',           'LT':'Lithuania',
+        'RS':'Serbia',          'ES':'Spain',            'NO':'Norway',
+        'ME':'Montenegro',      'IE':'Ireland',          'TR':'Turkey',
+        'TJ':'Tajikistan',      'NL':'Netherlands',      'LV':'Latvia',
+        'LB':'Lebanon',         'AZ':'Azerbaijan',       'HR':'Croatia',
+        'KZ':'Kazakhstan',      'SE':'Sweden',           'BY':'Belarus',
+        'MD':'Moldova',         'EE':'Estonia',          'MK':'North Macedonia',
+        'UA':'Ukraine',         'PT':'Portugal',         'SI':'Slovenia',
+        'AM':'Armenia',         'UZ':'Uzbekistan',       'GE':'Georgia',
+        'TM':'Turkmenistan',    'BA':'Bosnia',           'KG':'Kyrgyzstan',
+        'XK':'Kosovo',
     };
     return { T, NAMES };
 })();
