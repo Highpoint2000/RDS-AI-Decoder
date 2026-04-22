@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4b) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4c) //
 //                                                           //
-//  by Highpoint                last update: 2026-04-20      //
+//  by Highpoint                last update: 2026-04-22      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.4b',
+    version:      '2.4c',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -1589,6 +1589,7 @@ function clearRDSInDataHandler() {
         pi: '?', ps: '', ps_errors: '', pty: 0, tp: 0, ta: 0, ms: -1,
         rt0: '', rt1: '', rt0_errors: '', rt1_errors: '', rt_flag: '',
         rds: false, ecc: null, country_name: '', country_iso: 'UN',
+        lic: 0, lang: ''
     };
     Object.assign(dataHandler.dataToSend,  rdsFields);
     Object.assign(dataHandler.initialData, rdsFields);
@@ -1819,6 +1820,10 @@ function applyFollowToDataHandler() {
         dataHandler.dataToSend.country_iso  = country ? country.iso  : 'UN';
         dataHandler.dataToSend.country_name = country ? country.name : '';
     }
+    
+    // Lock LIC out so the flag doesn't alternate
+    dataHandler.dataToSend.lic = 0;
+    dataHandler.dataToSend.lang = '';
 
     dataHandler.dataToSend.rds = !!(pi && pi !== '?');
     applyAFToDataHandler();
@@ -2492,7 +2497,8 @@ function hookDataHandler(dh) {
             const fields = [
                 'pi', 'ps', 'ps_errors', 'pty', 'tp', 'ta', 'ms',
                 'rt0', 'rt1', 'rt0_errors', 'rt1_errors', 'rt_flag',
-                'ecc', 'country_iso', 'country_name', 'af'
+                'ecc', 'country_iso', 'country_name', 'af', 
+                'lic', 'lang'
             ];
 
             const lockedData = {};
