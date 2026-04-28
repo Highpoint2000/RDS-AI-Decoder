@@ -2,9 +2,9 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="1913" height="836" alt="Screenshot 2026-04-14 105410" src="https://github.com/user-attachments/assets/145f8528-566e-403a-a4d9-4f4cd49cfb44" />
 
-## Version 2.4c
+### Version 2.4e
 
-- Troubleshooting flickering ECC flags
+- Solved problem with flickering ECC flags 
 
 
 ## Installation notes:
@@ -42,6 +42,12 @@ If you have any questions, would like to report problems, or have suggestions fo
 <summary>History</summary>
 
 ### Version 2.4c
+
+- Troubleshooting flickering ECC flags
+
+
+
+### Version 2.4b
 
 - ECC table completely revised
 

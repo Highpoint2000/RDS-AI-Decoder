@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4c) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4e) //
 //                                                           //
-//  by Highpoint                last update: 2026-04-22      //
+//  by Highpoint                last update: 2026-04-28      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -1585,7 +1585,7 @@ function buildPSString(pi) {
 // ═══════════════════════════════════════════════════════════════
 function clearRDSInDataHandler() {
     if (!dataHandler) return;
-    const rdsFields = {
+const rdsFields = {
         pi: '?', ps: '', ps_errors: '', pty: 0, tp: 0, ta: 0, ms: -1,
         rt0: '', rt1: '', rt0_errors: '', rt1_errors: '', rt_flag: '',
         rds: false, ecc: null, country_name: '', country_iso: 'UN',
@@ -1819,6 +1819,10 @@ function applyFollowToDataHandler() {
         const country = lookupCountry(pi, eccByte);
         dataHandler.dataToSend.country_iso  = country ? country.iso  : 'UN';
         dataHandler.dataToSend.country_name = country ? country.name : '';
+		
+		// Force language fields to 0/empty to prevent flag flickering
+        dataHandler.dataToSend.lic = 0;
+        dataHandler.dataToSend.lang = '';
     }
     
     // Lock LIC out so the flag doesn't alternate
@@ -1966,7 +1970,7 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
 
     // ── Group 1A (ECC) ────────────────────────────────────────
     if (gT === 1 && vB === 0 && b3hex && errB[2] <= 1 && entry) {
-        const variant = (g2 >> 1) & 0x07;
+        const variant = (g3 >> 12) & 0x07;
         if (variant === 0) {
             const eccByte = g3 & 0xFF;
             if (eccByte > 0) {
@@ -2498,7 +2502,7 @@ function hookDataHandler(dh) {
                 'pi', 'ps', 'ps_errors', 'pty', 'tp', 'ta', 'ms',
                 'rt0', 'rt1', 'rt0_errors', 'rt1_errors', 'rt_flag',
                 'ecc', 'country_iso', 'country_name', 'af', 
-                'lic', 'lang'
+                'lic', 'lang' // <--- Add these two
             ];
 
             const lockedData = {};
