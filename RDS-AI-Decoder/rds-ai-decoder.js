@@ -16,7 +16,7 @@
     const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
     const pluginSetupOnlyNotify = false;
     const CHECK_FOR_UPDATES     = true;
-    const pluginManualUrl       = 'https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation-v2.2a.html';
+    const pluginManualUrl       = 'https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation.html';
 
     if (typeof sendToast !== 'function') {
         window.sendToast = function(cls, src, txt) {
