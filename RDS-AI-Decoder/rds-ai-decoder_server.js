@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4e) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4f) //
 //                                                           //
-//  by Highpoint                last update: 2026-04-28      //
+//  by Highpoint                last update: 2026-05-25      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.4c',
+    version:      '2.4f',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -953,18 +953,69 @@ function findBestRefEntry(pi) {
     const piUp = pi.toUpperCase();
     const dbEntry = db[pi];
     
-    const exact = currentState.freqRefs.filter(r => r.pi === piUp);
-    if (exact.length >= 1) {
-        // Sort by smart propagation score instead of just distance
-        return exact.sort((a, b) => calculatePropagationScore(b, dbEntry) - calculatePropagationScore(a, dbEntry))[0];
+    let candidates = currentState.freqRefs.filter(r => r.pi === piUp);
+    if (candidates.length === 0) {
+        candidates = currentState.freqRefs.filter(r => r.pireg && r.pireg === piUp);
     }
     
-    const pireg = currentState.freqRefs.filter(r => r.pireg && r.pireg === piUp);
-    if (pireg.length >= 1) {
-        return pireg.sort((a, b) => calculatePropagationScore(b, dbEntry) - calculatePropagationScore(a, dbEntry))[0];
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0]; // No collision, return the only candidate
+    
+    // --- COLLISION DETECTED: Multiple TX with same PI on this frequency ---
+    // Evaluate live evidence (AF network and partial PS) to break the tie.
+    
+    const liveAFs = Array.from(currentState.afSet);
+    const livePSUpper = currentState.psBuf.join('').toUpperCase().padEnd(8, ' ');
+    const cleanPositions = currentState.psBuf.map((_, i) => ((currentState.psErrBuf[i] ?? 3) <= 1));
+    
+    let bestCandidate = null;
+    let highestScore = -1;
+    
+    for (const cand of candidates) {
+        let score = calculatePropagationScore(cand, dbEntry); // Base score (distance/power)
+        
+        // 1. AF Network Cross-Check
+        // Check if any of our live received AFs point to this specific candidate's network
+        let afMatches = 0;
+        if (liveAFs.length > 0) {
+            for (const af of liveAFs) {
+                const afRefs = getFreqRefs(af);
+                if (afRefs.some(r => r.pi === piUp && (r.station === cand.station || r.txName === cand.txName))) {
+                    afMatches++;
+                }
+            }
+        }
+        score += (afMatches * 100); // Massive tie-breaker boost for confirmed AF network
+        
+        // 2. Strict PS Partial Match Check
+        let maxPsScore = 0;
+        if (cand.psVariants && cand.psVariants.length > 0) {
+            for (const v of cand.psVariants) {
+                const rv = v.toUpperCase().padEnd(8, ' ');
+                let matchPts = 0;
+                let mismatchPts = 0;
+                for (let i = 0; i < 8; i++) {
+                    if (cleanPositions[i] && rv[i] !== ' ') {
+                        if (rv[i] === livePSUpper[i]) matchPts++;
+                        else mismatchPts++;
+                    }
+                }
+                // Only reward if we have more matches than mismatches
+                const netPsScore = matchPts - mismatchPts;
+                if (netPsScore > maxPsScore) maxPsScore = netPsScore;
+            }
+        }
+        if (maxPsScore > 0) {
+            score += (maxPsScore * 30); // Significant boost for matching clean PS chars
+        }
+        
+        if (score > highestScore) {
+            highestScore = score;
+            bestCandidate = cand;
+        }
     }
     
-    return null;
+    return bestCandidate;
 }
 
 function findRefEntry(pi) { return findBestRefEntry(pi); }
