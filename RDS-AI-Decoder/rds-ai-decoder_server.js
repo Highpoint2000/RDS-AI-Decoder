@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4f) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4g) //
 //                                                           //
-//  by Highpoint                last update: 2026-05-25      //
+//  by Highpoint                last update: 2026-05-28      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.4f',
+    version:      '2.4g',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -1073,13 +1073,23 @@ function getConfirmThreshold(pi) {
     if (isSpecialPI(pi)) return PI_CONFIRM_THRESHOLD;
     const refs = currentState.freqRefs;
 
-    let threshold = PI_CONFIRM_THRESHOLD;
+    let threshold = 2; // Default threshold
+    
     if (refs && refs.length > 0) {
         const piUp   = pi ? pi.toUpperCase() : '';
         const inFmdx = refs.some(r => r.pi === piUp || (r.pireg && r.pireg === piUp));
-        if (!inFmdx) return PI_CONFIRM_THRESHOLD;
-        const ref = findRefEntry(pi);
-        if ((ref?.distKm ?? 9999) < 500) threshold = 1;
+        
+        if (!inFmdx) {
+            threshold = 4; // Unknown PIs require extremely strong evidence
+        } else {
+            const ref = findRefEntry(pi);
+            const distKm = ref?.distKm ?? 9999;
+            
+            if (distKm < 300) threshold = 1;      // Local Tropo: Let it pass immediately
+            else if (distKm > 800) threshold = 4; // SpE/MS Range: High threshold for naked PIs
+        }
+    } else {
+        threshold = 4; // No FMDX data for this frequency
     }
 
     let evidenceScore = 0;
@@ -1087,7 +1097,11 @@ function getConfirmThreshold(pi) {
     if (entry?.ecc)                        evidenceScore++;
     if (entry?.af && entry.af.length >= 2) evidenceScore++;
     if (recentZeroErrFraction() >= 0.75)   evidenceScore++;
-    if (countCleanRawPositions() >= 5)     evidenceScore++;
+    
+    // The Joker: As soon as we receive clean PS characters, the threshold drops drastically!
+    const cleanChars = countCleanRawPositions();
+    if (cleanChars >= 1) evidenceScore += 2; 
+    if (cleanChars >= 4) evidenceScore += 2;
 
     threshold = Math.max(1, threshold - Math.floor(evidenceScore / 2));
     return threshold;
@@ -1668,8 +1682,28 @@ function applyAFToDataHandler() {
 
 function applyFollowToDataHandler() {
     if (!dataHandler || !rdsFollowMode || !piConfirmed) return;
-    const pi    = currentState.pi;
-    const entry = (!isSpecialPI(pi) && pi) ? db[pi] : null;
+    
+    const pi = currentState.pi;
+
+    // --- SECURITY LOCK ---
+    if (pi && !isSpecialPI(pi)) {
+        const entry = db[pi];
+        const isKnownOnFreq = entry && entry.freq === roundFreq(currentState.freq);
+        
+        // Count how many valid (error level 0 or 1) non-space PS characters have been received
+        const validPsChars = currentState.psBuf.filter((char, i) => 
+            char !== ' ' && (currentState.psErrBuf[i] ?? 3) <= 1
+        ).length;
+
+        // Block passthrough to the webserver if the PI is not in the local DB for this frequency
+        // UNLESS we have already received at least a partial valid PS string (at least 3 clean char).
+        if (!isKnownOnFreq && validPsChars < 3) {
+            if (DEBUG) logInfo(`[RDS AI Decoder] Security Lock: Blocking unknown PI ${pi} from webserver until a valid PS substring is received.`);
+            return; 
+        }
+    }
+	
+	const entry = (!isSpecialPI(pi) && pi) ? db[pi] : null;
     const ref   = findRefEntry(pi);
     const pred  = currentState.lastPrediction;
 
@@ -1751,8 +1785,21 @@ function applyFollowToDataHandler() {
 
     if (!lastBroadcastPS) {
         const dbStr = getDbMixedCasePS();
-        if (dbStr) lastBroadcastPS = dbStr;
-        else if (ref?.psVariants?.length > 0) lastBroadcastPS = ref.psVariants[0].padEnd(8, ' ');
+        
+        // Count clean PS characters coming live over the air
+        const validPsChars = currentState.psBuf.filter((char, i) => char !== ' ' && (currentState.psErrBuf[i] ?? 3) <= 1).length;
+
+        if (dbStr) {
+            lastBroadcastPS = dbStr;
+        } else if (ref?.psVariants?.length > 0) {
+            if (validPsChars > 0) {
+                // Signal has partial PS data -> Allow FMDX name as a fallback helper
+                lastBroadcastPS = ref.psVariants[0].padEnd(8, ' ');
+            } else {
+                // PURE PI RECEPTION (Scatter or Ghost) -> Do not hallucinate a name!
+                lastBroadcastPS = '        '; 
+            }
+        }
     }
 
     const isDynamic          = (entry?.psIsDynamic || false) || (ref?.psVariants?.length > 1);

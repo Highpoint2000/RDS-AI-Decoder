@@ -2,10 +2,11 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="1913" height="836" alt="Screenshot 2026-04-14 105410" src="https://github.com/user-attachments/assets/145f8528-566e-403a-a4d9-4f4cd49cfb44" />
 
-### Version 2.4f
+### Version 2.4g
 
-- Algorithm hardened against duplicate PI codes on the same frequency
-
+- Meteor Scatter & Ghost PI Suppression: Added a dynamic PI confirmation threshold based on distance (1 hit for local, 4 hits for distant/unknown signals). The threshold lowers automatically if clean PS characters are decoded.
+- Anti-Hallucination (Scatter Mode): Prevents the system from guessing (hallucinating) a station name from the FMDX database if a PI code is received via a brief scatter ping with zero valid PS characters.
+- Local Truth Override: Bypasses the strict database enforcement if a mathematically perfect PS string (all 8 characters at error level 0 or 1) is decoded live, allowing bespoke local test transmitters or rebranded stations to be locked
 
 ## Installation notes:
 
@@ -41,10 +42,17 @@ If you have any questions, would like to report problems, or have suggestions fo
 <details>
 <summary>History</summary>
 
+### Version 2.4f
+
+- Algorithm hardened against duplicate PI codes on the same frequency
+
+### Version 2.4e
+
+- Solved problem with flickering ECC flags
+
 ### Version 2.4c
 
 - Troubleshooting flickering ECC flags
-
 
 
 ### Version 2.4b
