@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.4g) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.5)  //
 //                                                           //
-//  by Highpoint                last update: 2026-05-28      //
+//  by Highpoint                last update: 2026-05-30      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.4g',
+    version:      '2.5',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -81,6 +81,9 @@ let piConfirmed        = false;
 let piPendingBroadcast = false;
 
 let psLocked = false;
+
+let nativePI = '----';
+let nativePS = '        ';
 
 // Provisional tracking – updated ONLY inside buildAIPrediction()
 let lastProvisionalPS      = null;
@@ -2270,7 +2273,10 @@ function buildAIPrediction(pi) {
     const dbFreqEntries = getDbEntriesForFreq(currentState.freq);
 
     return {
-        pi, ps: psSlots, rt: rtResult, af: afArray,
+        pi, 
+        nativeWebserverPI: nativePI,
+        ps: psSlots, rt: rtResult, af: afArray,
+        nativeWebserverPS: nativePS,
         psName, psNameSrc, psVariants: ref?.psVariants || [], altFreqs, psLocked,
         psProvisional,
         psProvisionalConf: stationConf,
@@ -2523,6 +2529,8 @@ function interceptLines(data) {
                 currentState.freq  = freq;
                 currentFreq        = freq;
                 currentState.pi    = null;
+                nativePI = '----';
+                nativePS = '        ';
                 piConfirmCount     = 0;
                 piConfirmed        = false;
                 piPendingBroadcast = false;
@@ -2600,7 +2608,7 @@ function hookDataHandler(dh) {
                 'pi', 'ps', 'ps_errors', 'pty', 'tp', 'ta', 'ms',
                 'rt0', 'rt1', 'rt0_errors', 'rt1_errors', 'rt_flag',
                 'ecc', 'country_iso', 'country_name', 'af', 
-                'lic', 'lang' // <--- Add these two
+                'lic', 'lang'
             ];
 
             const lockedData = {};
@@ -2612,7 +2620,11 @@ function hookDataHandler(dh) {
 
                 Object.defineProperty(dh.dataToSend, f, {
                     get: () => lockedData[f],
-                    set: () => {},
+                    set: (val) => {
+
+                        if (f === 'pi') nativePI = val;
+                        if (f === 'ps') nativePS = val;
+                    },
                     configurable: true,
                     enumerable: true
                 });
@@ -2628,15 +2640,23 @@ function hookDataHandler(dh) {
             const result = orig.call(this, wss, receivedData, rdsWss);
 
             fields.forEach(f => {
+                lockedData[f] = dh.dataToSend[f];
+                lockedInit[f] = dh.initialData[f];
+
                 Object.defineProperty(dh.dataToSend, f, {
-                    value: lockedData[f],
-                    writable: true,
+                    get: () => lockedData[f],
+                    set: (val) => {
+                        lockedData[f] = val;
+                    },
                     configurable: true,
                     enumerable: true
                 });
+
                 Object.defineProperty(dh.initialData, f, {
-                    value: lockedInit[f],
-                    writable: true,
+                    get: () => lockedInit[f],
+                    set: (val) => {
+                        lockedInit[f] = val;
+                    },
                     configurable: true,
                     enumerable: true
                 });
@@ -2645,7 +2665,12 @@ function hookDataHandler(dh) {
             return result;
         }
 
+
         const result = orig.call(this, wss, receivedData, rdsWss);
+        
+        nativePI = dh.dataToSend.pi;
+        nativePS = dh.dataToSend.ps;
+
         return result;
     };
     logInfo(`[${PLUGIN_NAME}] datahandler hooked`);

@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.4g) //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.5)  //
 //                                                           //
-//  by Highpoint                last update: 2026-05-28      //
+//  by Highpoint                last update: 2026-05-30      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -10,7 +10,7 @@
 
 (() => {
 
-    const pluginVersion         = '2.4g';
+    const pluginVersion         = '2.5';
     const pluginName            = 'RDS AI Decoder';
     const pluginHomepageUrl     = 'https://github.com/Highpoint2000/RDS-AI-Decoder/releases';
     const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
@@ -231,6 +231,8 @@
         psStableMs: 0,
         psLockReason: null,
         psLocked: false,
+		nativePI: '-',
+        nativePS: '-',
     };
 
     // ── Change-detection fingerprint for PS slots ─────────────
@@ -353,6 +355,8 @@
     function onAI(d) {
         if (d.ts && d.ts < st._freqChangeTs) return;
         st.aiActive = true;
+		if (d.nativeWebserverPI !== undefined) st.nativePI = d.nativeWebserverPI;
+        if (d.nativeWebserverPS !== undefined) st.nativePS = d.nativeWebserverPS;
         st.aiStats  = d.stats;
         if (d.stats) {
             st.refStation    = d.stats.refStation    || null;
@@ -826,7 +830,8 @@
     // ── Statistics panel ──────────────────────────────────────
     function refreshStatsPanel() {
         if (!statsOpen) return;
-        setEl('ai-cur-pi',  st.pi);
+        setEl('ai-cur-pi',  st.pi);       
+        setEl('ai-native-rds', `${st.nativePI} | "${st.nativePS}"`);
         setEl('ai-active',  st.aiActive ? '✅ active' : '⏳ waiting...');
         if (st.aiStats) {
             setEl('ai-seen',    st.aiStats.seenCount?.toLocaleString() || '-');
@@ -956,7 +961,9 @@
         st.psProvisionalConf = 0;
         st.psStableMs        = 0;
         st.psLockReason      = null;
-        st.psLocked          = false;
+		
+        st.nativePI = '-';
+        st.nativePS = '-';
 
         _freqScrollTop = 0;
         _lastPSFingerprint = '';
@@ -1003,6 +1010,7 @@
 
         if (statsOpen) {
             setEl('ai-cur-pi',      '-');
+			setEl('ai-native-rds',  '- | "-"');
             setEl('ai-active',      '⏳ waiting...');
             setEl('ai-seen',        '-');
             setEl('ai-votes',       '-');
@@ -1276,10 +1284,11 @@
             </span>
           </div>
         </div>
-        <div id="rdsm-stats-pan">
+ <div id="rdsm-stats-pan">
             <div class="ai-stats-title">STATISTICS</div>
             <div class="ai-stats-r">AI connection: <span id="ai-active">⏳</span></div>
-            <div class="ai-stats-r">Current PI: <span id="ai-cur-pi">-</span></div>
+            <div class="ai-stats-r">Current PI: <span id="ai-cur-pi">-</span></div>           
+            <div class="ai-stats-r" style="color:#555; font-size:10px;">Native data: <span id="ai-native-rds" style="color:#777;">-</span></div>
             <div class="ai-stats-r">PS type: <span id="ai-dynamic">-</span></div>
             <div class="ai-stats-r">Groups received: <span id="ai-seen">-</span></div>
             <div class="ai-stats-r">PS votes total: <span id="ai-votes">-</span></div>
