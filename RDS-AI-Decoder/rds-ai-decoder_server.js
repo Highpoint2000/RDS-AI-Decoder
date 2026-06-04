@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.5)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.5a) //
 //                                                           //
-//  by Highpoint                last update: 2026-05-30      //
+//  by Highpoint                last update: 2026-06-02      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.5',
+    version:      '2.5a',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -1073,27 +1073,28 @@ function isPIAllowed(pi) {
 }
 
 function getConfirmThreshold(pi) {
-    if (isSpecialPI(pi)) return PI_CONFIRM_THRESHOLD;
-    const refs = currentState.freqRefs;
+        if (isSpecialPI(pi)) return PI_CONFIRM_THRESHOLD;
+        const refs = currentState.freqRefs;
 
-    let threshold = 2; // Default threshold
-    
-    if (refs && refs.length > 0) {
-        const piUp   = pi ? pi.toUpperCase() : '';
-        const inFmdx = refs.some(r => r.pi === piUp || (r.pireg && r.pireg === piUp));
+        let threshold = 4; // New default threshold for distances between 300km and 800km
         
-        if (!inFmdx) {
-            threshold = 4; // Unknown PIs require extremely strong evidence
-        } else {
-            const ref = findRefEntry(pi);
-            const distKm = ref?.distKm ?? 9999;
+        if (refs && refs.length > 0) {
+            const piUp   = pi ? pi.toUpperCase() : '';
+            const inFmdx = refs.some(r => r.pi === piUp || (r.pireg && r.pireg === piUp));
             
-            if (distKm < 300) threshold = 1;      // Local Tropo: Let it pass immediately
-            else if (distKm > 800) threshold = 4; // SpE/MS Range: High threshold for naked PIs
+            if (!inFmdx) {
+                threshold = 6; // Unknown PIs (not in FMDX) require maximum evidence (6)
+            } else {
+                const ref = findRefEntry(pi);
+                const distKm = ref?.distKm ?? 9999;
+                
+                if (distKm < 300) threshold = 2;      // Local Tropo (< 300 km): Require 2 confirmations
+                else if (distKm > 800) threshold = 6; // SpE/MS Range (> 800 km): Require 6 confirmations
+                // Everything in between (300 - 800 km) stays at the default threshold of 4
+            }
+        } else {
+            threshold = 6; // No FMDX data for this frequency -> require maximum evidence
         }
-    } else {
-        threshold = 4; // No FMDX data for this frequency
-    }
 
     let evidenceScore = 0;
     const entry = db[pi];
@@ -1366,15 +1367,41 @@ function checkPSDynamic(pi, psString) {
     if (isSpecialPI(pi)) return;
     const entry = ensurePI(pi);
     const buf   = entry.psDynamicBuf;
+    
     buf.push(psString);
     if (buf.length > 8) buf.shift();
+    
+    // Initialisiere den Frame-Zähler für das Timeout, falls er noch nicht existiert
+    if (entry.psDynamicFrames === undefined) entry.psDynamicFrames = 0;
+
     if (buf.length < 3) return;
-    if (!entry.psIsDynamic) {
-        entry.psIsDynamic = detectScrollPS(buf) || detectChangingPS(buf);
-        if (entry.psIsDynamic) {
-            entry.ps = {}; entry.psResolved = null;
+
+    // Prüfen, ob JETZT im aktuellen Puffer dynamischer Text läuft
+    const isCurrentlyDynamic = detectScrollPS(buf) || detectChangingPS(buf);
+
+    if (isCurrentlyDynamic) {
+        // Dynamischer Text erkannt -> Timer wieder auf 0 setzen
+        entry.psDynamicFrames = 0;
+        
+        if (!entry.psIsDynamic) {
+            entry.psIsDynamic = true;
+            entry.ps = {}; 
+            entry.psResolved = null;
             entry.psConf = new Array(8).fill(0);
             dbDirty = true;
+            if (DEBUG) logInfo(`[RDS AI Decoder] PI ${pi}: Dynamic PS detected. Latching to dynamic mode.`);
+        }
+    } else if (entry.psIsDynamic) {
+        // Modus ist "dynamisch", aber es dreht sich gerade nichts mehr -> Zähler erhöhen
+        entry.psDynamicFrames++;
+        
+        // Timeout-Grenze festlegen (hier: 50 Durchläufe, ca. 20-30 Sekunden ohne Scrollen)
+        if (entry.psDynamicFrames > 50) { 
+            entry.psIsDynamic = false;
+            entry.psDynamicFrames = 0;
+            buf.length = 0; // Puffer leeren für einen sauberen Neustart
+            dbDirty = true;
+            if (DEBUG) logInfo(`[RDS AI Decoder] PI ${pi}: Dynamic PS timeout reached. Jumping back to static PS check.`);
         }
     }
 }
@@ -1382,29 +1409,56 @@ function checkPSDynamic(pi, psString) {
 function detectScrollPS(buf) {
     if (buf.length < 3) return false;
     let scrollCount = 0;
+    
     for (let i = 1; i < buf.length; i++) {
         const a = buf[i-1].trim(), b = buf[i].trim();
-        if (!a.length || !b.length) continue;
-        for (let shift = 1; shift <= 4; shift++) {
-            const rotated = a.slice(shift) + a.slice(0, shift);
-            if (rotated.replace(/_/g, ' ').trim() === b.replace(/_/g, ' ').trim()) {
-                scrollCount++; break;
+        // Skip identical or empty fragments (just like the Kotlin app)
+        if (!a || !b || a === b) continue; 
+        
+        let isShifted = false;
+        for (let shift = 1; shift <= 7; shift++) {
+            // Check both left and right rotations
+            const rotatedLeft  = a.slice(shift) + a.slice(0, shift);
+            const rotatedRight = a.slice(-shift) + a.slice(0, a.length - shift);
+            
+            const cleanB = b.replace(/_/g, ' ');
+            if (rotatedLeft.replace(/_/g, ' ') === cleanB || 
+                rotatedRight.replace(/_/g, ' ') === cleanB) {
+                isShifted = true; 
+                break;
             }
         }
+        if (isShifted) scrollCount++;
     }
-    return scrollCount / (buf.length - 1) > 0.6;
+    return (scrollCount / (buf.length - 1)) > 0.6;
 }
 
 function detectChangingPS(buf) {
     if (buf.length < 5) return false;
+    
+    // 1. Filter valid tokens only (length >= 2), similar to Kotlin
+    const validTokens = buf.map(s => s.trim()).filter(s => s.length >= 2);
+    
+    // 2. Count occurrences of each token
     const counts = {};
-    for (const s of buf) {
-        const clean = s.trim();
-        if (!clean) continue;
-        counts[clean] = (counts[clean] || 0) + 1;
+    for (const s of validTokens) {
+        counts[s] = (counts[s] || 0) + 1;
     }
+    
+    // 3. Substring filter: Ignore short fragments if a longer one exists
+    // (e.g., ignore "OE" if "OE 1" is already in the list)
+    const distinctWords = Object.keys(counts).filter(key => {
+        return !Object.keys(counts).some(other => {
+            return other.length > key.length && other.toLowerCase().startsWith(key.toLowerCase());
+        });
+    });
+    
+    // 4. Check if at least 2 of these distinct words appear multiple times
     let recurring = 0;
-    for (const count of Object.values(counts)) { if (count >= 2) recurring++; }
+    for (const word of distinctWords) {
+        if (counts[word] >= 2) recurring++;
+    }
+    
     return recurring >= 2;
 }
 
@@ -1805,7 +1859,7 @@ function applyFollowToDataHandler() {
         }
     }
 
-    const isDynamic          = (entry?.psIsDynamic || false) || (ref?.psVariants?.length > 1);
+    const isDynamic          = (entry?.psIsDynamic || false);
     const isScrollingNonFmdx = entry?.psIsDynamic && (!ref?.psVariants || ref.psVariants.length <= 1);
 
     if (psLocked && lastBroadcastPS && !isScrollingNonFmdx) {
@@ -2247,7 +2301,7 @@ function buildAIPrediction(pi) {
         psNameSrc  = 'fmdx';
     }
 
-    const psIsDynamicEffective = (entry?.psIsDynamic || false) || (ref?.psVariants?.length > 1);
+    const psIsDynamicEffective = (entry?.psIsDynamic || false);
 
     const rawAltFreqs = (!isSpecialPI(pi) && psLocked && lastBroadcastPS)
         ? getAltFreqsForPIAndPS(pi, lastBroadcastPS)
