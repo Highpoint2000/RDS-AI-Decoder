@@ -2,9 +2,13 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="1913" height="836" alt="Screenshot 2026-04-14 105410" src="https://github.com/user-attachments/assets/145f8528-566e-403a-a4d9-4f4cd49cfb44" />
 
-## Version 2.5a
+## Version 2.6
 
-- AI algorithm optimized for error minimization
+- Spatial Awareness (SpE Cloud Tracking): The AI now tracks the geometric center (ITU/Azimuth) of active Sporadic-E clouds over a 5-minute window, effectively eliminating false logs from incorrect directions during PI collisions.
+- 5-Minute SpE Cache: DX stations (>800 km) are aggressively purged from local memory exactly 5 minutes after signal loss to prevent long-term PI blocking.
+- Dummy-PI Blocker: Single FMDX database candidates are now strictly validated against live PS characters and rejected on conflict, preventing uncoordinated "Dummy PI" mismatches.
+- Long-Press Toggle & Admin Padlock: RDS Follow is now toggled via a long-press (600ms) on the main navigation button. A new Admin Padlock UI (🔒/🔓) allows unlocking the feature for public guest users.
+- Database Auto-Wipe Mechanism: A seamless one-time wipe routine safely handles database schema updates while perfectly preserving administrative settings.
 
 ## Installation notes:
 
@@ -39,6 +43,10 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 2.5a
+
+- AI algorithm optimized for error minimization
 
 ### Version 2.5
 

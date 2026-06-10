@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.5a) //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.6) //
 //                                                           //
-//  by Highpoint                last update: 2026-06-02      //
+//  by Highpoint                last update: 2026-06-10      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -10,7 +10,7 @@
 
 (() => {
 
-    const pluginVersion         = '2.5a';
+    const pluginVersion         = '2.6';
     const pluginName            = 'RDS AI Decoder';
     const pluginHomepageUrl     = 'https://github.com/Highpoint2000/RDS-AI-Decoder/releases';
     const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
@@ -215,6 +215,7 @@
         _freqChangeTs:0,
         rtLine1:'', rtLine2:'',
         rdsFollow:false,
+        rdsFollowLocked:true, // DEFAULT LOCKED
         refStation:null, refDistKm:null, refMatchScore:0,
         refTxName:null, refItu:null, refAzimuth:null, refErp:null, refPol:null,
         af:[],
@@ -225,13 +226,12 @@
 
         dbFreqEntries: [],
 
-        // Provisional → locked UI support
         psProvisional: null,
         psProvisionalConf: 0,
         psStableMs: 0,
         psLockReason: null,
         psLocked: false,
-		nativePI: '-',
+        nativePI: '-',
         nativePS: '-',
     };
 
@@ -272,7 +272,11 @@
         }
     }
 
-    function onRdsFollowState(d) { st.rdsFollow = !!d.enabled; syncFollowUI(); }
+    function onRdsFollowState(d) { 
+        st.rdsFollow = !!d.enabled; 
+        if (d.locked !== undefined) st.rdsFollowLocked = !!d.locked;
+        syncFollowUI(); 
+    }
 
     // ── Frequency change ──────────────────────────────────────
     function onFreq(d) {
@@ -355,7 +359,7 @@
     function onAI(d) {
         if (d.ts && d.ts < st._freqChangeTs) return;
         st.aiActive = true;
-		if (d.nativeWebserverPI !== undefined) st.nativePI = d.nativeWebserverPI;
+        if (d.nativeWebserverPI !== undefined) st.nativePI = d.nativeWebserverPI;
         if (d.nativeWebserverPS !== undefined) st.nativePS = d.nativeWebserverPS;
         st.aiStats  = d.stats;
         if (d.stats) {
@@ -413,7 +417,6 @@
         if (afChanged) renderAF();
         if (psNameChanged || altFreqsChanged || afChanged) renderPSName();
 
-        // Provisional → locked fields
         if (d.psProvisional !== undefined) st.psProvisional = d.psProvisional || null;
         if (typeof d.psProvisionalConf === 'number') st.psProvisionalConf = d.psProvisionalConf;
         if (typeof d.psStableMs === 'number') st.psStableMs = d.psStableMs;
@@ -477,7 +480,7 @@
         if (src === 'ref-match') {
             const r = Math.round(120 + conf * 135);
             const g = Math.round( 80 + conf * 120);
-            const b = Math.round( 10 + conf *  20);
+            const b = Math.round( 10 + conf * 20);
             return `rgb(${r},${g},${b})`;
         }
         if (src === 'ref-seed') {
@@ -550,8 +553,6 @@
 
         el.innerHTML = items.join('');
 
-        // Use event delegation with 'mousedown' to prevent missed events 
-        // when the DOM updates rapidly between mousedown and mouseup.
         if (isAdmin && !el._hasDeleteListener) {
             el.addEventListener('mousedown', (e) => {
                 const btn = e.target.closest('.rdsm-delete-pi');
@@ -564,7 +565,6 @@
                 if (confirm(`Are you sure you want to delete the database entry for PI ${piToDelete}?`)) {
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({ type: 'rdsm_delete_pi', pi: piToDelete }));
-                        // Optimistically remove from UI
                         st.dbFreqEntries = st.dbFreqEntries.filter(en => en.pi !== piToDelete);
                         renderDbEntries();
                     }
@@ -907,37 +907,40 @@
         }
     }
 
-    // ── RDS Follow button sync ───────────────────────────────
+    // ── RDS Follow UI sync ───────────────────────────────
     function syncFollowUI() {
         const panelBtn = document.getElementById('rdsm-follow-btn');
+        const lockBtn  = document.getElementById('rdsm-lock-btn');
+        
         if (panelBtn) {
-            panelBtn.classList.toggle('on', st.rdsFollow);
-            panelBtn.title = !isAdmin
-                ? 'Administrator login required to toggle RDS Follow'
-                : st.rdsFollow
-                    ? 'RDS Follow active - AI feeds the web server'
-                    : 'RDS Follow inactive - native decoder active';
-            panelBtn.style.opacity = isAdmin ? '' : '0.5';
-            panelBtn.style.cursor  = isAdmin ? 'pointer' : 'not-allowed';
+            panelBtn.className = '';
+            if (st.rdsFollow) {
+                panelBtn.classList.add('on');
+                panelBtn.classList.add(st.rdsFollowLocked ? 'locked' : 'unlocked');
+            }
+            panelBtn.title = st.rdsFollow
+                ? 'RDS Follow active - AI feeds the web server'
+                : 'RDS Follow inactive - native decoder active';
         }
+        
+        if (lockBtn) {
+            lockBtn.innerHTML = st.rdsFollowLocked ? '&#128274;' : '&#128275;'; // 🔒 or 🔓
+            lockBtn.title = st.rdsFollowLocked ? 'Locked (Admin only)' : 'Unlocked (Public toggle allowed)';
+            lockBtn.style.opacity = isAdmin ? '1' : '0.5';
+            lockBtn.style.cursor  = isAdmin ? 'pointer' : 'not-allowed';
+        }
+        
         const navBtn = document.getElementById('rdsm-btn');
         if (navBtn) {
             const icon = navBtn.querySelector('i');
-            if (icon) icon.style.color = st.rdsFollow ? '#44ff88' : '';
+            if (icon) {
+                if (st.rdsFollow) {
+                    icon.style.color = st.rdsFollowLocked ? '#ff4444' : '#44ff88';
+                } else {
+                    icon.style.color = '';
+                }
+            }
         }
-    }
-
-    function toggleRdsFollow() {
-        checkAdminMode();
-        if (!isAdmin) {
-            sendToast('warning', pluginName, 'Administrator login required to toggle RDS Follow.');
-            return;
-        }
-        const next = !st.rdsFollow;
-        if (ws && ws.readyState === WebSocket.OPEN)
-            ws.send(JSON.stringify({ type:'rdsm_set_rds_follow', enabled:next }));
-        st.rdsFollow = next;
-        syncFollowUI();
     }
 
     // ── Full state reset on frequency change ──────────────────
@@ -961,7 +964,7 @@
         st.psProvisionalConf = 0;
         st.psStableMs        = 0;
         st.psLockReason      = null;
-		
+        
         st.nativePI = '-';
         st.nativePS = '-';
 
@@ -1010,7 +1013,7 @@
 
         if (statsOpen) {
             setEl('ai-cur-pi',      '-');
-			setEl('ai-native-rds',  '- | "-"');
+            setEl('ai-native-rds',  '- | "-"');
             setEl('ai-active',      '⏳ waiting...');
             setEl('ai-seen',        '-');
             setEl('ai-votes',       '-');
@@ -1116,16 +1119,26 @@
             font-size:10px;color:#666;box-sizing:border-box;width:100%;}
         #rdsm-gc{font-variant-numeric:tabular-nums;white-space:nowrap;}
         #rdsm-follow-wrap{display:flex;justify-content:center;align-items:center;}
+        
         #rdsm-follow-btn{
             display:inline-flex;align-items:center;gap:4px;
             font-size:9px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
             font-family:"Titillium Web",Calibri,sans-serif;
             color:#555;background:#181a24;border:1px solid #2a2d3a;border-radius:5px;
-            padding:2px 8px 2px 6px;white-space:nowrap;cursor:pointer;
-            transition:color .2s,border-color .2s,background .2s,opacity .2s;user-select:none;}
-        #rdsm-follow-btn:hover{color:#8ab4d8;border-color:#4a90d9;}
-        #rdsm-follow-btn.on{color:#44ff88;border-color:#44ff88;background:#0d1a12;}
-        #rdsm-follow-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0;}
+            padding:2px 8px 2px 6px;white-space:nowrap;user-select:none;
+            transition:color .2s,border-color .2s,background .2s;
+        }
+        #rdsm-follow-btn.on.locked {color:#ff4444;border-color:#ff4444;background:#2a1111;}
+        #rdsm-follow-btn.on.unlocked {color:#44ff88;border-color:#44ff88;background:#0d1a12;}
+        #rdsm-follow-dot {width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0;}
+        
+        #rdsm-lock-btn {
+            background:none;border:none;font-size:14px;cursor:pointer;
+            margin-left:6px;padding:0;transition:transform 0.2s;
+            user-select:none; filter: grayscale(20%);
+        }
+        #rdsm-lock-btn:hover { transform: scale(1.1); }
+
         #rdsm-ber-wrap{display:flex;align-items:center;justify-content:flex-end;
             white-space:nowrap;font-variant-numeric:tabular-nums;}
         #rdsm-bw{width:50px;height:4px;background:#2a2a2a;border-radius:2px;
@@ -1274,9 +1287,10 @@
           <div id="rdsm-stats">
             <span id="rdsm-gc">Groups: 0</span>
             <span id="rdsm-follow-wrap">
-              <button id="rdsm-follow-btn" title="RDS Follow inactive">
+              <div id="rdsm-follow-btn" title="RDS Follow Indicator">
                 <span id="rdsm-follow-dot"></span>RDS Follow
-              </button>
+              </div>
+              <button id="rdsm-lock-btn" title="Lock/Unlock RDS Follow">🔒</button>
             </span>
             <span id="rdsm-ber-wrap">BER
               <span id="rdsm-bw"><div id="rdsm-bf" style="width:0%"></div></span>
@@ -1322,7 +1336,21 @@
         document.body.appendChild(c);
         
         document.getElementById('rdsm-close').addEventListener('click', hidePanel);
-        document.getElementById('rdsm-follow-btn').addEventListener('click', toggleRdsFollow);
+        
+        // --- NEW LOCK BUTTON LISTENER ---
+        document.getElementById('rdsm-lock-btn').addEventListener('click', () => {
+            if (!isAdmin) {
+                sendToast('warning', pluginName, 'Administrator login required to lock/unlock.');
+                return;
+            }
+            const next = !st.rdsFollowLocked;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type:'rdsm_set_rds_lock', locked: next }));
+            }
+            st.rdsFollowLocked = next;
+            syncFollowUI();
+        });
+
         document.getElementById('rdsm-stats-btn').addEventListener('click', () => {
             statsOpen = !statsOpen;
             c.classList.toggle('stats-open', statsOpen);
@@ -1379,7 +1407,7 @@
         });
     }
 
-    // ── Toolbar button ────────────────────────────────────────
+    // ── Toolbar button with Long-Press ────────────────────────
     function addBtn() {
         let found = false;
         const obs = new MutationObserver((_, o) => {
@@ -1387,12 +1415,65 @@
             found = true; o.disconnect();
             addIconToPluginPanel('rdsm-btn', 'RDS Decoder', 'solid', 'radio',
                 `${pluginName} v${pluginVersion}`);
+            
             const btnObs = new MutationObserver((_, o2) => {
                 const btn = document.getElementById('rdsm-btn');
                 if (!btn) return;
                 o2.disconnect();
                 btn.classList.add('hide-phone', 'bg-color-2');
-                btn.addEventListener('click', () => {
+                
+                let pressTimer = null;
+                let wasLongPress = false;
+
+                const startPress = (e) => {
+                    if (e.type === 'mousedown' && e.button !== 0) return; // Only left-click
+                    wasLongPress = false;
+                    
+                    pressTimer = setTimeout(() => {
+                        pressTimer = null;
+                        wasLongPress = true; // Mark as long press so 'click' doesn't open panel
+                        
+                        checkAdminMode();
+                        if (st.rdsFollowLocked && !isAdmin) {
+                            sendToast('warning', pluginName, 'RDS Follow is locked. Administrator login required.');
+                            return;
+                        }
+                        
+                        const next = !st.rdsFollow;
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ type:'rdsm_set_rds_follow', enabled: next }));
+                        }
+                        st.rdsFollow = next;
+                        syncFollowUI();
+                        sendToast('success', pluginName, `RDS Follow Mode: ${next ? 'ON' : 'OFF'}`);
+                        
+                    }, 600); // Trigger after 600ms
+                };
+
+                const cancelPress = () => {
+                    if (pressTimer) {
+                        clearTimeout(pressTimer);
+                        pressTimer = null;
+                    }
+                };
+
+                // Attach Long Press Listeners
+                btn.addEventListener('mousedown', startPress);
+                btn.addEventListener('touchstart', startPress, { passive: true });
+                
+                btn.addEventListener('mouseup', cancelPress);
+                btn.addEventListener('mouseleave', cancelPress);
+                btn.addEventListener('touchend', cancelPress);
+
+                // Standard Click (Open/Close Panel)
+                btn.addEventListener('click', (e) => {
+                    if (wasLongPress) {
+                        wasLongPress = false; // Reset
+                        e.preventDefault();
+                        e.stopPropagation();
+                        return; // Block panel toggle if long-press occurred
+                    }
+                    
                     const c = document.getElementById('rdsm-panel-container');
                     if (!panelVis) {
                         panelVis = true; btn.classList.add('active');
@@ -1401,6 +1482,7 @@
                         });
                     } else { hidePanel(); }
                 });
+                
                 syncFollowUI();
             });
             btnObs.observe(document.body, {childList:true, subtree:true});

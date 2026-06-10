@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.5a) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.6) //
 //                                                           //
-//  by Highpoint                last update: 2026-06-02      //
+//  by Highpoint                last update: 2026-06-10      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.5a',
+    version:      '2.6',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -36,6 +36,7 @@ const VOTE_HALFLIFE_DAYS   = 7;
 const VOTE_EXPIRE_DAYS     = 30;
 const STATION_EXPIRE_DAYS  = 90;
 const QUICK_EXPIRE_DAYS    = 7;
+const SPE_EXPIRE_MINUTES   = 5;
 const CONSISTENCY_BOOST    = 1.5;
 const AI_BROADCAST_DELAY   = 80; // ms
 
@@ -69,6 +70,7 @@ function isSpecialPI(pi) {
 // ── Module-level state ───────────────────────────────────────
 let aiExclusiveMode    = false;
 let rdsFollowMode      = true;
+let rdsFollowLocked    = true;
 let nativeRDSDisabled  = true;
 let pluginsWss         = null;
 let pluginsMainWss     = null;
@@ -114,7 +116,7 @@ let fmdxByPI     = {};
 // ── Database (declared early – used by helper functions below) ───────
 let db      = {};
 let dbDirty = false;
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 // ═══════════════════════════════════════════════════════════════
 //  CURRENT STATE  ← must be declared before ANY function that reads it
@@ -955,30 +957,78 @@ function findBestRefEntry(pi) {
     if (isSpecialPI(pi)) return null;
     const piUp = pi.toUpperCase();
     const dbEntry = db[pi];
-    
+
     let candidates = currentState.freqRefs.filter(r => r.pi === piUp);
     if (candidates.length === 0) {
         candidates = currentState.freqRefs.filter(r => r.pireg && r.pireg === piUp);
     }
-    
+
     if (candidates.length === 0) return null;
-    if (candidates.length === 1) return candidates[0]; // No collision, return the only candidate
-    
-    // --- COLLISION DETECTED: Multiple TX with same PI on this frequency ---
-    // Evaluate live evidence (AF network and partial PS) to break the tie.
-    
-    const liveAFs = Array.from(currentState.afSet);
+
     const livePSUpper = currentState.psBuf.join('').toUpperCase().padEnd(8, ' ');
     const cleanPositions = currentState.psBuf.map((_, i) => ((currentState.psErrBuf[i] ?? 3) <= 1));
+    const memPS = (dbEntry && dbEntry.psVerifiedRaw) ? dbEntry.psVerifiedRaw.trim().toUpperCase() : null;
+
+    // ====================================================================
+    // 1. Strict Validation for Single Candidates
+    // Prevents blind pass-through of uncoordinated dummy PI codes (e.g., 1060)
+    // ====================================================================
+    if (candidates.length === 1) {
+        const cand = candidates[0];
+        const cleanCharsCount = cleanPositions.filter(Boolean).length;
+        
+        if (cleanCharsCount >= 2 && cand.psVariants && cand.psVariants.length > 0) {
+            let bestNetScore = -99;
+            for (const v of cand.psVariants) {
+                const rv = v.toUpperCase().padEnd(8, ' ');
+                let matchPts = 0; 
+                let mismatchPts = 0;
+                
+                for (let i = 0; i < 8; i++) {
+                    if (cleanPositions[i] && rv[i] !== ' ' && livePSUpper[i] !== ' ') {
+                        if (rv[i] === livePSUpper[i]) matchPts++;
+                        else mismatchPts++;
+                    }
+                }
+                const netScore = matchPts - mismatchPts;
+                if (netScore > bestNetScore) bestNetScore = netScore;
+            }
+            
+            // Reject the single candidate if live characters conflict with the database entry
+            if (bestNetScore < 0) {
+                return null; 
+            }
+        }
+        return cand;
+    }
+
+    // ====================================================================
+    // 2. Collision Handling: Multiple transmitters with identical PI
+    // ====================================================================
+    const liveAFs = Array.from(currentState.afSet);
+    const now = Date.now();
+    const activeAzimuths = [];
+    const activeItus = new Set();
     
+    // Spatial Awareness: Gather active locations/directions from the last 5 minutes
+    for (const [key, e] of Object.entries(db)) {
+        if (key === '_meta' || isSpecialPI(key) || key === piUp) continue;
+        if ((now - (e.seen || 0)) < 5 * 60000) { 
+            const refs = fmdxByPI[key];
+            if (refs && refs.length > 0) {
+                if (refs[0].itu) activeItus.add(refs[0].itu);
+                if (refs[0].azimuth !== undefined) activeAzimuths.push(refs[0].azimuth);
+            }
+        }
+    }
+
     let bestCandidate = null;
     let highestScore = -1;
     
     for (const cand of candidates) {
-        let score = calculatePropagationScore(cand, dbEntry); // Base score (distance/power)
+        let score = calculatePropagationScore(cand, dbEntry); // Base score from distance/power
         
-        // 1. AF Network Cross-Check
-        // Check if any of our live received AFs point to this specific candidate's network
+        // A. AF Network Cross-Check
         let afMatches = 0;
         if (liveAFs.length > 0) {
             for (const af of liveAFs) {
@@ -988,14 +1038,14 @@ function findBestRefEntry(pi) {
                 }
             }
         }
-        score += (afMatches * 100); // Massive tie-breaker boost for confirmed AF network
+        score += (afMatches * 100); 
         
-        // 2. Strict PS Partial Match Check
+        // B. Strict PS Partial Match Check (Live Data over the air)
         let maxPsScore = 0;
         if (cand.psVariants && cand.psVariants.length > 0) {
             for (const v of cand.psVariants) {
                 const rv = v.toUpperCase().padEnd(8, ' ');
-                let matchPts = 0;
+                let matchPts = 0; 
                 let mismatchPts = 0;
                 for (let i = 0; i < 8; i++) {
                     if (cleanPositions[i] && rv[i] !== ' ') {
@@ -1003,13 +1053,35 @@ function findBestRefEntry(pi) {
                         else mismatchPts++;
                     }
                 }
-                // Only reward if we have more matches than mismatches
                 const netPsScore = matchPts - mismatchPts;
                 if (netPsScore > maxPsScore) maxPsScore = netPsScore;
             }
         }
-        if (maxPsScore > 0) {
-            score += (maxPsScore * 30); // Significant boost for matching clean PS chars
+        if (maxPsScore > 0) score += (maxPsScore * 30); 
+
+        // C. Memory / Hysteresis Check (Prioritize already verified stations)
+        if (cand.distKm < 800 && memPS && cand.psVariants && cand.psVariants.length > 0) {
+            const isMatch = cand.psVariants.some(v => {
+                const rv = v.trim().toUpperCase();
+                return rv === memPS || memPS.startsWith(rv) || rv.startsWith(memPS);
+            });
+            if (isMatch) score += 2000; 
+        }
+
+        // D. Spatial Awareness: Azimuth & ITU Alignment (Sporadic-E cloud tracking)
+        if (cand.distKm > 800) {
+            // Apply bonus if the candidate's country matches currently active DX paths
+            if (activeItus.has(cand.itu)) {
+                score += 800; 
+            }
+            // Apply bonus if the path angle aligns within ±40° of other active DX stations
+            let azMatch = false;
+            for (const activeAz of activeAzimuths) {
+                let diff = Math.abs(cand.azimuth - activeAz);
+                if (diff > 180) diff = 360 - diff;
+                if (diff <= 40) { azMatch = true; break; }
+            }
+            if (azMatch) score += 800;
         }
         
         if (score > highestScore) {
@@ -1119,31 +1191,53 @@ function loadDB() {
     try {
         if (fs.existsSync(DB_FILE)) {
             const raw = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+            
+            // ====================================================================
+            // ONE-TIME WIPE TRIGGER: Checks if the stored database version is outdated
+            // ====================================================================
             if (!raw._meta || raw._meta.dbVersion !== DB_VERSION) {
-                logInfo(`[${PLUGIN_NAME}] Old DB structure – one-time wipe for schema update`);
-                let preservedFollowMode = false;
-                if (raw._meta && typeof raw._meta.rdsFollowMode === 'boolean')
-                    preservedFollowMode = raw._meta.rdsFollowMode;
+                logInfo(`[${PLUGIN_NAME}] Database version mismatch. Performing one-time wipe to version ${DB_VERSION}.`);
+                
+                let preservedFollowMode = true;
+                let preservedFollowLocked = true;
+                
+                // Preserve administrative settings (Lock state and Follow state) before wiping
+                if (raw._meta) {
+                    if (typeof raw._meta.rdsFollowMode === 'boolean') preservedFollowMode = raw._meta.rdsFollowMode;
+                    if (typeof raw._meta.rdsFollowLocked === 'boolean') preservedFollowLocked = raw._meta.rdsFollowLocked;
+                }
+                
                 rdsFollowMode     = preservedFollowMode;
                 nativeRDSDisabled = preservedFollowMode;
-                if (preservedFollowMode)
-                    logInfo(`[${PLUGIN_NAME}] RDS Follow state preserved across wipe: ON`);
-                db = { _meta: { rdsFollowMode: preservedFollowMode, dbVersion: DB_VERSION } };
+                rdsFollowLocked   = preservedFollowLocked;
+                
+                // Initialize a fresh database with the updated schema version
+                db = { _meta: { rdsFollowMode: preservedFollowMode, rdsFollowLocked: preservedFollowLocked, dbVersion: DB_VERSION } };
                 dbDirty = true;
                 saveDB();
-                return;
+                
+                logInfo(`[${PLUGIN_NAME}] One-time wipe completed successfully. New schema version ${DB_VERSION} saved.`);
+                return; // Abort further loading since the database is now fresh and clean
             }
+            // ====================================================================
+
+            // Normal loading routine (runs if the version matches DB_VERSION)
             if (raw._meta && typeof raw._meta === 'object') {
                 if (typeof raw._meta.rdsFollowMode === 'boolean') {
                     rdsFollowMode     = raw._meta.rdsFollowMode;
                     nativeRDSDisabled = rdsFollowMode;
                     logInfo(`[${PLUGIN_NAME}] RDS Follow restored: ${rdsFollowMode ? 'ON' : 'OFF'}`);
                 }
+                if (typeof raw._meta.rdsFollowLocked === 'boolean') {
+                    rdsFollowLocked = raw._meta.rdsFollowLocked;
+                }
             }
+            
             for (const [pi, entry] of Object.entries(raw)) {
                 if (pi === '_meta') continue;
                 if (isSpecialPI(pi)) { delete raw[pi]; continue; }
                 delete entry.rt; delete entry.rtLast; delete entry.psDynamicBuf;
+                
                 if (entry.ps && typeof entry.ps === 'object') {
                     for (const [posKey, posData] of Object.entries(entry.ps)) {
                         if (!posData || typeof posData !== 'object') continue;
@@ -1166,19 +1260,19 @@ function loadDB() {
                 if (entry.freq) entry.freq = roundFreq(entry.freq);
                 if (!Array.isArray(entry.af)) entry.af = [];
                 if (entry.psVerifiedRaw && !isPSStringClean(entry.psVerifiedRaw)) {
-                    if (DEBUG) logInfo(`[${PLUGIN_NAME}] Discarding corrupt psVerifiedRaw for PI=${pi} on load`);
                     entry.psVerifiedRaw = null; entry.psVerifiedRawTs = 0;
                 }
             }
             db = raw;
             logInfo(`[${PLUGIN_NAME}] AI memory loaded: ${Object.keys(db).filter(k => k !== '_meta').length} stations`);
         } else {
-            db = { _meta: { rdsFollowMode: true, dbVersion: DB_VERSION } };
-            logInfo(`[${PLUGIN_NAME}] AI memory: new database created`);
+            // Fresh installation fallback if no database file exists
+            db = { _meta: { rdsFollowMode: true, rdsFollowLocked: true, dbVersion: DB_VERSION } };
+            logInfo(`[${PLUGIN_NAME}] AI memory: new database file created`);
         }
     } catch(e) {
         logWarn(`[${PLUGIN_NAME}] Could not load AI DB: ${e.message} – starting fresh`);
-        db = { _meta: { rdsFollowMode: true, dbVersion: DB_VERSION } };
+        db = { _meta: { rdsFollowMode: true, rdsFollowLocked: true, dbVersion: DB_VERSION } };
     }
 }
 
@@ -1189,11 +1283,19 @@ function saveDB() {
         const expireMs      = STATION_EXPIRE_DAYS * 86400000;
         const quickExpireMs = QUICK_EXPIRE_DAYS   * 86400000;
         const toSave        = {};
-        toSave._meta = { rdsFollowMode, savedAt: now, dbVersion: DB_VERSION };
+        toSave._meta = { rdsFollowMode, rdsFollowLocked, savedAt: now, dbVersion: DB_VERSION };
         for (const [pi, entry] of Object.entries(db)) {
             if (pi === '_meta') continue;
             if (isSpecialPI(pi)) continue;
-            if ((now - (entry.seen || 0)) > expireMs) continue;
+            
+            const ageMs = now - (entry.seen || 0);
+            
+            const isSpE = entry.distKm !== undefined && entry.distKm >= 800;
+            const speExpireMs = SPE_EXPIRE_MINUTES * 60000;
+            if (isSpE && ageMs > speExpireMs) continue;
+
+            if (!isSpE && ageMs > expireMs) continue;
+
             const hasPS     = entry.ps && Object.keys(entry.ps).length > 0;
             const hasUseful = hasPS || entry.ecc || (entry.pty > 0) ||
                               (Array.isArray(entry.af) && entry.af.length > 0);
@@ -2376,8 +2478,11 @@ function onPIConfirmed(pi) {
 
     const entry = ensurePI(pi);
     const ref   = findRefEntry(pi);
+	
+	if (ref && ref.distKm !== undefined) {
+        entry.distKm = ref.distKm;
+    }
 
-    // ── Bug 1 fix: psIsDynamic zurücksetzen wenn fmdx nur eine statische Variante kennt ──
     if (entry.psIsDynamic && ref?.psVariants?.length === 1) {
         entry.psIsDynamic = false;
         entry.ps          = {};
@@ -2738,10 +2843,11 @@ function handlePluginMessage(ws, raw) {
     try { msg = JSON.parse(raw); } catch(e) { return; }
 
     if (msg.type === 'rdsm_get_rds_follow') {
-        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode })); }
+        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked })); }
         catch(e) {}
         return;
     }
+    
     if (msg.type === 'rdsm_set_rds_follow') {
         const next = !!msg.enabled;
         if (next !== rdsFollowMode) {
@@ -2752,9 +2858,21 @@ function handlePluginMessage(ws, raw) {
             if (!next) clearRDSInDataHandler();
             else if (piConfirmed) applyFollowToDataHandler();
         }
-        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode });
+        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked });
         return;
     }
+    
+    if (msg.type === 'rdsm_set_rds_lock') {
+        const next = !!msg.locked;
+        if (next !== rdsFollowLocked) {
+            rdsFollowLocked = next;
+            dbDirty = true;
+            logInfo(`[${PLUGIN_NAME}] RDS Follow Lock set to: ${next ? 'LOCKED' : 'UNLOCKED'}`);
+        }
+        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked });
+        return;
+    }
+    
     if (msg.type === 'rdsm_delete_pi') {
         const piToDel = msg.pi ? msg.pi.toUpperCase() : null;
         if (piToDel && db[piToDel]) {
@@ -2781,7 +2899,7 @@ function registerAPIRoutes() {
                     stationCount:  Object.keys(db).filter(k => k !== '_meta').length,
                     fmdxFreqCount: Object.keys(fmdxByFreq).length,
                     fmdxPICount:   Object.keys(fmdxByPI).length,
-                    rdsFollowMode, aiExclusiveMode,
+                    rdsFollowMode, rdsFollowLocked, aiExclusiveMode,
                     piConfirmed, psLocked,
                     currentPI:   currentState.pi,
                     currentFreq,
