@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.6) //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.7)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-10      //
+//  by Highpoint                last update: 2026-06-18      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -10,7 +10,7 @@
 
 (() => {
 
-    const pluginVersion         = '2.6';
+    const pluginVersion         = '2.7';
     const pluginName            = 'RDS AI Decoder';
     const pluginHomepageUrl     = 'https://github.com/Highpoint2000/RDS-AI-Decoder/releases';
     const pluginUpdateUrl       = 'https://raw.githubusercontent.com/Highpoint2000/RDS-AI-Decoder/refs/heads/main/RDS-AI-Decoder/rds-ai-decoder.js';
@@ -71,7 +71,6 @@
                  'Leisure','Jazz Music','Country Music','National Music','Oldies Music',
                  'Folk Music','Documentary','Alarm Test','Alarm'];
 
-    // ── RDS character set (ETSI EN 50067) ────────────────────
     const RDS_CHARSET = [
         ' ','!','"','#','¤','%','&',"'",
         '(',')', '*','+',',','-','.','/',
@@ -110,7 +109,6 @@
 
     const CONF = [1.00, 0.90, 0.70, 0.00];
 
-    // ── Slot factories ────────────────────────────────────────
     const mkPS = () => Array.from({length:8}, ()=>({char:' ',conf:0,src:'empty',rawOk:0,rawChar:null}));
     const mkRT = n   => Array.from({length:n}, ()=>({char:' ',conf:0,src:'empty'}));
 
@@ -118,7 +116,6 @@
     let rtSlots = [mkRT(64), mkRT(64)];
     let rtAB    = -1;
 
-    // ── PS fusion: incoming raw RDS block ────────────────────
     function fusePS_raw(pos, char, conf, src, errLevel) {
         const cur = psSlots[pos];
         if (errLevel <= 1 && char === cur.rawChar) { cur.rawOk = Math.min(cur.rawOk + 1, 4); }
@@ -142,7 +139,6 @@
             psSlots[pos] = {char, conf, src, rawOk:cur.rawOk, rawChar:cur.rawChar};
     }
 
-    // ── PS fusion: incoming AI prediction ───────────────────
     function fusePS_ai(pos, char, conf, src) {
         const cur = psSlots[pos];
         if (cur.rawOk >= 2 && cur.src.startsWith('raw')) return;
@@ -155,7 +151,6 @@
             psSlots[pos] = {char, conf, src, rawOk:cur.rawOk, rawChar:cur.rawChar};
     }
 
-    // ── RT fusion ─────────────────────────────────────────────
     function fuseRT(ab, i, char, conf, src) {
         if (i < 0 || i >= rtSlots[ab].length) return;
         const cur     = rtSlots[ab][i];
@@ -164,7 +159,6 @@
             rtSlots[ab][i] = {char, conf, src};
     }
 
-    // ── Stable flag debouncing ────────────────────────────────
     let _ptyCandidate = -1, _ptyCandCount = 0;
     let _taCandidate  = null, _taCandCount = 0;
 
@@ -203,7 +197,6 @@
         }
     }
 
-    // ── Global state ──────────────────────────────────────────
     let st = {
         pi:'----', piCand:'----', piN:0,
         psBuf:new Array(8).fill(' '), psGroups:new Set(),
@@ -215,7 +208,7 @@
         _freqChangeTs:0,
         rtLine1:'', rtLine2:'',
         rdsFollow:false,
-        rdsFollowLocked:true, // DEFAULT LOCKED
+        rdsFollowLocked:true,
         refStation:null, refDistKm:null, refMatchScore:0,
         refTxName:null, refItu:null, refAzimuth:null, refErp:null, refPol:null,
         af:[],
@@ -234,8 +227,48 @@
         nativePI: '-',
         nativePS: '-',
     };
+	
+    let isRecording = false;
 
-    // ── Change-detection fingerprint for PS slots ─────────────
+    function toggleRecording() {
+        if (!isAdmin) {
+            sendToast('warning', pluginName, 'Administrator login required to record RDS data.');
+            return;
+        }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'rdsm_toggle_record', isAdmin: true }));
+        }
+    }
+
+    function updateRecordUI(recording, downloadUrl) {
+        const btn = document.getElementById('rdsm-record-btn');
+        if (!btn) return;
+        const wasRecording = isRecording;
+        isRecording = recording;
+        
+        if (recording) {
+            btn.innerHTML = '⏹';
+            btn.classList.add('recording-pulse');
+            btn.title = 'Stop recording & save CSV';
+            if (!wasRecording) {
+                sendToast('success', pluginName, 'Server-side RDS recording started...');
+            }
+        } else {
+            btn.innerHTML = '⏺';
+            btn.classList.remove('recording-pulse');
+            btn.title = 'Record raw RDS data';
+            if (wasRecording && downloadUrl) {
+                if (isAdmin) {
+                    sendToast('success', pluginName, 'Recording saved to server.');
+                    window.open(downloadUrl, '_blank');
+                    window.open('https://highpoint.fmdx.org/webtools/rds-raw-decoder.html', '_blank');
+                } else {
+                    sendToast('info', pluginName, 'Administrator stopped RDS recording.');
+                }
+            }
+        }
+    }
+
     let _lastPSFingerprint = '';
     let _lastRTFingerprint = '';
 
@@ -261,7 +294,6 @@
     let ws = null, reconn = null;
     let panelVis = false, statsOpen = false;
 
-    // ── Message dispatcher ────────────────────────────────────
     function onMessage(data) {
         let d; try { d = JSON.parse(data); } catch(e) { return; }
         switch (d.type) {
@@ -275,10 +307,10 @@
     function onRdsFollowState(d) { 
         st.rdsFollow = !!d.enabled; 
         if (d.locked !== undefined) st.rdsFollowLocked = !!d.locked;
+        if (d.isRecording !== undefined) updateRecordUI(d.isRecording, d.downloadUrl);
         syncFollowUI(); 
     }
 
-    // ── Frequency change ──────────────────────────────────────
     function onFreq(d) {
         st._freqChangeTs = Date.now();
         reset();
@@ -290,9 +322,9 @@
         }
     }
 
-    // ── Raw RDS group handler ─────────────────────────────────
     function onRaw(d) {
         if (d.freq && d.freq !== st.freq) { st.freq = d.freq; setEl('rdsm-freq', d.freq + ' MHz'); }
+
         if (d.pi) {
             const pi = d.pi.toUpperCase();
             if (pi === st.piCand) {
@@ -355,9 +387,9 @@
         renderAll();
     }
 
-    // ── AI prediction handler ─────────────────────────────────
     function onAI(d) {
         if (d.ts && d.ts < st._freqChangeTs) return;
+        
         st.aiActive = true;
         if (d.nativeWebserverPI !== undefined) st.nativePI = d.nativeWebserverPI;
         if (d.nativeWebserverPS !== undefined) st.nativePS = d.nativeWebserverPS;
@@ -470,7 +502,6 @@
 
     function renderAll() { renderPS(); renderRT(); refreshStats(); }
 
-    // ── Confidence → colour ───────────────────────────────────
     function confToGray(conf, src) {
         if (src === 'empty') return 'transparent';
         if (src === 'ai-bigram') {
@@ -493,7 +524,6 @@
         return `rgb(${v},${v},${v})`;
     }
 
-    // ── Render PS characters ──────────────────────────────────
     function renderPS() {
         const fp = psSlotsFingerprint();
         if (fp === _lastPSFingerprint) return;
@@ -517,7 +547,6 @@
         }
     }
 
-    // ── Render Database Entries for Frequency ─────────────────
     function renderDbEntries() {
         const el = document.getElementById('rdsm-dbentries-content');
         if (!el) return;
@@ -574,7 +603,6 @@
         }
     }
 
-    // ── Render FMDX.ORG section ───────────────────────────────
     let _freqScrollTop = 0;
 
     function renderPSName() {
@@ -757,7 +785,6 @@
         }
     }
 
-    // ── Render RadioText ──────────────────────────────────────
     function renderRT() {
         const ab    = rtAB >= 0 ? rtAB : 0;
         const fp = rtSlotsFingerprint(ab) + '|' + st.rtLine1;
@@ -788,7 +815,6 @@
             : '<span style="color:#333">-</span>';
     }
 
-    // ── AF flag rendering ─────────────────────────────────────
     function renderAF() {
         const el = document.getElementById('rdsm-af-flag');
         if (!el) return;
@@ -804,7 +830,6 @@
         }
     }
 
-    // ── BER: 0% = perfect, 100% = all blocks lost ─────────────
     function updateBER(errB) {
         if (!errB || !Array.isArray(errB)) return;
         const hasError = errB.some(e => e >= 2);
@@ -827,7 +852,6 @@
 
     function refreshStats() { setEl('rdsm-gc', `Groups: ${st.grpTotal}`); }
 
-    // ── Statistics panel ──────────────────────────────────────
     function refreshStatsPanel() {
         if (!statsOpen) return;
         setEl('ai-cur-pi',  st.pi);       
@@ -881,7 +905,6 @@
             `bigram:${bigN}  🌐:${refM}  🔶:${refS}  ✅:${vN}`);
     }
 
-    // ── Render Provisional → Locked status ────────────────────
     function renderStatus() {
         const el = document.getElementById('rdsm-status');
         if (!el) return;
@@ -907,7 +930,6 @@
         }
     }
 
-    // ── RDS Follow UI sync ───────────────────────────────
     function syncFollowUI() {
         const panelBtn = document.getElementById('rdsm-follow-btn');
         const lockBtn  = document.getElementById('rdsm-lock-btn');
@@ -924,7 +946,7 @@
         }
         
         if (lockBtn) {
-            lockBtn.innerHTML = st.rdsFollowLocked ? '&#128274;' : '&#128275;'; // 🔒 or 🔓
+            lockBtn.innerHTML = st.rdsFollowLocked ? '&#128274;' : '&#128275;'; 
             lockBtn.title = st.rdsFollowLocked ? 'Locked (Admin only)' : 'Unlocked (Public toggle allowed)';
             lockBtn.style.opacity = isAdmin ? '1' : '0.5';
             lockBtn.style.cursor  = isAdmin ? 'pointer' : 'not-allowed';
@@ -943,7 +965,6 @@
         }
     }
 
-    // ── Full state reset on frequency change ──────────────────
     function reset() {
         st.pi = '----'; st.piCand = '----'; st.piN = 0;
         st.psBuf.fill(' '); st.psGroups.clear();
@@ -1026,7 +1047,6 @@
         renderStatus();
     }
 
-    // ── CSS injection ─────────────────────────────────────────
     function injectCSS() {
         if (document.getElementById('rdsm-css')) return;
         const s = document.createElement('style');
@@ -1054,7 +1074,7 @@
             padding:10px 14px 8px;background:var(--color-main-bright,#4a90d9);cursor:move;
             border-radius:11px 11px 0 0;}
         .rdsm-ht{font-size:14px;font-weight:700;color:#fff;text-transform:uppercase;
-            letter-spacing:1px;font-family:"Titillium Web",Calibri,sans-serif;}
+            letter-spacing:1px;font-family:"Titillium Web",Calibri,sans-serif; white-space:nowrap;}
         #rdsm-dot{display:inline-block;width:16px;height:6px;border-radius:50%;
             background:#ff4444;transition:background .4s;vertical-align:middle;margin-right:10px;}
         #rdsm-dot.ok{background:#44ff88;}
@@ -1177,15 +1197,29 @@
         .rdiv{border:none;border-top:1px solid rgba(255,255,255,.07);margin:7px 0;}
         #rdsm-panel-container.drag{opacity:.85;cursor:move;}
         #rdsm-status{overflow:visible;line-height:1.8;}
+		#rdsm-record-btn {
+            background: none; border: none; color: #ff4444; font-size: 16px;
+            cursor: pointer; opacity: 0.8; padding: 0 4px; 
+            transition: transform 0.2s, opacity 0.2s;
+        }
+        #rdsm-record-btn:hover { opacity: 1; transform: scale(1.1); }
+        
+        @keyframes pulse-record {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.3); opacity: 0.5; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        .recording-pulse {
+            animation: pulse-record 1.5s infinite;
+            color: #ff4444 !important;
+        }
         `;
         document.head.appendChild(s);
     }
 
-    // ── RDS group type labels ─────────────────────────────────
     const GA = [];
     for (let i = 0; i <= 15; i++) GA.push(`${i}A`, `${i}B`);
 
-    // ── Panel HTML ────────────────────────────────────────────
     function createPanel() {
         if (document.getElementById('rdsm-panel-container')) return;
         const c = document.createElement('div');
@@ -1193,7 +1227,10 @@
         c.innerHTML = `
         <div id="rdsm-panel">
           <div id="rdsm-hdr">
-            <span class="rdsm-ht">${pluginName}</span>
+            <span style="display:flex;align-items:center;gap:6px;white-space:nowrap;">
+                <span class="rdsm-ht">${pluginName}</span>
+                <button id="rdsm-record-btn" title="Record raw RDS data">⏺</button>
+            </span>
             <span style="display:flex;align-items:center;gap:5px">
               <span id="rdsm-dot" title="Connection status"></span>
               <a id="rdsm-manual-link"
@@ -1336,8 +1373,8 @@
         document.body.appendChild(c);
         
         document.getElementById('rdsm-close').addEventListener('click', hidePanel);
+		document.getElementById('rdsm-record-btn').addEventListener('click', toggleRecording);
         
-        // --- NEW LOCK BUTTON LISTENER ---
         document.getElementById('rdsm-lock-btn').addEventListener('click', () => {
             if (!isAdmin) {
                 sendToast('warning', pluginName, 'Administrator login required to lock/unlock.');
@@ -1360,11 +1397,9 @@
         makeDrag(c, document.getElementById('rdsm-hdr'));
     }
 
-    // ── Drag support ──────────────────────────────────────────
     function makeDrag(el, h) {
         let sx, sy, sl, st2, dr = false;
 
-        // Restore saved position
         try {
             const savedPos = localStorage.getItem('rdsm_panel_pos');
             if (savedPos) {
@@ -1378,7 +1413,7 @@
         } catch(e) {}
 
         h.addEventListener('mousedown', e => {
-            if (e.target.id === 'rdsm-close' || e.target.id === 'rdsm-manual-link') return;
+            if (e.target.id === 'rdsm-close' || e.target.id === 'rdsm-manual-link' || e.target.id === 'rdsm-record-btn') return;
             dr = true; el.classList.add('drag');
             sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect(); sl = r.left; st2 = r.top;
@@ -1397,7 +1432,6 @@
             dr = false; 
             el.classList.remove('drag'); 
             
-            // Save position
             try {
                 localStorage.setItem('rdsm_panel_pos', JSON.stringify({
                     left: el.style.left,
@@ -1407,7 +1441,6 @@
         });
     }
 
-    // ── Toolbar button with Long-Press ────────────────────────
     function addBtn() {
         let found = false;
         const obs = new MutationObserver((_, o) => {
@@ -1426,12 +1459,12 @@
                 let wasLongPress = false;
 
                 const startPress = (e) => {
-                    if (e.type === 'mousedown' && e.button !== 0) return; // Only left-click
+                    if (e.type === 'mousedown' && e.button !== 0) return; 
                     wasLongPress = false;
                     
                     pressTimer = setTimeout(() => {
                         pressTimer = null;
-                        wasLongPress = true; // Mark as long press so 'click' doesn't open panel
+                        wasLongPress = true; 
                         
                         checkAdminMode();
                         if (st.rdsFollowLocked && !isAdmin) {
@@ -1447,7 +1480,7 @@
                         syncFollowUI();
                         sendToast('success', pluginName, `RDS Follow Mode: ${next ? 'ON' : 'OFF'}`);
                         
-                    }, 600); // Trigger after 600ms
+                    }, 600); 
                 };
 
                 const cancelPress = () => {
@@ -1457,7 +1490,6 @@
                     }
                 };
 
-                // Attach Long Press Listeners
                 btn.addEventListener('mousedown', startPress);
                 btn.addEventListener('touchstart', startPress, { passive: true });
                 
@@ -1465,13 +1497,12 @@
                 btn.addEventListener('mouseleave', cancelPress);
                 btn.addEventListener('touchend', cancelPress);
 
-                // Standard Click (Open/Close Panel)
                 btn.addEventListener('click', (e) => {
                     if (wasLongPress) {
-                        wasLongPress = false; // Reset
+                        wasLongPress = false; 
                         e.preventDefault();
                         e.stopPropagation();
-                        return; // Block panel toggle if long-press occurred
+                        return; 
                     }
                     
                     const c = document.getElementById('rdsm-panel-container');

@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.6) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.7)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-10      //
+//  by Highpoint                last update: 2026-06-18      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.6',
+    version:      '2.7',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -43,9 +43,6 @@ const AI_BROADCAST_DELAY   = 80; // ms
 const FMDX_RADIUS_KM       = 3000;
 const FMDX_BULK_TTL_MS     = 6 * 60 * 60 * 1000;
 
-// Minimum distance (km) the GPS position must move before the fmdx.org
-// index is rebuilt from cache.  3000 km stations are already included,
-// so a 100 km shift doesn't change which transmitters are reachable.
 const FMDX_REINDEX_MIN_DIST_KM = 100;
 
 const PI_CONFIRM_THRESHOLD = 2;
@@ -58,14 +55,20 @@ const LOCK_MIN_STABLE_MS        = 700;
 const LOCK_STRONG_EVIDENCE_CONF = 0.96;
 
 // ── Rolling block-quality window ─────────────────────────────
-const QUAL_WINDOW_SIZE   = 30;   // ~30 groups ≈ 1–2 s of reception
-const QUAL_LOCK_MIN_ZERO = 0.55; // ≥55% of recent blocks must be err==0
+const QUAL_WINDOW_SIZE   = 30;   
+const QUAL_LOCK_MIN_ZERO = 0.55; 
 
 // ── Special / wildcard PI codes ───────────────────────────────
 const SPECIAL_PI_CODES = new Set(['FFFF', '0000']);
 function isSpecialPI(pi) {
     return !pi || SPECIAL_PI_CODES.has(pi.toUpperCase());
 }
+
+// ── Server-Side Recording ────────────────────────────────────
+const logDir = path.resolve(__dirname, '../../web/logs');
+let isRecording = false;
+let recordStream = null;
+let recordFileName = '';
 
 // ── Module-level state ───────────────────────────────────────
 let aiExclusiveMode    = false;
@@ -87,40 +90,29 @@ let psLocked = false;
 let nativePI = '----';
 let nativePS = '        ';
 
-// Provisional tracking – updated ONLY inside buildAIPrediction()
 let lastProvisionalPS      = null;
 let provisionalFirstSeenTs = 0;
 let lastLockReason         = null;
 
-// Rolling block-quality window
 let qualWindow = [];
 
 let ownLat = null;
 let ownLon = null;
-
-// Last GPS position used for the fmdx.org index build.
-// Kept separate from ownLat/ownLon so that small GPS jitter
-// does not continuously retrigger expensive index rebuilds.
 let fmdxIndexLat = null;
 let fmdxIndexLon = null;
 
 let gpsWsClient      = null;
 let gpsWsReconnTimer = null;
-let gpsWsConnected   = false; // eslint-disable-line no-unused-vars
+let gpsWsConnected   = false; 
 
-// ── fmdx.org index (declared early – used by helper functions below) ──
 let fmdxByFreq   = {};
 let fmdxLoadedAt = 0;
 let fmdxByPI     = {};
 
-// ── Database (declared early – used by helper functions below) ───────
 let db      = {};
 let dbDirty = false;
 const DB_VERSION = 2;
 
-// ═══════════════════════════════════════════════════════════════
-//  CURRENT STATE  ← must be declared before ANY function that reads it
-// ═══════════════════════════════════════════════════════════════
 let currentState = {
     pi: null, freq: null,
     rtSlots:  Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 })),
@@ -136,7 +128,6 @@ let currentState = {
     afSet: new Set(),
 };
 
-// ── Database entry extractor for current frequency ────────────
 function getDbEntriesForFreq(freq) {
     if (!freq) return [];
     const rounded = roundFreq(freq);
@@ -145,7 +136,6 @@ function getDbEntriesForFreq(freq) {
         if (pi === '_meta' || isSpecialPI(pi)) continue;
         if (entry.freq === rounded) {
             const ps = entry.psVerifiedRaw || entry.psResolved || '';
-            // Only add to results if PS is not empty
             if (ps.trim().length > 0) {
                 results.push({
                     pi: pi,
@@ -157,19 +147,14 @@ function getDbEntriesForFreq(freq) {
             }
         }
     }
-    // Sort by seenCount descending
     results.sort((a, b) => b.seenCount - a.seenCount);
     return results;
 }
 
-// ── Round GPS coordinates to 2 decimal places (~1 km) ─────────
-// This prevents GPS noise (sub-meter jitter) from causing
-// repeated index rebuilds.
 function roundGps(coord) {
     return Math.round(coord * 100) / 100;
 }
 
-// ── GPS WebSocket listener ────────────────────────────────────
 function startGpsWsListener() {
     let wsPort = 8080;
     try {
@@ -197,18 +182,12 @@ function startGpsWsListener() {
                     const rawLat = parseFloat(msg.value.lat);
                     const rawLon = parseFloat(msg.value.lon);
                     if (!isNaN(rawLat) && !isNaN(rawLon) && msg.value.status === 'active') {
-                        // Round to ~1 km precision to absorb GPS jitter
                         const lat = roundGps(rawLat);
                         const lon = roundGps(rawLon);
 
-                        // Always update current position (used for distance calcs etc.)
                         ownLat = lat;
                         ownLon = lon;
 
-                        // Only rebuild the index when we have moved more than
-                        // FMDX_REINDEX_MIN_DIST_KM from the position used for
-                        // the last build.  Since the DB already covers 3000 km,
-                        // a small drift doesn't change which stations are included.
                         if (fmdxLoadedAt > 0) {
                             const needsRebuild =
                                 fmdxIndexLat === null ||
@@ -242,7 +221,6 @@ function startGpsWsListener() {
     setTimeout(connect, 5000);
 }
 
-// ── Load own location from config.json ───────────────────────
 function loadOwnLocation() {
     try {
         const cfgPath = path.join(__dirname, '../../config.json');
@@ -263,7 +241,6 @@ function loadOwnLocation() {
     }
 }
 
-// ── Haversine distance & Bearing ──────────────────────────────
 function haversineKm(lat1, lon1, lat2, lon2) {
     const R  = 6371;
     const dL = (lat2 - lat1) * Math.PI / 180;
@@ -323,7 +300,6 @@ function nodeHttpGetJSON(url) {
     });
 }
 
-// ── fmdx.org bulk data load ───────────────────────────────────
 async function loadFmdxBulk() {
     if (ownLat === null || ownLon === null) {
         logWarn(`[${PLUGIN_NAME}] fmdx.org bulk load skipped – no location in config.json`);
@@ -337,7 +313,6 @@ async function loadFmdxBulk() {
             if (fresh && hasRaw) {
                 fmdxLoadedAt = cached._ts;
                 buildFmdxIndex(cached.raw);
-                // Record the position used for this index build
                 fmdxIndexLat = ownLat;
                 fmdxIndexLon = ownLon;
                 if (Object.keys(fmdxByFreq).length > 0) {
@@ -357,8 +332,6 @@ async function loadFmdxBulk() {
 
 async function downloadFmdxBulk() {
     if (ownLat === null || ownLon === null) return;
-    // Use rounded coordinates in the API URL to avoid unnecessary re-downloads
-    // when GPS drifts by a few meters.
     const url = `https://maps.fmdx.org/api/?qth=${ownLat},${ownLon}`;
     logInfo(`[${PLUGIN_NAME}] fmdx.org downloading: ${url}`);
     let raw;
@@ -384,7 +357,6 @@ async function downloadFmdxBulk() {
     }
     fmdxLoadedAt = Date.now();
     buildFmdxIndex(raw);
-    // Record the position used for this fresh download
     fmdxIndexLat = ownLat;
     fmdxIndexLon = ownLon;
     logInfo(`[${PLUGIN_NAME}] fmdx.org download complete – ${txCount} tx locations`);
@@ -408,47 +380,34 @@ function extractLocations(raw) {
 
 function sanitizeDatabaseWithFmdx() {
     let cleanedCount = 0;
-    
     for (const [pi, entry] of Object.entries(db)) {
         if (pi === '_meta' || isSpecialPI(pi)) continue;
-        
         if (entry.psVerifiedRaw) {
             const candidate = entry.psVerifiedRaw.trim().toUpperCase();
             const altFreqs = fmdxByPI[pi.toUpperCase()] || [];
-            
-            // Only validate if we have FMDX data for this PI
             if (altFreqs.length > 0) {
                 const allVariants = [];
                 altFreqs.forEach(f => { 
                     if (f.psVariants) allVariants.push(...f.psVariants); 
                 });
-                
                 if (allVariants.length > 0) {
                     const isValid = allVariants.some(v => {
                         const refStr = v.trim().toUpperCase();
                         if (refStr === candidate) return true;
                         if (refStr.startsWith(candidate)) return true;
-                        
                         if (candidate.startsWith(refStr)) {
-                            // If FMDX strictly says there is only 1 variant, NEVER allow suffixes.
-                            // This completely purges any corrupted "Dlf ££" entries.
                             if (allVariants.length === 1) return false;
-                            
                             const suffix = candidate.substring(refStr.length);
                             return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
                         }
                         return false;
                     });
-
                     if (!isValid) {
-                        if (DEBUG) logInfo(`[${PLUGIN_NAME}] DB Cleanup: Removing garbage PS "${entry.psVerifiedRaw}" for PI=${pi}`);
-                        
                         entry.psVerifiedRaw   = null;
                         entry.psVerifiedRawTs = 0;
                         entry.ps              = {};
                         entry.psResolved      = null;
                         entry.psConf          = new Array(8).fill(0);
-                        
                         dbDirty = true;
                         cleanedCount++;
                     }
@@ -456,7 +415,6 @@ function sanitizeDatabaseWithFmdx() {
             }
         }
     }
-    
     if (cleanedCount > 0) {
         logInfo(`[${PLUGIN_NAME}] Database cleanup finished. Purged ${cleanedCount} corrupted stations.`);
         saveDB();
@@ -537,9 +495,7 @@ function buildFmdxIndex(raw) {
 
 function getFreqRefs(freq) {
     const f    = roundFreq(freq);
-    const refs = fmdxByFreq[f] || [];
-    if (DEBUG) logInfo(`[${PLUGIN_NAME}] getFreqRefs: "${f}" → ${refs.length} entry(s)`);
-    return refs;
+    return fmdxByFreq[f] || [];
 }
 
 function getAltFreqsForPI(pi) {
@@ -565,12 +521,10 @@ function getAltFreqsForPIAndPS(pi, confirmedPS) {
     return filtered.length > 0 ? filtered : all;
 }
 
-// ── datahandler ───────────────────────────────────────────────
 let dataHandler = null;
 try { dataHandler = require('../../server/datahandler'); }
 catch(e) { logWarn(`[${PLUGIN_NAME}] Could not load datahandler: ${e.message}`); }
 
-// ── RDS character set (ETSI EN 50067) ───────────────────────
 const RDS_CHARSET = [
     ' ','!','"','#','¤','%','&',"'",
     '(',')', '*','+',',','-','.','/',
@@ -613,7 +567,6 @@ function decodeAFCode(code) {
     return null;
 }
 
-// ── RDS country / ECC lookup ──────────────────────────────────
 const RDS_COUNTRY = (() => {
     const T = {
         0xE0: { 0x1:'DE', 0x2:'DZ', 0x3:'AD', 0x4:'IL', 0x5:'IT',
@@ -666,31 +619,15 @@ const RDS_COUNTRY = (() => {
 function lookupCountry(pi, eccByte) {
     if (!pi || pi === '?' || pi === '----') return null;
     if (!eccByte || eccByte === 0) return null;
-    
     const piNibble = (parseInt(pi, 16) >> 12) & 0xF;
     if (piNibble === 0) return null;
-    
-    // Debugging log to help trace country resolving issues
-    if (DEBUG) logInfo(`[${PLUGIN_NAME}] lookupCountry() checking: PI=${pi} (Nibble=${piNibble}), ECC=${eccByte.toString(16).toUpperCase()}`);
-    
     const eccMap = RDS_COUNTRY.T[eccByte];
-    if (!eccMap) {
-        if (DEBUG) logInfo(`[${PLUGIN_NAME}] lookupCountry() failed: ECC ${eccByte.toString(16).toUpperCase()} not found in RDS_COUNTRY table.`);
-        return null;
-    }
-    
+    if (!eccMap) return null;
     const iso = eccMap[piNibble];
-    if (!iso) {
-        if (DEBUG) logInfo(`[${PLUGIN_NAME}] lookupCountry() failed: PI Nibble ${piNibble} not found for ECC ${eccByte.toString(16).toUpperCase()}.`);
-        return null;
-    }
-    
-    if (DEBUG) logInfo(`[${PLUGIN_NAME}] lookupCountry() matched: ISO=${iso}, Name=${RDS_COUNTRY.NAMES[iso] || iso}`);
-    
+    if (!iso) return null;
     return { iso, name: RDS_COUNTRY.NAMES[iso] || iso };
 }
 
-// ── Check that a PS string contains only printable characters ─
 function isPSStringClean(ps) {
     if (!ps || typeof ps !== 'string') return false;
     for (let i = 0; i < ps.length; i++) {
@@ -700,10 +637,6 @@ function isPSStringClean(ps) {
     }
     return true;
 }
-
-// ═══════════════════════════════════════════════════════════════
-//  ROLLING BLOCK-QUALITY WINDOW
-// ═══════════════════════════════════════════════════════════════
 
 function updateQualWindow(errB) {
     const zeroCount = errB.filter(e => e === 0).length;
@@ -722,10 +655,6 @@ function qualityAllowsLock() {
     if (qualWindow.length < 5) return false;
     return recentZeroErrFraction() >= QUAL_LOCK_MIN_ZERO;
 }
-
-// ═══════════════════════════════════════════════════════════════
-//  ECC COUNTRY PLAUSIBILITY  (soft penalty only – never hard block)
-// ═══════════════════════════════════════════════════════════════
 
 function eccCountryMultiplier(refEntry) {
     if (!refEntry) return 1.0;
@@ -746,10 +675,6 @@ function eccCountryMultiplier(refEntry) {
 
     return 0.5;
 }
-
-// ═══════════════════════════════════════════════════════════════
-//  AF NETWORK COVERAGE
-// ═══════════════════════════════════════════════════════════════
 
 function computeAFCoverage(pi) {
     if (!pi || isSpecialPI(pi)) return 0;
@@ -772,17 +697,10 @@ function computeAFCoverage(pi) {
     return Math.min(1, matched / dbFreqs.size);
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  PROVISIONAL HELPERS
-// ═══════════════════════════════════════════════════════════════
-
 function countCleanRawPositions() {
     let n = 0;
     for (let i = 0; i < 8; i++) {
         const e = currentState.psErrBuf?.[i] ?? 3;
-        // If the error level is 0 or 1, the receiver actually decoded this 
-        // position from the live signal. Valid spaces MUST count to prevent 
-        // penalizing short station names like "Dlf     ".
         if (e <= 1) n++;
     }
     return n;
@@ -798,10 +716,6 @@ function computeStationConfidence(pi) {
     const cleanRawPos = countCleanRawPositions();
     const rawFactor   = Math.min(1, cleanRawPos / 8);
 
-    // LOCAL TRUTH OVERRIDE:
-    // If we receive a perfectly clean 8-character RDS round, AND it exactly matches 
-    // a previously fully verified string from our local memory (rdsm_memory.json),
-    // we bypass all external databases and jump straight to 100% (1.0) confidence.
     const livePS = currentState.psBuf.join('');
     if (cleanRawPos === 8 && entry?.psVerifiedRaw === livePS) {
         return 1.0; 
@@ -834,8 +748,6 @@ function computeStationConfidence(pi) {
                eccAdjust -
                dynamicPenalty;
 
-    // FALLBACK BOOST: If raw reception is perfect (8/8 clean chars) but we missed 
-    // the AF bonus due to a DB collision (e.g. Croatia / UK), artificially boost to allow locking.
     if (cleanRawPos === 8 && conf < 0.95) {
         conf += 0.10;
     }
@@ -894,36 +806,23 @@ function computeProvisionalPS(pi) {
     return null;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  fmdx.org REFERENCE MATCHING
-// ═══════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════
-//  fmdx.org REFERENCE MATCHING
-// ═══════════════════════════════════════════════════════════════
-
 function calculatePropagationScore(ref, dbEntry) {
     if (!ref) return 0;
     
-    // Base score from distance (closer is better, but not the only factor)
     const distKm = ref.distKm || 9999;
     let distScore = 0;
     
-    // Normal Tropo / Line of sight
     if (distKm <= 100) distScore = 100;
     else if (distKm <= 300) distScore = 80;
-    else if (distKm <= 800) distScore = 40; // Enhanced Tropo
-    else if (distKm <= 2500) distScore = 20; // Sporadic E range
+    else if (distKm <= 800) distScore = 40; 
+    else if (distKm <= 2500) distScore = 20; 
     else distScore = 5;
     
-    // Power (ERP) factor
-    const erp = ref.erp || 0.1; // fallback to 0.1kW if unknown
+    const erp = ref.erp || 0.1; 
     const pwrScore = Math.min(50, Math.log10(Math.max(1, erp * 10)) * 15);
     
-    // Site verification (are we receiving other frequencies from this site?)
     let siteBonus = 0;
     if (ref.txName) {
-        // Simple check: count how many active AFs or other known PIs share this site
         let sharedSites = 0;
         for (const f of currentState.afSet) {
             const freqRefs = getFreqRefs(f);
@@ -934,18 +833,14 @@ function calculatePropagationScore(ref, dbEntry) {
         siteBonus = Math.min(30, sharedSites * 10);
     }
     
-    // Sporadic-E characteristic check (if distance is huge, but signal is strong)
     let spEBonus = 0;
     if (distKm > 800 && distKm < 2500) {
-        // If we are getting good data despite the distance, it might be SpE
         const cleanCount = countCleanRawPositions();
         if (cleanCount >= 4) spEBonus = 20;
     }
     
-    // Historical confirmation bonus
     let histBonus = 0;
     if (dbEntry && dbEntry.seenCount > 10) {
-        // We've seen this PI often, likely a regular catch
         histBonus = 15;
     }
     
@@ -969,10 +864,6 @@ function findBestRefEntry(pi) {
     const cleanPositions = currentState.psBuf.map((_, i) => ((currentState.psErrBuf[i] ?? 3) <= 1));
     const memPS = (dbEntry && dbEntry.psVerifiedRaw) ? dbEntry.psVerifiedRaw.trim().toUpperCase() : null;
 
-    // ====================================================================
-    // 1. Strict Validation for Single Candidates
-    // Prevents blind pass-through of uncoordinated dummy PI codes (e.g., 1060)
-    // ====================================================================
     if (candidates.length === 1) {
         const cand = candidates[0];
         const cleanCharsCount = cleanPositions.filter(Boolean).length;
@@ -994,7 +885,6 @@ function findBestRefEntry(pi) {
                 if (netScore > bestNetScore) bestNetScore = netScore;
             }
             
-            // Reject the single candidate if live characters conflict with the database entry
             if (bestNetScore < 0) {
                 return null; 
             }
@@ -1002,15 +892,11 @@ function findBestRefEntry(pi) {
         return cand;
     }
 
-    // ====================================================================
-    // 2. Collision Handling: Multiple transmitters with identical PI
-    // ====================================================================
     const liveAFs = Array.from(currentState.afSet);
     const now = Date.now();
     const activeAzimuths = [];
     const activeItus = new Set();
     
-    // Spatial Awareness: Gather active locations/directions from the last 5 minutes
     for (const [key, e] of Object.entries(db)) {
         if (key === '_meta' || isSpecialPI(key) || key === piUp) continue;
         if ((now - (e.seen || 0)) < 5 * 60000) { 
@@ -1026,9 +912,8 @@ function findBestRefEntry(pi) {
     let highestScore = -1;
     
     for (const cand of candidates) {
-        let score = calculatePropagationScore(cand, dbEntry); // Base score from distance/power
+        let score = calculatePropagationScore(cand, dbEntry); 
         
-        // A. AF Network Cross-Check
         let afMatches = 0;
         if (liveAFs.length > 0) {
             for (const af of liveAFs) {
@@ -1040,7 +925,6 @@ function findBestRefEntry(pi) {
         }
         score += (afMatches * 100); 
         
-        // B. Strict PS Partial Match Check (Live Data over the air)
         let maxPsScore = 0;
         if (cand.psVariants && cand.psVariants.length > 0) {
             for (const v of cand.psVariants) {
@@ -1059,7 +943,6 @@ function findBestRefEntry(pi) {
         }
         if (maxPsScore > 0) score += (maxPsScore * 30); 
 
-        // C. Memory / Hysteresis Check (Prioritize already verified stations)
         if (cand.distKm < 800 && memPS && cand.psVariants && cand.psVariants.length > 0) {
             const isMatch = cand.psVariants.some(v => {
                 const rv = v.trim().toUpperCase();
@@ -1068,13 +951,10 @@ function findBestRefEntry(pi) {
             if (isMatch) score += 2000; 
         }
 
-        // D. Spatial Awareness: Azimuth & ITU Alignment (Sporadic-E cloud tracking)
         if (cand.distKm > 800) {
-            // Apply bonus if the candidate's country matches currently active DX paths
             if (activeItus.has(cand.itu)) {
                 score += 800; 
             }
-            // Apply bonus if the path angle aligns within ±40° of other active DX stations
             let azMatch = false;
             for (const activeAz of activeAzimuths) {
                 let diff = Math.abs(cand.azimuth - activeAz);
@@ -1138,9 +1018,6 @@ function isPIAllowed(pi) {
     if (isSpecialPI(pi)) return true;
     const refs = currentState.freqRefs;
     if (!refs || refs.length === 0) return true;
-    const piUp = pi.toUpperCase();
-    if (DEBUG && !refs.some(r => r.pi === piUp || (r.pireg && r.pireg === piUp)))
-        logInfo(`[${PLUGIN_NAME}] PI ${piUp} not in fmdx.org for ${currentState.freq} MHz – allowing anyway`);
     return true;
 }
 
@@ -1148,24 +1025,23 @@ function getConfirmThreshold(pi) {
         if (isSpecialPI(pi)) return PI_CONFIRM_THRESHOLD;
         const refs = currentState.freqRefs;
 
-        let threshold = 4; // New default threshold for distances between 300km and 800km
+        let threshold = 4; 
         
         if (refs && refs.length > 0) {
             const piUp   = pi ? pi.toUpperCase() : '';
             const inFmdx = refs.some(r => r.pi === piUp || (r.pireg && r.pireg === piUp));
             
             if (!inFmdx) {
-                threshold = 6; // Unknown PIs (not in FMDX) require maximum evidence (6)
+                threshold = 6; 
             } else {
                 const ref = findRefEntry(pi);
                 const distKm = ref?.distKm ?? 9999;
                 
-                if (distKm < 300) threshold = 2;      // Local Tropo (< 300 km): Require 2 confirmations
-                else if (distKm > 800) threshold = 6; // SpE/MS Range (> 800 km): Require 6 confirmations
-                // Everything in between (300 - 800 km) stays at the default threshold of 4
+                if (distKm < 300) threshold = 2;      
+                else if (distKm > 800) threshold = 6; 
             }
         } else {
-            threshold = 6; // No FMDX data for this frequency -> require maximum evidence
+            threshold = 6; 
         }
 
     let evidenceScore = 0;
@@ -1174,7 +1050,6 @@ function getConfirmThreshold(pi) {
     if (entry?.af && entry.af.length >= 2) evidenceScore++;
     if (recentZeroErrFraction() >= 0.75)   evidenceScore++;
     
-    // The Joker: As soon as we receive clean PS characters, the threshold drops drastically!
     const cleanChars = countCleanRawPositions();
     if (cleanChars >= 1) evidenceScore += 2; 
     if (cleanChars >= 4) evidenceScore += 2;
@@ -1183,25 +1058,17 @@ function getConfirmThreshold(pi) {
     return threshold;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  DATABASE
-// ═══════════════════════════════════════════════════════════════
-
 function loadDB() {
     try {
         if (fs.existsSync(DB_FILE)) {
             const raw = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
             
-            // ====================================================================
-            // ONE-TIME WIPE TRIGGER: Checks if the stored database version is outdated
-            // ====================================================================
             if (!raw._meta || raw._meta.dbVersion !== DB_VERSION) {
                 logInfo(`[${PLUGIN_NAME}] Database version mismatch. Performing one-time wipe to version ${DB_VERSION}.`);
                 
                 let preservedFollowMode = true;
                 let preservedFollowLocked = true;
                 
-                // Preserve administrative settings (Lock state and Follow state) before wiping
                 if (raw._meta) {
                     if (typeof raw._meta.rdsFollowMode === 'boolean') preservedFollowMode = raw._meta.rdsFollowMode;
                     if (typeof raw._meta.rdsFollowLocked === 'boolean') preservedFollowLocked = raw._meta.rdsFollowLocked;
@@ -1211,17 +1078,14 @@ function loadDB() {
                 nativeRDSDisabled = preservedFollowMode;
                 rdsFollowLocked   = preservedFollowLocked;
                 
-                // Initialize a fresh database with the updated schema version
                 db = { _meta: { rdsFollowMode: preservedFollowMode, rdsFollowLocked: preservedFollowLocked, dbVersion: DB_VERSION } };
                 dbDirty = true;
                 saveDB();
                 
                 logInfo(`[${PLUGIN_NAME}] One-time wipe completed successfully. New schema version ${DB_VERSION} saved.`);
-                return; // Abort further loading since the database is now fresh and clean
+                return; 
             }
-            // ====================================================================
 
-            // Normal loading routine (runs if the version matches DB_VERSION)
             if (raw._meta && typeof raw._meta === 'object') {
                 if (typeof raw._meta.rdsFollowMode === 'boolean') {
                     rdsFollowMode     = raw._meta.rdsFollowMode;
@@ -1266,7 +1130,6 @@ function loadDB() {
             db = raw;
             logInfo(`[${PLUGIN_NAME}] AI memory loaded: ${Object.keys(db).filter(k => k !== '_meta').length} stations`);
         } else {
-            // Fresh installation fallback if no database file exists
             db = { _meta: { rdsFollowMode: true, rdsFollowLocked: true, dbVersion: DB_VERSION } };
             logInfo(`[${PLUGIN_NAME}] AI memory: new database file created`);
         }
@@ -1304,7 +1167,7 @@ function saveDB() {
             if (entry.psVerifiedRaw && !isPSStringClean(entry.psVerifiedRaw)) {
                 entry.psVerifiedRaw = null; entry.psVerifiedRawTs = 0;
             }
-            const { psDynamicBuf, ...saveable } = entry; // eslint-disable-line no-unused-vars
+            const { psDynamicBuf, ...saveable } = entry; 
             toSave[pi] = saveable;
         }
         const stationKeys = Object.keys(toSave).filter(k => k !== '_meta');
@@ -1321,9 +1184,9 @@ function saveDB() {
 }
 
 setInterval(saveDB, DB_SAVE_INTERVAL);
-process.on('SIGINT',  () => { saveDB(); process.exit(0); });
-process.on('SIGTERM', () => { saveDB(); process.exit(0); });
-process.on('exit',    () => { try { saveDB(); } catch(e) {} });
+process.on('SIGINT',  () => { saveDB(); if (recordStream) recordStream.end(); process.exit(0); });
+process.on('SIGTERM', () => { saveDB(); if (recordStream) recordStream.end(); process.exit(0); });
+process.on('exit',    () => { try { saveDB(); if (recordStream) recordStream.end(); } catch(e) {} });
 
 function ensurePI(pi) {
     if (!db[pi]) {
@@ -1376,9 +1239,6 @@ function cacheAF(pi, freqMHz) {
     }
 }
 
-// ══════════════════════════════════════════════════════════════
-//  VOTE ENGINE
-// ══════════════════════════════════════════════════════════════
 function votePS(pi, pos, char, weight, errLevel) {
     if (!pi || pi === '----' || !char || char < ' ') return;
     if (isSpecialPI(pi)) return;
@@ -1473,16 +1333,13 @@ function checkPSDynamic(pi, psString) {
     buf.push(psString);
     if (buf.length > 8) buf.shift();
     
-    // Initialisiere den Frame-Zähler für das Timeout, falls er noch nicht existiert
     if (entry.psDynamicFrames === undefined) entry.psDynamicFrames = 0;
 
     if (buf.length < 3) return;
 
-    // Prüfen, ob JETZT im aktuellen Puffer dynamischer Text läuft
     const isCurrentlyDynamic = detectScrollPS(buf) || detectChangingPS(buf);
 
     if (isCurrentlyDynamic) {
-        // Dynamischer Text erkannt -> Timer wieder auf 0 setzen
         entry.psDynamicFrames = 0;
         
         if (!entry.psIsDynamic) {
@@ -1491,19 +1348,14 @@ function checkPSDynamic(pi, psString) {
             entry.psResolved = null;
             entry.psConf = new Array(8).fill(0);
             dbDirty = true;
-            if (DEBUG) logInfo(`[RDS AI Decoder] PI ${pi}: Dynamic PS detected. Latching to dynamic mode.`);
         }
     } else if (entry.psIsDynamic) {
-        // Modus ist "dynamisch", aber es dreht sich gerade nichts mehr -> Zähler erhöhen
         entry.psDynamicFrames++;
-        
-        // Timeout-Grenze festlegen (hier: 50 Durchläufe, ca. 20-30 Sekunden ohne Scrollen)
         if (entry.psDynamicFrames > 50) { 
             entry.psIsDynamic = false;
             entry.psDynamicFrames = 0;
-            buf.length = 0; // Puffer leeren für einen sauberen Neustart
+            buf.length = 0; 
             dbDirty = true;
-            if (DEBUG) logInfo(`[RDS AI Decoder] PI ${pi}: Dynamic PS timeout reached. Jumping back to static PS check.`);
         }
     }
 }
@@ -1514,12 +1366,10 @@ function detectScrollPS(buf) {
     
     for (let i = 1; i < buf.length; i++) {
         const a = buf[i-1].trim(), b = buf[i].trim();
-        // Skip identical or empty fragments (just like the Kotlin app)
         if (!a || !b || a === b) continue; 
         
         let isShifted = false;
         for (let shift = 1; shift <= 7; shift++) {
-            // Check both left and right rotations
             const rotatedLeft  = a.slice(shift) + a.slice(0, shift);
             const rotatedRight = a.slice(-shift) + a.slice(0, a.length - shift);
             
@@ -1538,24 +1388,18 @@ function detectScrollPS(buf) {
 function detectChangingPS(buf) {
     if (buf.length < 5) return false;
     
-    // 1. Filter valid tokens only (length >= 2), similar to Kotlin
     const validTokens = buf.map(s => s.trim()).filter(s => s.length >= 2);
-    
-    // 2. Count occurrences of each token
     const counts = {};
     for (const s of validTokens) {
         counts[s] = (counts[s] || 0) + 1;
     }
     
-    // 3. Substring filter: Ignore short fragments if a longer one exists
-    // (e.g., ignore "OE" if "OE 1" is already in the list)
     const distinctWords = Object.keys(counts).filter(key => {
         return !Object.keys(counts).some(other => {
             return other.length > key.length && other.toLowerCase().startsWith(key.toLowerCase());
         });
     });
     
-    // 4. Check if at least 2 of these distinct words appear multiple times
     let recurring = 0;
     for (const word of distinctWords) {
         if (counts[word] >= 2) recurring++;
@@ -1564,9 +1408,6 @@ function detectChangingPS(buf) {
     return recurring >= 2;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  PS LOCK & DYNAMIC JUMP ENGINE
-// ═══════════════════════════════════════════════════════════════
 function checkAndLockPS(pi) {
     if (isSpecialPI(pi)) return;
     if (!piConfirmed) return;
@@ -1579,9 +1420,6 @@ function checkAndLockPS(pi) {
     const stableMs = (lastProvisionalPS && provisionalFirstSeenTs)
         ? (Date.now() - provisionalFirstSeenTs) : 0;
 
-    // Allow saving short station names like "RSA" or "Dlf".
-    // We lower the required non-space characters from 4 to 2.
-    // The strong CRC checks and our new strict FMDX rules prevent garbage anyway.
     const allRawVerified = currentState.psErrBuf.every(e => e <= 1) &&
                            currentState.psBuf.filter(c => c && c !== ' ').length >= 2 &&
                            currentState.psRoundReceivedAfterConfirm;
@@ -1654,12 +1492,7 @@ function checkAndLockPS(pi) {
                         if (refStr === nu) return true;
                         if (refStr.startsWith(nu)) return true;
                         if (nu.startsWith(refStr)) {
-                            // STRICT ENFORCEMENT: If FMDX strictly says there is only 1 variant, 
-                            // NEVER allow suffixes. This completely blocks "Dlf az".
                             if (ref.psVariants.length === 1) return false;
-                            
-                            // For multi-variant stations, block garbage suffixes like "££" 
-                            // by forcing alphanumeric characters only.
                             const suffix = nu.substring(refStr.length);
                             return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
                         }
@@ -1670,7 +1503,6 @@ function checkAndLockPS(pi) {
                     entry.psVerifiedRaw    = candidate;
                     entry.psVerifiedRawTs  = Date.now();
                     dbDirty = true;
-                    if (DEBUG) logInfo(`[${PLUGIN_NAME}] psVerifiedRaw set for PI=${pi}: "${candidate}"`);
                 }
             }
         }
@@ -1678,9 +1510,6 @@ function checkAndLockPS(pi) {
         if (!newPS && allRawVerified) {
             const candidate = currentState.psBuf.join('');
             if (isPSStringClean(candidate)) {
-                // STRICT FMDX ENFORCEMENT ON LIVE LOCK:
-                // Do not lock onto a raw string if it blatantly violates FMDX.
-                // This prevents CRC-collision garbage (like "PUPSTNIK") from locking the UI session.
                 const nu = candidate.trim().toUpperCase();
                 const ok = !ref?.psVariants?.length ||
                     ref.psVariants.some(v => {
@@ -1698,15 +1527,12 @@ function checkAndLockPS(pi) {
                 if (ok) {
                     newPS = candidate;
                     lockReason = 'Raw RDS fully verified';
-                } else {
-                    if (DEBUG) console.log(`[RDS AI Decoder] Rejected live raw lock for PI=${pi}: "${candidate}" violates strict FMDX rules.`);
                 }
             }
         }
 
         if (newPS) {
             psLocked = true; lastBroadcastPS = newPS; lastLockReason = lockReason;
-            if (DEBUG) logInfo(`[${PLUGIN_NAME}] PS locked for PI=${pi}: "${newPS}" (${lockReason})`);
             if (_aiTimer) { clearTimeout(_aiTimer); _aiTimer = null; }
             const prediction = buildAIPrediction(pi);
             currentState.lastPrediction = prediction;
@@ -1722,7 +1548,6 @@ function checkAndLockPS(pi) {
             if (cu !== bv) {
                 lastBroadcastPS = buildHybridPS(bestVariant);
                 entry.psIsDynamic = true; dbDirty = true;
-                if (DEBUG) logInfo(`[${PLUGIN_NAME}] Dynamic FMDX PS jump for PI=${pi}: "${lastBroadcastPS}"`);
                 if (_aiTimer) { clearTimeout(_aiTimer); _aiTimer = null; }
                 const prediction = buildAIPrediction(pi);
                 currentState.lastPrediction = prediction;
@@ -1754,7 +1579,6 @@ function checkAndLockPS(pi) {
                     if (ok) {
                         entry.psVerifiedRaw = freshPS; entry.psVerifiedRawTs = Date.now();
                         dbDirty = true;
-                        if (DEBUG) logInfo(`[${PLUGIN_NAME}] DB improved psVerifiedRaw for PI=${pi}: "${freshPS}"`);
                     }
                 }
             }
@@ -1762,9 +1586,6 @@ function checkAndLockPS(pi) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  TX-SEARCH  (Follow mode off)
-// ═══════════════════════════════════════════════════════════════
 let txUpdateTimer = null;
 function scheduleDataHandlerUpdate(pi) {
     if (!dataHandler || rdsFollowMode || !piConfirmed || psLocked) return;
@@ -1804,12 +1625,9 @@ function buildPSString(pi) {
     return entry.psResolved || '';
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  DATAHANDLER HELPERS
-// ═══════════════════════════════════════════════════════════════
 function clearRDSInDataHandler() {
     if (!dataHandler) return;
-const rdsFields = {
+    const rdsFields = {
         pi: '?', ps: '', ps_errors: '', pty: 0, tp: 0, ta: 0, ms: -1,
         rt0: '', rt1: '', rt0_errors: '', rt1_errors: '', rt_flag: '',
         rds: false, ecc: null, country_name: '', country_iso: 'UN',
@@ -1844,20 +1662,15 @@ function applyFollowToDataHandler() {
     
     const pi = currentState.pi;
 
-    // --- SECURITY LOCK ---
     if (pi && !isSpecialPI(pi)) {
         const entry = db[pi];
         const isKnownOnFreq = entry && entry.freq === roundFreq(currentState.freq);
         
-        // Count how many valid (error level 0 or 1) non-space PS characters have been received
         const validPsChars = currentState.psBuf.filter((char, i) => 
             char !== ' ' && (currentState.psErrBuf[i] ?? 3) <= 1
         ).length;
 
-        // Block passthrough to the webserver if the PI is not in the local DB for this frequency
-        // UNLESS we have already received at least a partial valid PS string (at least 3 clean char).
         if (!isKnownOnFreq && validPsChars < 3) {
-            if (DEBUG) logInfo(`[RDS AI Decoder] Security Lock: Blocking unknown PI ${pi} from webserver until a valid PS substring is received.`);
             return; 
         }
     }
@@ -1879,10 +1692,6 @@ function applyFollowToDataHandler() {
             candidate = entry.psResolved;
         }
 
-        // STRICT FMDX ENFORCEMENT ON READ:
-        // Before we hand over any database string (voted or verified) to the webserver,
-        // we strictly validate it against the known FMDX variants. 
-        // This stops garbage votes (like "Dlf   Dl") from leaking into the webserver UI.
         if (candidate && ref?.psVariants?.length > 0) {
             const isValid = ref.psVariants.some(v => {
                 const refStr = v.trim().toUpperCase();
@@ -1892,19 +1701,15 @@ function applyFollowToDataHandler() {
                 if (refStr.startsWith(cand)) return true;
                 
                 if (cand.startsWith(refStr)) {
-                    // If FMDX strictly says there is only 1 variant, NEVER allow suffixes.
                     if (ref.psVariants.length === 1) return false;
-                    
                     const suffix = cand.substring(refStr.length);
                     return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
                 }
                 return false;
             });
             
-            // Reject garbage candidate. applyFollowToDataHandler will fall back to FMDX variant.
             if (!isValid) return null; 
         }
-
         return candidate;
     };
 
@@ -1944,18 +1749,14 @@ function applyFollowToDataHandler() {
 
     if (!lastBroadcastPS) {
         const dbStr = getDbMixedCasePS();
-        
-        // Count clean PS characters coming live over the air
         const validPsChars = currentState.psBuf.filter((char, i) => char !== ' ' && (currentState.psErrBuf[i] ?? 3) <= 1).length;
 
         if (dbStr) {
             lastBroadcastPS = dbStr;
         } else if (ref?.psVariants?.length > 0) {
             if (validPsChars > 0) {
-                // Signal has partial PS data -> Allow FMDX name as a fallback helper
                 lastBroadcastPS = ref.psVariants[0].padEnd(8, ' ');
             } else {
-                // PURE PI RECEPTION (Scatter or Ghost) -> Do not hallucinate a name!
                 lastBroadcastPS = '        '; 
             }
         }
@@ -2014,8 +1815,6 @@ function applyFollowToDataHandler() {
     } else if (pred?.ps && Array.isArray(pred.ps)) {
         const ms = computeRefMatchScore(pi);
         
-        // STRICT FMDX ENFORCEMENT FOR WEBSERVER IN PROVISIONAL STATE:
-        // Always enforce the clean FMDX string if match score is reasonable.
         if (ms >= 0.4 && ref?.psVariants?.length > 0) {
             const dbStr = getDbMixedCasePS();
             const psStr = dbStr ? dbStr : ref.psVariants[0].padEnd(8, ' ');
@@ -2077,12 +1876,10 @@ function applyFollowToDataHandler() {
         dataHandler.dataToSend.country_iso  = country ? country.iso  : 'UN';
         dataHandler.dataToSend.country_name = country ? country.name : '';
 		
-		// Force language fields to 0/empty to prevent flag flickering
         dataHandler.dataToSend.lic = 0;
         dataHandler.dataToSend.lang = '';
     }
     
-    // Lock LIC out so the flag doesn't alternate
     dataHandler.dataToSend.lic = 0;
     dataHandler.dataToSend.lang = '';
 
@@ -2090,9 +1887,6 @@ function applyFollowToDataHandler() {
     applyAFToDataHandler();
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  GROUP DECODING
-// ═══════════════════════════════════════════════════════════════
 function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
     if (!b2hex) return;
 
@@ -2120,7 +1914,6 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
         if (blkAok && blkBok) currentState.tp = tp;
     }
 
-    // ── Group 0A ─────────────────────────────────────────────
     if (gT === 0 && vB === 0) {
         if (blkAok && blkBok) {
             const ta  = !!((g2 >> 4) & 0x01);
@@ -2160,7 +1953,6 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
         }
     }
 
-    // ── Group 0B ─────────────────────────────────────────────
     if (gT === 0 && vB === 1) {
         if (blkAok && blkBok) {
             const ta  = !!((g2 >> 4) & 0x01);
@@ -2195,7 +1987,6 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
         }
     }
 
-    // ── Group 2A (RadioText) ──────────────────────────────────
     if (gT === 2 && vB === 0) {
         const abF = (g2 >> 4) & 0x01, addr = (g2 & 0x0F) * 4;
         if (abF !== currentState.rtAB) {
@@ -2212,7 +2003,6 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
         }
     }
 
-    // ── Group 2B (RadioText, 2 chars per group) ───────────────
     if (gT === 2 && vB === 1) {
         const abF = (g2 >> 4) & 0x01, addr = (g2 & 0x0F) * 2;
         if (abF !== currentState.rtAB) {
@@ -2225,7 +2015,6 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
         }
     }
 
-    // ── Group 1A (ECC) ────────────────────────────────────────
     if (gT === 1 && vB === 0 && b3hex && errB[2] <= 1 && entry) {
         const variant = (g3 >> 12) & 0x07;
         if (variant === 0) {
@@ -2246,7 +2035,6 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
     }
 }
 
-// ── Bigram frequency table ────────────────────────────────────
 const BIGRAM = {
     ' ':{'R':25,'S':20,'M':18,'F':15,'D':14,'N':12,'B':11,'K':10,'H':9,'L':8,'C':7,'W':6,'T':5,'A':5,'G':4,'E':4,'P':4,'1':3,'2':3,'3':3},
     'R':{'A':20,'E':18,'O':15,'D':12,'S':10,'I':9,'U':8,'T':7,' ':6,'N':5,'K':4,'C':4,'L':4,'1':3,'2':3},
@@ -2275,7 +2063,7 @@ const BIGRAM = {
     '3':{'0':15,'1':12,'2':10,'3':8,'4':7,'5':6,'6':5,'7':4,'8':3,'9':3,' ':3},
 };
 
-function bigramScore(a, b) { // eslint-disable-line no-unused-vars
+function bigramScore(a, b) { 
     if (!a || !b) return 1;
     return (BIGRAM[a]?.[b] || 1);
 }
@@ -2290,9 +2078,6 @@ function buildRTString() {
     return rt.trimEnd();
 }
 
-// ═══════════════════════════════════════════════════════���═══════
-//  AI PREDICTION ENGINE
-// ═══════════════════════════════════════════════════════════════
 function buildAIPrediction(pi) {
     const entry   = (!isSpecialPI(pi) && pi) ? db[pi] : null;
     const ref     = findRefEntry(pi);
@@ -2425,15 +2210,15 @@ function buildAIPrediction(pi) {
         .map(f => parseFloat(f.toFixed ? f.toFixed(1) : String(f)))
         .sort((a, b) => a - b);
 
-    // Fetch matching DB entries for the current frequency
     const dbFreqEntries = getDbEntriesForFreq(currentState.freq);
 
     return {
         pi, 
-        nativeWebserverPI: nativePI,
+		nativeWebserverPI: nativePI,
         ps: psSlots, rt: rtResult, af: afArray,
         nativeWebserverPS: nativePS,
         psName, psNameSrc, psVariants: ref?.psVariants || [], altFreqs, psLocked,
+        itu: ref?.itu || null,
         psProvisional,
         psProvisionalConf: stationConf,
         psStableMs:        stableMs,
@@ -2462,12 +2247,8 @@ function buildAIPrediction(pi) {
     };
 }
 
-// ─────────────────────────────────────────────────────────────
-//  onPIConfirmed
-// ─────────────────────────────────────────────────────────────
 function onPIConfirmed(pi) {
     if (isSpecialPI(pi)) {
-        if (DEBUG) logInfo(`[${PLUGIN_NAME}] Special PI confirmed: ${pi} (pass-through mode)`);
         const prediction = buildAIPrediction(pi);
         currentState.lastPrediction = prediction;
         setTimeout(() => broadcast({ type: 'rdsm_ai', ...prediction, ts: Date.now() }), AI_BROADCAST_DELAY);
@@ -2489,7 +2270,6 @@ function onPIConfirmed(pi) {
         entry.psResolved  = null;
         entry.psConf      = new Array(8).fill(0);
         dbDirty = true;
-        if (DEBUG) logInfo(`[${PLUGIN_NAME}] PI ${pi}: psIsDynamic reset (fmdx ref has 1 static variant)`);
     }
 
     if (ref?.psVariants?.length > 0 && Object.keys(entry.ps).length === 0) {
@@ -2507,7 +2287,6 @@ function onPIConfirmed(pi) {
 
     if (entry.psVerifiedRaw) {
         if (!isPSStringClean(entry.psVerifiedRaw)) {
-            if (DEBUG) logInfo(`[${PLUGIN_NAME}] Discarding corrupt psVerifiedRaw for PI=${pi}`);
             entry.psVerifiedRaw = null; entry.psVerifiedRawTs = 0; dbDirty = true;
         } else if (ref?.psVariants?.length > 0) {
             const su = entry.psVerifiedRaw.trim().toUpperCase();
@@ -2516,28 +2295,9 @@ function onPIConfirmed(pi) {
                 return su === vu || su.startsWith(vu) || vu.startsWith(su);
             });
             if (!ok) {
-                if (DEBUG) logInfo(`[${PLUGIN_NAME}] Discarding stale psVerifiedRaw "${entry.psVerifiedRaw.trim()}" for PI=${pi}`);
                 entry.psVerifiedRaw = null; entry.psVerifiedRawTs = 0; dbDirty = true;
             }
         }
-    }
-
-    if (DEBUG) {
-        const rmp = Math.round(computeRefMatchScore(pi) * 100);
-        let src = 'no fmdx.org ref';
-        if (ref) {
-            const dist = ref.distKm != null ? `${ref.distKm} km` : '? km';
-            const mt   = (ref.pireg && ref.pireg === pi.toUpperCase())
-                ? `pireg match (primary PI: ${ref.piMain || '?'})` : 'primary PI match';
-            src = `fmdx.org, ${dist}, match ${rmp}%, ${mt}`;
-        }
-        logInfo(`[${PLUGIN_NAME}] PI confirmed: ${pi}${(entry.psResolved||'').trim() ? ` = "${(entry.psResolved||'').trim()}"` : ''} (${src})`);
-        if (ref?.psVariants?.length > 0)
-            logInfo(`[${PLUGIN_NAME}] PS variants for ${pi}: ${ref.psVariants.map((v,i) => `[${i}] "${v.trimEnd()}"`).join('  ')}`);
-        const altF = getAltFreqsForPI(pi);
-        if (altF.length > 0)
-            logInfo(`[${PLUGIN_NAME}] fmdx.org freqs for PI ${pi}: ` +
-                [...new Set(altF.map(a => parseFloat(a.freq).toFixed(1)))].sort().join(', '));
     }
 
     if (!psLocked) checkAndLockPS(pi);
@@ -2553,9 +2313,48 @@ function onPIConfirmed(pi) {
     if (rdsFollowMode) applyFollowToDataHandler();
 }
 
-// ─────────────────────────────────────────────────────────────
-//  parseAndDispatch
-// ─────────────────────────────────────────────────────────────
+// ── CSV Parsing Logic ─────────────────────────────────────────
+function getActionForCsv(b2, b3, b4, errString) {
+    let groupType = '-';
+    let action = '-';
+    const errs = errString ? errString.split('').map(Number) : [3,3,3,3];
+
+    if (errs[0] <= 1 && errs[1] <= 1 && b2 && b2 !== '----') {
+        const g2 = parseInt(b2, 16);
+        const gT = (g2 >> 12) & 0xF;
+        const vB = (g2 >> 11) & 0x1;
+        groupType = `${gT}${vB ? 'B' : 'A'}`;
+
+        if (gT === 0) {
+            if (b4 && b4 !== '----' && errs[3] <= 1) {
+                const b4num = parseInt(b4, 16);
+                const c0 = rdsChar(b4num >> 8);
+                const c1 = rdsChar(b4num & 0xFF);
+                action = `PS Seg ${g2 & 0x3}: '${c0}${c1}'`;
+            } else {
+                action = `Group 0${vB ? 'B' : 'A'} (No PS)`;
+            }
+        } else if (gT === 2) {
+            let rtChars = '';
+            if (vB === 0) {
+                if (b3 && b3 !== '----' && errs[2] <= 1) rtChars += rdsChar(parseInt(b3, 16) >> 8) + rdsChar(parseInt(b3, 16) & 0xFF);
+                if (b4 && b4 !== '----' && errs[3] <= 1) rtChars += rdsChar(parseInt(b4, 16) >> 8) + rdsChar(parseInt(b4, 16) & 0xFF);
+            } else {
+                if (b4 && b4 !== '----' && errs[3] <= 1) rtChars += rdsChar(parseInt(b4, 16) >> 8) + rdsChar(parseInt(b4, 16) & 0xFF);
+            }
+            action = `Radiotext Seg: '${rtChars.replace(/\r/g, '')}'`;
+        } else if (gT === 1 && vB === 0 && b3 && b3 !== '----' && errs[2] <= 1) {
+            const ecc = (parseInt(b3, 16) & 0xFF).toString(16).toUpperCase().padStart(2, '0');
+            action = `Extended Country Code: ${ecc}`;
+        } else {
+            action = `Other Group`;
+        }
+    } else if (errs[1] > 1) {
+        action = 'Block 2 Error';
+    }
+    return { groupType, action };
+}
+
 function parseAndDispatch(raw) {
     let dataHex, errorHex;
     if (raw.length >= 18) {
@@ -2574,13 +2373,35 @@ function parseAndDispatch(raw) {
     const errByte = parseInt(errorHex, 16);
     const errB    = [(errByte>>6)&3, (errByte>>4)&3, (errByte>>2)&3, errByte&3];
 
-    const piRaw = dataHex.slice(0, 4).toUpperCase();
+    const piRawUpper = dataHex.slice(0, 4).toUpperCase();
     const b2hex = dataHex.slice(4,  8);
     const b3hex = dataHex.slice(8,  12);
     const b4hex = dataHex.slice(12, 16);
 
+    // Write to CSV before early exit so errors are also logged
+    if (isRecording && recordStream) {
+        const tsStr = new Date().toISOString();
+        const freqStr = currentState.freq || '-';
+        const piRec = piRawUpper;
+        const errStr = errB.join('');
+
+        const dec = getActionForCsv(b2hex, b3hex, b4hex, errStr);
+
+        const pred = currentState.lastPrediction;
+        let aiPs = '', aiConf = 0, fmdx = '', itu = '';
+        if (pred) {
+            aiPs = pred.ps ? pred.ps.map(s => s.char && s.char !== ' ' ? s.char : ' ').join('').replace(/,/g, '') : '';
+            aiConf = pred.ps ? Math.round((pred.ps.reduce((acc, s) => acc + (s.conf || 0), 0) / 8) * 100) : 0;
+            fmdx = pred.psName ? pred.psName.replace(/,/g, '') : '';
+            itu = (pred.stats && pred.stats.refItu) ? pred.stats.refItu.replace(/,/g, '') : '';
+        }
+
+        const csvLine = `${tsStr},${freqStr},${piRec},${dec.groupType},${b2hex},${b3hex},${b4hex},${errStr},"${dec.action}","${aiPs}",${aiConf},"${fmdx}","${itu}"\n`;
+        recordStream.write(csvLine);
+    }
+
     if (errB[0] > 1) return;
-    const pi = piRaw;
+    const pi = piRawUpper;
 
     if (pi !== currentState.pi) {
         currentState.pi        = pi;
@@ -2613,10 +2434,6 @@ function parseAndDispatch(raw) {
         }
         currentState.freqRefs = isSpecialPI(pi) ? [] : getFreqRefs(currentState.freq);
 
-        if (DEBUG && currentState.freqRefs.length > 0 && !isSpecialPI(pi)) {
-            if (!currentState.freqRefs.some(r => r.pi === pi || (r.pireg && r.pireg === pi)))
-                logInfo(`[${PLUGIN_NAME}] PI candidate ${pi} not in fmdx.org for ${currentState.freq} MHz`);
-        }
     } else {
         piConfirmCount++;
     }
@@ -2637,7 +2454,6 @@ function parseAndDispatch(raw) {
     if (piConfirmed) scheduleAIBroadcast(pi);
 }
 
-// ── AI broadcast scheduler ────────────────────────────────────
 let _aiTimer = null;
 function scheduleAIBroadcast(pi) {
     if (_aiTimer) return;
@@ -2651,9 +2467,6 @@ function scheduleAIBroadcast(pi) {
     }, AI_BROADCAST_DELAY);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  BROADCAST HELPERS
-// ─────────────────────────────────────────────────────────────
 function broadcast(payload) {
     if (!pluginsWss) return;
     const msg = JSON.stringify(payload);
@@ -2662,17 +2475,6 @@ function broadcast(payload) {
     });
 }
 
-function broadcastToMainWss(payload) { // eslint-disable-line no-unused-vars
-    if (!pluginsMainWss) return;
-    const msg = JSON.stringify(payload);
-    pluginsMainWss.clients.forEach(c => {
-        if (c.readyState === c.OPEN) try { c.send(msg); } catch(e) {}
-    });
-}
-
-// ─────────────────────────────────────────────────────────────
-//  hookDataHandler
-// ─────────────────────────────────────────────────────────────
 function stripRDSLines(data) { // eslint-disable-line no-unused-vars
     return data.split('\n').filter(l => !l.startsWith('R')).join('\n');
 }
@@ -2698,7 +2500,7 @@ function interceptLines(data) {
                 lastProvisionalPS      = null;
                 provisionalFirstSeenTs = 0;
                 lastLockReason         = null;
-                qualWindow             = []; // reset quality window on freq change
+                qualWindow             = []; 
                 currentState.psBuf.fill(' ');
                 currentState.psErrBuf.fill(3);
                 currentState.psSegsSeen.clear();
@@ -2738,9 +2540,6 @@ function interceptLines(data) {
                     currentState.pi             = knownPI;
                     currentState.lastPrediction = buildAIPrediction(knownPI);
                     piPendingBroadcast          = true;
-                    const knownEntry = db[knownPI];
-                    const psName = (knownEntry?.psResolved || '').trim();
-                    if (DEBUG) logInfo(`[${PLUGIN_NAME}] Pre-seeded PI ${knownPI}${psName ? ` = "${psName}"` : ''} from learned DB`);
                 }
             }
         } else if (l.startsWith('R') && l.length >= 14) {
@@ -2780,7 +2579,6 @@ function hookDataHandler(dh) {
                 Object.defineProperty(dh.dataToSend, f, {
                     get: () => lockedData[f],
                     set: (val) => {
-
                         if (f === 'pi') nativePI = val;
                         if (f === 'ps') nativePS = val;
                     },
@@ -2824,7 +2622,6 @@ function hookDataHandler(dh) {
             return result;
         }
 
-
         const result = orig.call(this, wss, receivedData, rdsWss);
         
         nativePI = dh.dataToSend.pi;
@@ -2835,15 +2632,12 @@ function hookDataHandler(dh) {
     logInfo(`[${PLUGIN_NAME}] datahandler hooked`);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  WebSocket message handler
-// ─────────────────────────────────────────────────────────────
 function handlePluginMessage(ws, raw) {
     let msg;
     try { msg = JSON.parse(raw); } catch(e) { return; }
 
     if (msg.type === 'rdsm_get_rds_follow') {
-        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked })); }
+        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording })); }
         catch(e) {}
         return;
     }
@@ -2858,7 +2652,7 @@ function handlePluginMessage(ws, raw) {
             if (!next) clearRDSInDataHandler();
             else if (piConfirmed) applyFollowToDataHandler();
         }
-        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked });
+        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording });
         return;
     }
     
@@ -2869,7 +2663,29 @@ function handlePluginMessage(ws, raw) {
             dbDirty = true;
             logInfo(`[${PLUGIN_NAME}] RDS Follow Lock set to: ${next ? 'LOCKED' : 'UNLOCKED'}`);
         }
-        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked });
+        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording });
+        return;
+    }
+
+    if (msg.type === 'rdsm_toggle_record') {
+        if (!msg.isAdmin) return;
+        if (!isRecording) {
+            if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+            const d = new Date();
+            const ts = `${d.getFullYear()}${(d.getMonth()+1).toString().padStart(2,'0')}${d.getDate().toString().padStart(2,'0')}_${d.getHours().toString().padStart(2,'0')}${d.getMinutes().toString().padStart(2,'0')}`;
+            recordFileName = `RDS_RAW_${ts}.csv`;
+            const filePath = path.join(logDir, recordFileName);
+            recordStream = fs.createWriteStream(filePath, { flags: 'a' });
+            recordStream.write('Timestamp,Frequency_MHz,PI,Group,Block2,Block3,Block4,Errors,Decoding_Action,AI_PS,AI_Conf,FMDX_Name,ITU\n');
+            isRecording = true;
+            logInfo(`[${PLUGIN_NAME}] Recording started: ${recordFileName}`);
+            broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording: true });
+        } else {
+            if (recordStream) { recordStream.end(); recordStream = null; }
+            isRecording = false;
+            logInfo(`[${PLUGIN_NAME}] Recording stopped: ${recordFileName}`);
+            broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording: false, downloadUrl: `/logs/${recordFileName}` });
+        }
         return;
     }
     
@@ -2884,9 +2700,6 @@ function handlePluginMessage(ws, raw) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  API routes
-// ─────────────────────────────────────────────────────────────
 function registerAPIRoutes() {
     try {
         const app = pluginsApi.getHttpServer();
@@ -2911,9 +2724,6 @@ function registerAPIRoutes() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  INIT
-// ─────────────────────────────────────────────────────────────
 function init() {
     loadOwnLocation();
     startGpsWsListener();

@@ -4,7 +4,9 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 
 ## Version 2.7
 
-- Raw RDS Recording & CSV Export: Added a new Record button (⏺) to the panel header. Records incoming raw RDS groups, block hex codes, error levels, and AI prediction data. Automatically exports to a RDS_RAW_YYYYMMDD_HHMM.csv file, optimized for the RDS RAW Decoder web tool: https://highpoint.fmdx.org/webtools/rds-raw-decoder.html
+- Added server-side recording function: Records incoming raw RDS data (groups, block hex codes, error levels, and AI prediction data). The raw RDS data is saved directly as a CSV file on the server (../../web/logs).
+- Client-side recording control: Administrators can start and stop recording via the user interface (new record button (⏺)  in the panel header); a direct download link becomes available once recording stops.
+- Raw RDS data can be analyzed and validated using this new web tool: https://highpoint.fmdx.org/webtools/rds-raw-decoder.html
 
 ## Installation notes:
 
