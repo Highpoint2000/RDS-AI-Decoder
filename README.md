@@ -21,12 +21,10 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 
 ## How to use:     
                                          
-- Click the RDS Decoder button to open the RDS monitor panel 
-- As an administrator, you can activate RDS Follow Mode. This will feed the plugin's RDS data directly into the web server
-
 Detailed documentation on how the plugin works can be found [here](https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation.html)
 A demo video can be viewed [here](https://highpoint.fmdx.org/videos/RDS-AI-Decoder-Demo.mp4)
 A live demo with the RDS Follow function activated is available [here](http://highpoint2000.selfhost.de:8080)
+Recorded Raw RDS data can be analyzed and validated using this [web tool](https://highpoint.fmdx.org/webtools/rds-raw-decoder.html)
 
 ## Notes: 
 
