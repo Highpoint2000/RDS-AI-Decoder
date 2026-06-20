@@ -2,11 +2,11 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="1913" height="836" alt="Screenshot 2026-04-14 105410" src="https://github.com/user-attachments/assets/145f8528-566e-403a-a4d9-4f4cd49cfb44" />
 
-## Version 2.7
 
-- Added server-side recording function: Records incoming raw RDS data (groups, block hex codes, error levels, and AI prediction data). The raw RDS data is saved directly as a CSV file on the server (../../web/logs).
-- Client-side recording control: Administrators can start and stop recording via the user interface (new record button (⏺)  in the panel header); a direct download link becomes available once recording stops.
-- Raw RDS data can be analyzed and validated using this new web tool: https://highpoint.fmdx.org/webtools/rds-raw-decoder.html
+## Version 2.8
+
+- MUF detection (automatic start/stop) integrated for automatic RDS raw recording. Admins can choose between MUF EU, NA, and AU within the plugin.
+- Design adjustments
 
 ## Installation notes:
 
@@ -39,6 +39,12 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 2.7
+
+- Added server-side recording function: Records incoming raw RDS data (groups, block hex codes, error levels, and AI prediction data). The raw RDS data is saved directly as a CSV file on the server (../../web/logs).
+- Client-side recording control: Administrators can start and stop recording via the user interface (new record button (⏺)  in the panel header); a direct download link becomes available once recording stops.
+- Raw RDS 
 
 ### Version 2.6
 

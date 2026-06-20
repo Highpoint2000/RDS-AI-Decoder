@@ -2,7 +2,7 @@
 //                                                           //
 //  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.7)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-18      //
+//  by Highpoint                last update: 2026-06-19      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -42,33 +42,33 @@ const AI_BROADCAST_DELAY   = 80; // ms
 
 const FMDX_RADIUS_KM       = 3000;
 const FMDX_BULK_TTL_MS     = 6 * 60 * 60 * 1000;
-
 const FMDX_REINDEX_MIN_DIST_KM = 100;
 
 const PI_CONFIRM_THRESHOLD = 2;
 const GHOST_PI_THRESHOLD   = 8; // eslint-disable-line no-unused-vars
 
-// ── Provisional → Locked tuning (DX use-case) ────────────────
 const PROVISIONAL_MIN_CONF      = 0.55;
 const LOCK_MIN_CONF             = 0.90;
 const LOCK_MIN_STABLE_MS        = 700;
 const LOCK_STRONG_EVIDENCE_CONF = 0.96;
 
-// ── Rolling block-quality window ─────────────────────────────
 const QUAL_WINDOW_SIZE   = 30;   
 const QUAL_LOCK_MIN_ZERO = 0.55; 
 
-// ── Special / wildcard PI codes ───────────────────────────────
 const SPECIAL_PI_CODES = new Set(['FFFF', '0000']);
 function isSpecialPI(pi) {
     return !pi || SPECIAL_PI_CODES.has(pi.toUpperCase());
 }
 
-// ── Server-Side Recording ────────────────────────────────────
+// ── Server-Side Recording & MUF State ────────────────────────
 const logDir = path.resolve(__dirname, '../../web/logs');
 let isRecording = false;
 let recordStream = null;
 let recordFileName = '';
+
+let mufMode = 'OFF'; // 'OFF', 'EU', 'NA', 'AU'
+let mufCheckInterval = null;
+let mufTriggeredRecord = false;
 
 // ── Module-level state ───────────────────────────────────────
 let aiExclusiveMode    = false;
@@ -184,7 +184,6 @@ function startGpsWsListener() {
                     if (!isNaN(rawLat) && !isNaN(rawLon) && msg.value.status === 'active') {
                         const lat = roundGps(rawLat);
                         const lon = roundGps(rawLon);
-
                         ownLat = lat;
                         ownLon = lon;
 
@@ -300,6 +299,73 @@ function nodeHttpGetJSON(url) {
     });
 }
 
+// ── MUF API Checker ──────────────────────────────────────────
+async function checkMUFStatus() {
+    if (mufMode === 'OFF') return;
+    const regionMap = { 'EU': 'europe', 'NA': 'north_america', 'AU': 'australia' };
+    const regionKey = regionMap[mufMode];
+    if (!regionKey) return;
+
+    try {
+        const json = await nodeHttpGetJSON('https://fmdx.org/includes/tools/get_muf.php');
+        const regionData = json[regionKey];
+        
+        let mufActive = false;
+        if (regionData && regionData.max_frequency && regionData.max_frequency !== 'No data') {
+            const mufValue = parseFloat(regionData.max_frequency);
+            if (mufValue > 0) mufActive = true;
+        }
+
+        if (mufActive) {
+            if (!isRecording) {
+                logInfo(`[${PLUGIN_NAME}] Valid MUF detected for ${mufMode} (${regionData.max_frequency} MHz). Auto-starting recording.`);
+                mufTriggeredRecord = true;
+                startServerRecording();
+            }
+        } else {
+            if (isRecording && mufTriggeredRecord) {
+                logInfo(`[${PLUGIN_NAME}] MUF is no longer valid for ${mufMode}. Auto-stopping recording.`);
+                stopServerRecording(true); // <--- Pass true here
+            }
+        }
+    } catch (e) {
+        logWarn(`[${PLUGIN_NAME}] MUF check failed: ${e.message}`);
+    }
+}
+
+// ── Recording Helpers ────────────────────────────────────────
+function startServerRecording() {
+    if (isRecording) return;
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    const d = new Date();
+    const ts = `${d.getFullYear()}${(d.getMonth()+1).toString().padStart(2,'0')}${d.getDate().toString().padStart(2,'0')}_${d.getHours().toString().padStart(2,'0')}${d.getMinutes().toString().padStart(2,'0')}${d.getSeconds().toString().padStart(2,'0')}`;
+    recordFileName = `RDS_RAW_${ts}.csv`;
+    const filePath = path.join(logDir, recordFileName);
+    recordStream = fs.createWriteStream(filePath, { flags: 'a' });
+    recordStream.write('Timestamp,Frequency_MHz,PI,Block2,Block3,Block4,Errors,AI_PS,AI_Conf,FMDX_Name,ITU\n');
+    isRecording = true;
+    logInfo(`[${PLUGIN_NAME}] Recording started: ${recordFileName}`);
+    broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording: true, mufMode });
+}
+
+function stopServerRecording(silent = false) {
+    if (!isRecording) return;
+    if (recordStream) { recordStream.end(); recordStream = null; }
+    isRecording = false;
+    logInfo(`[${PLUGIN_NAME}] Recording stopped: ${recordFileName}`);
+    broadcast({ 
+        type: 'rdsm_rds_follow_state', 
+        enabled: rdsFollowMode, 
+        locked: rdsFollowLocked, 
+        isRecording: false, 
+        downloadUrl: silent ? null : `/logs/${recordFileName}`, 
+        mufMode,
+        silentStop: silent 
+    });
+    mufTriggeredRecord = false;
+}
+
+// ── FMDX loading ─────────────────────────────────────────────
 async function loadFmdxBulk() {
     if (ownLat === null || ownLon === null) {
         logWarn(`[${PLUGIN_NAME}] fmdx.org bulk load skipped – no location in config.json`);
@@ -808,7 +874,6 @@ function computeProvisionalPS(pi) {
 
 function calculatePropagationScore(ref, dbEntry) {
     if (!ref) return 0;
-    
     const distKm = ref.distKm || 9999;
     let distScore = 0;
     
@@ -884,7 +949,6 @@ function findBestRefEntry(pi) {
                 const netScore = matchPts - mismatchPts;
                 if (netScore > bestNetScore) bestNetScore = netScore;
             }
-            
             if (bestNetScore < 0) {
                 return null; 
             }
@@ -1016,8 +1080,6 @@ function computeRefMatchScore(pi) {
 function isPIAllowed(pi) {
     if (!pi || pi === '----') return false;
     if (isSpecialPI(pi)) return true;
-    const refs = currentState.freqRefs;
-    if (!refs || refs.length === 0) return true;
     return true;
 }
 
@@ -1081,8 +1143,6 @@ function loadDB() {
                 db = { _meta: { rdsFollowMode: preservedFollowMode, rdsFollowLocked: preservedFollowLocked, dbVersion: DB_VERSION } };
                 dbDirty = true;
                 saveDB();
-                
-                logInfo(`[${PLUGIN_NAME}] One-time wipe completed successfully. New schema version ${DB_VERSION} saved.`);
                 return; 
             }
 
@@ -1090,7 +1150,6 @@ function loadDB() {
                 if (typeof raw._meta.rdsFollowMode === 'boolean') {
                     rdsFollowMode     = raw._meta.rdsFollowMode;
                     nativeRDSDisabled = rdsFollowMode;
-                    logInfo(`[${PLUGIN_NAME}] RDS Follow restored: ${rdsFollowMode ? 'ON' : 'OFF'}`);
                 }
                 if (typeof raw._meta.rdsFollowLocked === 'boolean') {
                     rdsFollowLocked = raw._meta.rdsFollowLocked;
@@ -2313,48 +2372,6 @@ function onPIConfirmed(pi) {
     if (rdsFollowMode) applyFollowToDataHandler();
 }
 
-// ── CSV Parsing Logic ─────────────────────────────────────────
-function getActionForCsv(b2, b3, b4, errString) {
-    let groupType = '-';
-    let action = '-';
-    const errs = errString ? errString.split('').map(Number) : [3,3,3,3];
-
-    if (errs[0] <= 1 && errs[1] <= 1 && b2 && b2 !== '----') {
-        const g2 = parseInt(b2, 16);
-        const gT = (g2 >> 12) & 0xF;
-        const vB = (g2 >> 11) & 0x1;
-        groupType = `${gT}${vB ? 'B' : 'A'}`;
-
-        if (gT === 0) {
-            if (b4 && b4 !== '----' && errs[3] <= 1) {
-                const b4num = parseInt(b4, 16);
-                const c0 = rdsChar(b4num >> 8);
-                const c1 = rdsChar(b4num & 0xFF);
-                action = `PS Seg ${g2 & 0x3}: '${c0}${c1}'`;
-            } else {
-                action = `Group 0${vB ? 'B' : 'A'} (No PS)`;
-            }
-        } else if (gT === 2) {
-            let rtChars = '';
-            if (vB === 0) {
-                if (b3 && b3 !== '----' && errs[2] <= 1) rtChars += rdsChar(parseInt(b3, 16) >> 8) + rdsChar(parseInt(b3, 16) & 0xFF);
-                if (b4 && b4 !== '----' && errs[3] <= 1) rtChars += rdsChar(parseInt(b4, 16) >> 8) + rdsChar(parseInt(b4, 16) & 0xFF);
-            } else {
-                if (b4 && b4 !== '----' && errs[3] <= 1) rtChars += rdsChar(parseInt(b4, 16) >> 8) + rdsChar(parseInt(b4, 16) & 0xFF);
-            }
-            action = `Radiotext Seg: '${rtChars.replace(/\r/g, '')}'`;
-        } else if (gT === 1 && vB === 0 && b3 && b3 !== '----' && errs[2] <= 1) {
-            const ecc = (parseInt(b3, 16) & 0xFF).toString(16).toUpperCase().padStart(2, '0');
-            action = `Extended Country Code: ${ecc}`;
-        } else {
-            action = `Other Group`;
-        }
-    } else if (errs[1] > 1) {
-        action = 'Block 2 Error';
-    }
-    return { groupType, action };
-}
-
 function parseAndDispatch(raw) {
     let dataHex, errorHex;
     if (raw.length >= 18) {
@@ -2378,29 +2395,34 @@ function parseAndDispatch(raw) {
     const b3hex = dataHex.slice(8,  12);
     const b4hex = dataHex.slice(12, 16);
 
-    // Write to CSV before early exit so errors are also logged
-    if (isRecording && recordStream) {
+    // --- NEW FILTER ---
+    // If Block 3 AND Block 4 have error level 2 or 3, the frame has no payload.
+    // If Block 1 (PI) is > 1, the station identity is corrupt.
+    // We skip writing these empty/corrupt frames to the CSV.
+    const noPayload = (errB[2] >= 2 && errB[3] >= 2);
+    const badPI = (errB[0] > 1);
+
+    if (isRecording && recordStream && !noPayload && !badPI) {
         const tsStr = new Date().toISOString();
         const freqStr = currentState.freq || '-';
         const piRec = piRawUpper;
         const errStr = errB.join('');
 
-        const dec = getActionForCsv(b2hex, b3hex, b4hex, errStr);
-
         const pred = currentState.lastPrediction;
-        let aiPs = '', aiConf = 0, fmdx = '', itu = '';
+        let aiPs = '________', aiConf = 0, fmdx = '', itu = '';
         if (pred) {
-            aiPs = pred.ps ? pred.ps.map(s => s.char && s.char !== ' ' ? s.char : ' ').join('').replace(/,/g, '') : '';
+            aiPs = pred.ps ? pred.ps.map(s => s.char && s.char !== ' ' ? s.char : '_').join('').padEnd(8, '_').replace(/,/g, '') : '________';
             aiConf = pred.ps ? Math.round((pred.ps.reduce((acc, s) => acc + (s.conf || 0), 0) / 8) * 100) : 0;
             fmdx = pred.psName ? pred.psName.replace(/,/g, '') : '';
             itu = (pred.stats && pred.stats.refItu) ? pred.stats.refItu.replace(/,/g, '') : '';
         }
 
-        const csvLine = `${tsStr},${freqStr},${piRec},${dec.groupType},${b2hex},${b3hex},${b4hex},${errStr},"${dec.action}","${aiPs}",${aiConf},"${fmdx}","${itu}"\n`;
+        const csvLine = `${tsStr},${freqStr},${piRec},${b2hex},${b3hex},${b4hex},${errStr},"${aiPs}",${aiConf},"${fmdx}","${itu}"\n`;
         recordStream.write(csvLine);
     }
 
-    if (errB[0] > 1) return;
+    // Stop execution completely if the PI code is bad
+    if (badPI) return;
     const pi = piRawUpper;
 
     if (pi !== currentState.pi) {
@@ -2637,7 +2659,7 @@ function handlePluginMessage(ws, raw) {
     try { msg = JSON.parse(raw); } catch(e) { return; }
 
     if (msg.type === 'rdsm_get_rds_follow') {
-        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording })); }
+        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode })); }
         catch(e) {}
         return;
     }
@@ -2652,7 +2674,7 @@ function handlePluginMessage(ws, raw) {
             if (!next) clearRDSInDataHandler();
             else if (piConfirmed) applyFollowToDataHandler();
         }
-        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording });
+        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode });
         return;
     }
     
@@ -2663,29 +2685,42 @@ function handlePluginMessage(ws, raw) {
             dbDirty = true;
             logInfo(`[${PLUGIN_NAME}] RDS Follow Lock set to: ${next ? 'LOCKED' : 'UNLOCKED'}`);
         }
-        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording });
+        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode });
         return;
     }
 
     if (msg.type === 'rdsm_toggle_record') {
         if (!msg.isAdmin) return;
         if (!isRecording) {
-            if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
-            const d = new Date();
-            const ts = `${d.getFullYear()}${(d.getMonth()+1).toString().padStart(2,'0')}${d.getDate().toString().padStart(2,'0')}_${d.getHours().toString().padStart(2,'0')}${d.getMinutes().toString().padStart(2,'0')}`;
-            recordFileName = `RDS_RAW_${ts}.csv`;
-            const filePath = path.join(logDir, recordFileName);
-            recordStream = fs.createWriteStream(filePath, { flags: 'a' });
-            recordStream.write('Timestamp,Frequency_MHz,PI,Group,Block2,Block3,Block4,Errors,Decoding_Action,AI_PS,AI_Conf,FMDX_Name,ITU\n');
-            isRecording = true;
-            logInfo(`[${PLUGIN_NAME}] Recording started: ${recordFileName}`);
-            broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording: true });
+            mufTriggeredRecord = false; 
+            startServerRecording();
         } else {
-            if (recordStream) { recordStream.end(); recordStream = null; }
-            isRecording = false;
-            logInfo(`[${PLUGIN_NAME}] Recording stopped: ${recordFileName}`);
-            broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording: false, downloadUrl: `/logs/${recordFileName}` });
+            mufTriggeredRecord = false;
+            stopServerRecording();
         }
+        return;
+    }
+    
+    if (msg.type === 'rdsm_set_muf_mode') {
+        if (!msg.isAdmin) return;
+        mufMode = msg.mode;
+        logInfo(`[${PLUGIN_NAME}] MUF Auto-Record mode set to: ${mufMode}`);
+        
+        if (mufCheckInterval) {
+            clearInterval(mufCheckInterval);
+            mufCheckInterval = null;
+        }
+        
+        if (mufMode !== 'OFF') {
+            mufCheckInterval = setInterval(checkMUFStatus, 60000);
+            checkMUFStatus(); // Initial check
+        } else {
+            if (isRecording && mufTriggeredRecord) {
+                stopServerRecording(true); // <--- Pass true here
+            }
+            mufTriggeredRecord = false;
+        }
+        broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode });
         return;
     }
     

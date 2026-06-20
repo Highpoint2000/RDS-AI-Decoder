@@ -2,7 +2,7 @@
 //                                                           //
 //  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V2.7)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-18      //
+//  by Highpoint                last update: 2026-06-19      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -70,42 +70,6 @@
                  "Children's Programmes",'Social Affairs','Religion','Phone-In','Travel',
                  'Leisure','Jazz Music','Country Music','National Music','Oldies Music',
                  'Folk Music','Documentary','Alarm Test','Alarm'];
-
-    const RDS_CHARSET = [
-        ' ','!','"','#','¤','%','&',"'",
-        '(',')', '*','+',',','-','.','/',
-        '0','1','2','3','4','5','6','7',
-        '8','9',':',';','<','=','>','?',
-        '@','A','B','C','D','E','F','G',
-        'H','I','J','K','L','M','N','O',
-        'P','Q','R','S','T','U','V','W',
-        'X','Y','Z','[','\\',']','―','_',
-        '‖','a','b','c','d','e','f','g',
-        'h','i','j','k','l','m','n','o',
-        'p','q','r','s','t','u','v','w',
-        'x','y','z','{','|','}','¯',' ',
-        'á','à','é','è','í','ì','ó','ò',
-        'ú','ù','Ñ','Ç','Ş','β','¡','Ĳ',
-        'â','ä','ê','ë','î','ï','ô','ö',
-        'û','ü','ñ','ç','ş','ǧ','ı','ĳ',
-        'ª','α','©','‰','Ǧ','ě','ň','ő',
-        'π','€','£','$','←','↑','→','↓',
-        'º','¹','²','³','±','İ','ń','ű',
-        'µ','¿','÷','°','¼','½','¾','§',
-        'Á','À','É','È','Í','Ì','Ó','Ò',
-        'Ú','Ù','Ř','Č','Š','Ž','Ð','Ŀ',
-        'Â','Ä','Ê','Ë','Î','Ï','Ô','Ö',
-        'Û','Ü','ř','č','š','ž','đ','ŀ',
-        'Ã','Å','Æ','Œ','ŷ','Ý','Õ','Ø',
-        'Þ','Ŋ','Ŕ','Ć','Ś','Ź','Ŧ','ð',
-        'ã','å','æ','œ','ŵ','ý','õ','ø',
-        'þ','ŋ','ŕ','ć','ś','ź','ŧ',' ',
-    ];
-    function rCh(b) {
-        if (b === 0x0D) return '\r';
-        if (b < 0x20)   return ' ';
-        return RDS_CHARSET[b - 0x20] || ' ';
-    }
 
     const CONF = [1.00, 0.90, 0.70, 0.00];
 
@@ -226,6 +190,7 @@
         psLocked: false,
         nativePI: '-',
         nativePS: '-',
+        mufMode: 'OFF'
     };
 	
     let isRecording = false;
@@ -240,7 +205,7 @@
         }
     }
 
-    function updateRecordUI(recording, downloadUrl) {
+    function updateRecordUI(recording, downloadUrl, silentStop) {
         const btn = document.getElementById('rdsm-record-btn');
         if (!btn) return;
         const wasRecording = isRecording;
@@ -257,15 +222,32 @@
             btn.innerHTML = '⏺';
             btn.classList.remove('recording-pulse');
             btn.title = 'Record raw RDS data';
-            if (wasRecording && downloadUrl) {
-                if (isAdmin) {
-                    sendToast('success', pluginName, 'Recording saved to server.');
-                    window.open(downloadUrl, '_blank');
-                    window.open('https://highpoint.fmdx.org/webtools/rds-raw-decoder.html', '_blank');
-                } else {
-                    sendToast('info', pluginName, 'Administrator stopped RDS recording.');
+            
+            if (wasRecording) {
+                if (silentStop) {
+                    if (isAdmin) sendToast('info', pluginName, 'Auto-recording stopped by MUF condition. CSV saved to server.');
+                } else if (downloadUrl) {
+                    if (isAdmin) {
+                        sendToast('success', pluginName, 'Recording saved to server.');
+                        window.open(downloadUrl, '_blank');
+                        window.open('https://highpoint.fmdx.org/webtools/rds-raw-decoder.html', '_blank');
+                    } else {
+                        sendToast('info', pluginName, 'Administrator stopped RDS recording.');
+                    }
                 }
             }
+        }
+    }
+
+    function updateMufUI(mode) {
+        st.mufMode = mode || 'OFF';
+        const btn = document.getElementById('rdsm-muf-btn');
+        if (!btn) return;
+        btn.innerHTML = `MUF ${st.mufMode}`;
+        if (st.mufMode === 'OFF') {
+            btn.classList.remove('on');
+        } else {
+            btn.classList.add('on');
         }
     }
 
@@ -307,7 +289,8 @@
     function onRdsFollowState(d) { 
         st.rdsFollow = !!d.enabled; 
         if (d.locked !== undefined) st.rdsFollowLocked = !!d.locked;
-        if (d.isRecording !== undefined) updateRecordUI(d.isRecording, d.downloadUrl);
+        if (d.isRecording !== undefined) updateRecordUI(d.isRecording, d.downloadUrl, d.silentStop);
+        if (d.mufMode !== undefined) updateMufUI(d.mufMode);
         syncFollowUI(); 
     }
 
@@ -349,7 +332,13 @@
             stableFlag_TA(ta, blkAok, blkBok);
             stableFlag_MS(ms, blkAok, blkBok);
             if (d.b4 && c4 > 0) {
-                const addr = seg*2, c0 = rCh((g4>>8)&0xFF), c1 = rCh(g4&0xFF);
+                const addr = seg*2;
+                let c0 = ' ', c1 = ' ';
+                const c0Code = (g4>>8)&0xFF;
+                const c1Code = g4&0xFF;
+                if (c0Code >= 0x20) c0 = String.fromCharCode(c0Code);
+                if (c1Code >= 0x20) c1 = String.fromCharCode(c1Code);
+
                 if (c0 >= ' ') { fusePS_raw(addr,   c0, c4, s4, d.errB[3]); st.psBuf[addr]   = c0; st.psGroups.add(seg); }
                 if (c1 >= ' ') { fusePS_raw(addr+1, c1, c4, s4, d.errB[3]); st.psBuf[addr+1] = c1; }
             }
@@ -361,8 +350,20 @@
                 if (o.trim().length >= 4) promoteRT(o);
                 st.rtabFlag = abF; rtAB = abF; rtSlots[abF] = mkRT(64);
             }
-            if (d.b3 && c3 > 0) { fuseRT(abF, addr,   rCh((g3>>8)&0xFF), c3, s3); fuseRT(abF, addr+1, rCh(g3&0xFF), c3, s3); }
-            if (d.b4 && c4 > 0) { fuseRT(abF, addr+2, rCh((g4>>8)&0xFF), c4, s4); fuseRT(abF, addr+3, rCh(g4&0xFF), c4, s4); }
+            if (d.b3 && c3 > 0) { 
+                let c0 = ' ', c1 = ' ';
+                const c0Code = (g3>>8)&0xFF; const c1Code = g3&0xFF;
+                if (c0Code >= 0x20 || c0Code === 0x0D) c0 = c0Code===0x0D ? '\r' : String.fromCharCode(c0Code);
+                if (c1Code >= 0x20 || c1Code === 0x0D) c1 = c1Code===0x0D ? '\r' : String.fromCharCode(c1Code);
+                fuseRT(abF, addr, c0, c3, s3); fuseRT(abF, addr+1, c1, c3, s3); 
+            }
+            if (d.b4 && c4 > 0) { 
+                let c2 = ' ', c3_char = ' ';
+                const c2Code = (g4>>8)&0xFF; const c3Code = g4&0xFF;
+                if (c2Code >= 0x20 || c2Code === 0x0D) c2 = c2Code===0x0D ? '\r' : String.fromCharCode(c2Code);
+                if (c3Code >= 0x20 || c3Code === 0x0D) c3_char = c3Code===0x0D ? '\r' : String.fromCharCode(c3Code);
+                fuseRT(abF, addr+2, c2, c4, s4); fuseRT(abF, addr+3, c3_char, c4, s4); 
+            }
         }
         if (gT === 2 && vB === 1) {
             const abF = (g2>>4)&1, addr = (g2&0xF)*2;
@@ -371,7 +372,13 @@
                 if (o.trim().length >= 4) promoteRT(o);
                 st.rtabFlag = abF; rtAB = abF; rtSlots[abF] = mkRT(64);
             }
-            if (d.b4 && c4 > 0) { fuseRT(abF, addr, rCh((g4>>8)&0xFF), c4, s4); fuseRT(abF, addr+1, rCh(g4&0xFF), c4, s4); }
+            if (d.b4 && c4 > 0) { 
+                let c0 = ' ', c1 = ' ';
+                const c0Code = (g4>>8)&0xFF; const c1Code = g4&0xFF;
+                if (c0Code >= 0x20 || c0Code === 0x0D) c0 = c0Code===0x0D ? '\r' : String.fromCharCode(c0Code);
+                if (c1Code >= 0x20 || c1Code === 0x0D) c1 = c1Code===0x0D ? '\r' : String.fromCharCode(c1Code);
+                fuseRT(abF, addr, c0, c4, s4); fuseRT(abF, addr+1, c1, c4, s4); 
+            }
         }
         if (gT === 1 && vB === 0 && d.b3 && d.errB[2] <= 1 && ((g2>>1)&7) === 0) {
             const eccVal = (g4 !== undefined ? (parseInt(d.b3,16)&0xFF) : NaN);
@@ -1052,10 +1059,10 @@
         const s = document.createElement('style');
         s.id = 'rdsm-css';
         s.textContent = `
-        #rdsm-panel-container { display:flex; position:fixed; top:70px; right:20px; z-index:9999; pointer-events:none; }
+#rdsm-panel-container { display:flex; position:fixed; top:70px; right:20px; z-index:9999; pointer-events:none; }
         #rdsm-panel { pointer-events:auto; width:390px;
             background:var(--color-bg-1,#13151f);
-            border:1px solid var(--color-main-bright,#4a90d9);
+            border:1px solid #2a2d3a;
             border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6);
             font-family:"Titillium Web",Calibri,sans-serif;
             color:#e0e0e0;display:none;user-select:none;
@@ -1063,7 +1070,7 @@
         #rdsm-panel-container.vis #rdsm-panel {display:flex;}
         #rdsm-stats-pan { pointer-events:auto; width:280px; margin-left:10px;
             background:var(--color-bg-1,#13151f);
-            border:1px solid var(--color-main-bright,#4a90d9);
+            border:1px solid #2a2d3a;
             border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6);
             font-family:"Titillium Web",Calibri,sans-serif;
             color:#e0e0e0;display:none;user-select:none;
@@ -1071,23 +1078,24 @@
         #rdsm-panel-container.vis.stats-open #rdsm-stats-pan {display:flex;}
         
         #rdsm-hdr{display:flex;align-items:center;justify-content:space-between;
-            padding:10px 14px 8px;background:var(--color-main-bright,#4a90d9);cursor:move;
+            padding:10px 14px 8px;background:#11141e;cursor:move;
+            border-bottom: 1px solid rgba(255,255,255,0.07);
             border-radius:11px 11px 0 0;}
-        .rdsm-ht{font-size:14px;font-weight:700;color:#fff;text-transform:uppercase;
+        .rdsm-ht{font-size:14px;font-weight:700;color:var(--color-main-bright,#4a90d9);text-transform:uppercase;
             letter-spacing:1px;font-family:"Titillium Web",Calibri,sans-serif; white-space:nowrap;}
         #rdsm-dot{display:inline-block;width:16px;height:6px;border-radius:50%;
             background:#ff4444;transition:background .4s;vertical-align:middle;margin-right:10px;}
         #rdsm-dot.ok{background:#44ff88;}
         #rdsm-close{background:none;border:none;color:#fff;font-size:16px;cursor:pointer;
-            opacity:.8;font-family:"Titillium Web",Calibri,sans-serif;}
+            opacity:.6;font-family:"Titillium Web",Calibri,sans-serif; transition:opacity .2s;}
         #rdsm-close:hover{opacity:1;}
         #rdsm-manual-link{background:none;border:none;color:#fff;font-size:16px;cursor:pointer;
-            opacity:.8;font-family:"Titillium Web",Calibri,sans-serif;}
+            opacity:.6;font-family:"Titillium Web",Calibri,sans-serif; transition:opacity .2s;}
         #rdsm-manual-link:hover{opacity:1;}
         #rdsm-body{padding:11px 14px;}
         .rr{display:flex;align-items:center;margin-bottom:8px;gap:8px;}
         .rl{font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;
-            color:var(--color-main-bright,#4a90d9);min-width:62px;opacity:.85;
+            color:#777;min-width:62px;
             font-family:"Titillium Web",Calibri,sans-serif;}
         .rv{font-size:14px;font-weight:600;flex:1;color:#f0f0f0;
             overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
@@ -1107,17 +1115,18 @@
         .rt-line + .rt-line-label{margin-top:5px;}
         .rfl{display:flex;gap:5px;flex-wrap:wrap;}
         .rf{font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px;
-            background:#1c1c1c;color:#444;letter-spacing:.5px;
-            font-family:"Titillium Web",Calibri,sans-serif;transition:background .25s,color .25s;}
-        .rf.on{background:var(--color-main-bright,#4a90d9);color:#fff;}
-        .pty-badge{font-size:10px;background:var(--color-main-bright,#4a90d9);
-            color:#fff;padding:1px 6px;border-radius:4px;margin-left:4px;
+            background:transparent;color:#666;border:1px solid rgba(255,255,255,0.1);letter-spacing:.5px;
+            font-family:"Titillium Web",Calibri,sans-serif;transition:border-color .25s,box-shadow .25s,color .25s;}
+        .rf.on{background:transparent;color:#fff; border-color:var(--color-main-bright,#4a90d9); box-shadow: 0 0 3px rgba(74, 144, 217, 0.4);}
+        .pty-badge{font-size:10px;background:transparent;
+            border:1px solid var(--color-main-bright,#4a90d9);
+            color:var(--color-main-bright,#4a90d9);padding:1px 6px;border-radius:4px;margin-left:4px;
             font-family:"Titillium Web",Calibri,sans-serif;}
         #rdsm-gg{display:flex;flex-wrap:wrap;gap:3px;flex:1;}
         .rgc{font-size:9px;font-weight:700;padding:1px 4px;border-radius:3px;
-            background:#1c1c1c;color:#444;font-family:"Titillium Web",Calibri,sans-serif;
-            min-width:24px;text-align:center;transition:background .3s,color .3s;}
-        .rgc.on{background:var(--color-main-bright,#4a90d9);color:#fff;}
+            background:transparent;color:#444;border:1px solid rgba(255,255,255,0.1);font-family:"Titillium Web",Calibri,sans-serif;
+            min-width:24px;text-align:center;transition:border-color .3s,box-shadow .3s,color .3s;}
+        .rgc.on{background:transparent;color:#fff;border-color:var(--color-main-bright,#4a90d9); box-shadow: 0 0 3px rgba(74, 144, 217, 0.4);}
         #rdsm-psname{
             display:flex !important;visibility:visible !important;
             align-items:flex-start;
@@ -1168,7 +1177,7 @@
         #rdsm-btn:hover{color:var(--color-5);filter:brightness(120%);}
         #rdsm-btn.active{background-color:var(--color-2)!important;filter:brightness(120%);}
         
-        #rdsm-stats-btn{font-size:10px;font-weight:700;color:var(--color-main-bright,#4a90d9);
+        #rdsm-stats-btn{font-size:10px;font-weight:700;color:#777;
             text-transform:uppercase;letter-spacing:1px; cursor:pointer;
             font-family:"Titillium Web",Calibri,sans-serif; display:flex; align-items:center; gap:4px;
             margin-left:auto;}
@@ -1190,8 +1199,8 @@
         .ai-stats-r span{color:#ccc;font-weight:600;font-family:"Titillium Web",Calibri,sans-serif;}
         .ai-stats-ref{display:flex;justify-content:space-between;font-size:11px;
             color:#888;margin-bottom:5px;font-family:"Titillium Web",Calibri,sans-serif;
-            background:rgba(200,160,32,.08);border-radius:4px;padding:3px 6px;}
-        .ai-stats-ref span{color:#c8a020;font-weight:600;}
+            background:rgba(74, 144, 217, 0.05);border-radius:4px;border:1px solid rgba(74, 144, 217, 0.2);padding:3px 6px;}
+        .ai-stats-ref span{color:#fff;font-weight:600;}
         .ai-stats-leg{font-size:9px;color:#555;margin-top:auto;line-height:2;
             font-family:"Titillium Web",Calibri,sans-serif;}
         .rdiv{border:none;border-top:1px solid rgba(255,255,255,.07);margin:7px 0;}
@@ -1204,6 +1213,18 @@
         }
         #rdsm-record-btn:hover { opacity: 1; transform: scale(1.1); }
         
+        #rdsm-muf-btn {
+            background: transparent; border: 1px solid rgba(74, 144, 217, 0.3); color: #888;
+            font-size: 10px; font-weight: 700; cursor: pointer;
+            border-radius: 4px; padding: 2px 6px; margin-left: 6px;
+            font-family: "Titillium Web",Calibri,sans-serif;
+            transition: color 0.3s, border-color 0.3s, background 0.3s, box-shadow 0.3s;
+        }
+        #rdsm-muf-btn:hover { color: #fff; border-color: rgba(74, 144, 217, 0.6); }
+        #rdsm-muf-btn.on { color: #fff; border-color: var(--color-main-bright,#4a90d9); box-shadow: 0 0 5px rgba(74, 144, 217, 0.4); }
+        
+        #rdsm-manual-link { padding: 0 4px; }
+
         @keyframes pulse-record {
             0% { transform: scale(1); opacity: 1; }
             50% { transform: scale(1.3); opacity: 0.5; }
@@ -1230,6 +1251,7 @@
             <span style="display:flex;align-items:center;gap:6px;white-space:nowrap;">
                 <span class="rdsm-ht">${pluginName}</span>
                 <button id="rdsm-record-btn" title="Record raw RDS data">⏺</button>
+                <button id="rdsm-muf-btn" title="Toggle MUF Auto-Record">MUF OFF</button>
             </span>
             <span style="display:flex;align-items:center;gap:5px">
               <span id="rdsm-dot" title="Connection status"></span>
@@ -1375,6 +1397,20 @@
         document.getElementById('rdsm-close').addEventListener('click', hidePanel);
 		document.getElementById('rdsm-record-btn').addEventListener('click', toggleRecording);
         
+        document.getElementById('rdsm-muf-btn').addEventListener('click', () => {
+            if (!isAdmin) {
+                sendToast('warning', pluginName, 'Administrator login required to set MUF mode.');
+                return;
+            }
+            const modes = ['OFF', 'EU', 'NA', 'AU'];
+            const currentIndex = modes.indexOf(st.mufMode);
+            const nextMode = modes[(currentIndex + 1) % modes.length];
+            
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'rdsm_set_muf_mode', mode: nextMode, isAdmin: true }));
+            }
+        });
+        
         document.getElementById('rdsm-lock-btn').addEventListener('click', () => {
             if (!isAdmin) {
                 sendToast('warning', pluginName, 'Administrator login required to lock/unlock.');
@@ -1413,7 +1449,7 @@
         } catch(e) {}
 
         h.addEventListener('mousedown', e => {
-            if (e.target.id === 'rdsm-close' || e.target.id === 'rdsm-manual-link' || e.target.id === 'rdsm-record-btn') return;
+            if (e.target.id === 'rdsm-close' || e.target.id === 'rdsm-manual-link' || e.target.id === 'rdsm-record-btn' || e.target.id === 'rdsm-muf-btn') return;
             dr = true; el.classList.add('drag');
             sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect(); sl = r.left; st2 = r.top;
@@ -1536,7 +1572,6 @@
         syncFollowUI();
     }
 
-    // ── WebSocket connection ──────────────────────────────────
     let _wsFailToast = false;
     function connect() {
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
@@ -1561,7 +1596,6 @@
         ws.onmessage = e => onMessage(e.data);
     }
 
-    // ── DOM helpers ───────────────────────────────────────────
     const setEl   = (id, t) => { const e = document.getElementById(id); if (e) e.textContent = t; };
     const setDot  = ok => {
         const e = document.getElementById('rdsm-dot');
@@ -1569,7 +1603,6 @@
     };
     const setFlag = (id, on) => { const e = document.getElementById(id); if (e) e.className = 'rf' + (on ? ' on' : ''); };
 
-    // ── Admin detection ───────────────────────────────────────
     let isAdmin = false;
     function checkAdminMode() {
         const bodyText = document.body.textContent || document.body.innerText;
@@ -1578,7 +1611,6 @@
     }
     checkAdminMode();
 
-    // ── Entry point ───────────────────────────────────────────
     function init() {
         if (window.location.pathname === '/setup') return;
         injectCSS();
