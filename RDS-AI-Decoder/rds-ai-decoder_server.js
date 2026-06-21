@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.7)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.8)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-19      //
+//  by Highpoint                last update: 2026-06-20      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -21,7 +21,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.7',
+    version:      '2.8',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
