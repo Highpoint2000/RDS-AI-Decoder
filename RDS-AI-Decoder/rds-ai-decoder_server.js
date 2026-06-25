@@ -1,17 +1,14 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V2.8)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.0)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-20      //
+//  by Highpoint                last update: 2026-06-24      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
 ///////////////////////////////////////////////////////////////
 
 'use strict';
-
-// ── Debug switch ─────────────────────────────────────────────
-const DEBUG = false;
 
 const fs         = require('fs');
 const path       = require('path');
@@ -21,39 +18,18 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '2.8',
+    version:      '3.6',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
 
 const PLUGIN_NAME          = 'RDS AI Decoder';
-const DB_FILE              = path.join(__dirname, 'rdsm_memory.json');
 const FMDX_BULK_FILE       = path.join(__dirname, 'rdsm_fmdx_cache.json');
-const DB_SAVE_INTERVAL     = 60 * 1000;
-const MAX_STATIONS         = 2000;
-const CONF_TABLE           = [1.00, 0.90, 0.70, 0.00];
-const VOTE_HALFLIFE_DAYS   = 7;
-const VOTE_EXPIRE_DAYS     = 30;
-const STATION_EXPIRE_DAYS  = 90;
-const QUICK_EXPIRE_DAYS    = 7;
-const SPE_EXPIRE_MINUTES   = 5;
-const CONSISTENCY_BOOST    = 1.5;
-const AI_BROADCAST_DELAY   = 80; // ms
+const OLD_MEMORY_FILE      = path.join(__dirname, 'rdsm_memory.json');
 
-const FMDX_RADIUS_KM       = 3000;
-const FMDX_BULK_TTL_MS     = 6 * 60 * 60 * 1000;
+// 7 Days Cache for FMDX Database (No Radius Limits)
+const FMDX_BULK_TTL_MS     = 7 * 24 * 60 * 60 * 1000; 
 const FMDX_REINDEX_MIN_DIST_KM = 100;
-
-const PI_CONFIRM_THRESHOLD = 2;
-const GHOST_PI_THRESHOLD   = 8; // eslint-disable-line no-unused-vars
-
-const PROVISIONAL_MIN_CONF      = 0.55;
-const LOCK_MIN_CONF             = 0.90;
-const LOCK_MIN_STABLE_MS        = 700;
-const LOCK_STRONG_EVIDENCE_CONF = 0.96;
-
-const QUAL_WINDOW_SIZE   = 30;   
-const QUAL_LOCK_MIN_ZERO = 0.55; 
 
 const SPECIAL_PI_CODES = new Set(['FFFF', '0000']);
 function isSpecialPI(pi) {
@@ -66,7 +42,7 @@ let isRecording = false;
 let recordStream = null;
 let recordFileName = '';
 
-let mufMode = 'OFF'; // 'OFF', 'EU', 'NA', 'AU'
+let mufMode = 'OFF'; 
 let mufCheckInterval = null;
 let mufTriggeredRecord = false;
 
@@ -77,24 +53,10 @@ let rdsFollowLocked    = true;
 let nativeRDSDisabled  = true;
 let pluginsWss         = null;
 let pluginsMainWss     = null;
-let currentFreq        = null;
 let legacyPiCache      = null;
-let lastBroadcastPS    = null;
 
-let piConfirmCount     = 0;
-let piConfirmed        = false;
-let piPendingBroadcast = false;
-
-let psLocked = false;
-
-let nativePI = '----';
+let nativePI = '?';
 let nativePS = '        ';
-
-let lastProvisionalPS      = null;
-let provisionalFirstSeenTs = 0;
-let lastLockReason         = null;
-
-let qualWindow = [];
 
 let ownLat = null;
 let ownLon = null;
@@ -103,120 +65,63 @@ let fmdxIndexLon = null;
 
 let gpsWsClient      = null;
 let gpsWsReconnTimer = null;
-let gpsWsConnected   = false; 
 
 let fmdxByFreq   = {};
-let fmdxLoadedAt = 0;
 let fmdxByPI     = {};
-
-let db      = {};
-let dbDirty = false;
-const DB_VERSION = 2;
+let fmdxLoadedAt = 0;
 
 let currentState = {
     pi: null, freq: null,
-    rtSlots:  Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 })),
-    rtAB: -1,
-    psSegsSeen: new Set(),
     psBuf:    new Array(8).fill(' '),
     psErrBuf: new Array(8).fill(3),
-    psRoundComplete: false,
-    psRoundReceivedAfterConfirm: false,
-    lastPrediction: null,
-    tp: false, ta: false, ms: -1, stereo: false,
-    freqRefs: [],
+    psSegsSeen: new Set(),
+    rtSlots:  Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 })),
+    rtAB: -1,
+    tp: false, ta: false, ms: -1, stereo: false, pty: 0,
     afSet: new Set(),
+    ecc: null,
+    latestAi: { ps: null, conf: 0, fmdx: '', itu: '', reason: '', statusColor: '#6c757d' },
+    frozenPs: null,
+    rawAccumulatedPS: '        '
 };
 
-function getDbEntriesForFreq(freq) {
-    if (!freq) return [];
-    const rounded = roundFreq(freq);
-    const results = [];
-    for (const [pi, entry] of Object.entries(db)) {
-        if (pi === '_meta' || isSpecialPI(pi)) continue;
-        if (entry.freq === rounded) {
-            const ps = entry.psVerifiedRaw || entry.psResolved || '';
-            if (ps.trim().length > 0) {
-                results.push({
-                    pi: pi,
-                    ps: ps.trim(),
-                    seenCount: entry.seenCount || 0,
-                    pty: entry.pty,
-                    isDynamic: !!entry.psIsDynamic
-                });
-            }
-        }
-    }
-    results.sort((a, b) => b.seenCount - a.seenCount);
-    return results;
-}
-
-function roundGps(coord) {
-    return Math.round(coord * 100) / 100;
-}
+function roundGps(coord) { return Math.round(coord * 100) / 100; }
 
 function startGpsWsListener() {
     let wsPort = 8080;
     try {
         const cfgPath = path.join(__dirname, '../../config.json');
-        if (fs.existsSync(cfgPath)) {
-            const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-            wsPort = cfg?.webserver?.webserverPort || 8080;
-        }
-    } catch(e) { /* ignore */ }
-
-    const wsUrl = `ws://127.0.0.1:${wsPort}/data_plugins`;
+        if (fs.existsSync(cfgPath)) wsPort = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))?.webserver?.webserverPort || 8080;
+    } catch(e) {}
 
     function connect() {
-        if (gpsWsClient) {
-            try { gpsWsClient.removeAllListeners(); gpsWsClient.terminate(); } catch(e) {}
-            gpsWsClient = null;
-        }
-        const ws = new WebSocket(wsUrl);
-        gpsWsClient = ws;
-        ws.on('open', () => { gpsWsConnected = true; });
-        ws.on('message', (raw) => {
+        if (gpsWsClient) { try { gpsWsClient.removeAllListeners(); gpsWsClient.terminate(); } catch(e) {} }
+        gpsWsClient = new WebSocket(`ws://127.0.0.1:${wsPort}/data_plugins`);
+        gpsWsClient.on('message', (raw) => {
             try {
                 const msg = JSON.parse(raw);
-                if (msg.type === 'GPS' && msg.value) {
-                    const rawLat = parseFloat(msg.value.lat);
-                    const rawLon = parseFloat(msg.value.lon);
-                    if (!isNaN(rawLat) && !isNaN(rawLon) && msg.value.status === 'active') {
-                        const lat = roundGps(rawLat);
-                        const lon = roundGps(rawLon);
-                        ownLat = lat;
-                        ownLon = lon;
+                if (msg.type === 'GPS' && msg.value && msg.value.status === 'active') {
+                    const lat = roundGps(parseFloat(msg.value.lat));
+                    const lon = roundGps(parseFloat(msg.value.lon));
+                    ownLat = lat; ownLon = lon;
 
-                        if (fmdxLoadedAt > 0) {
-                            const needsRebuild =
-                                fmdxIndexLat === null ||
-                                fmdxIndexLon === null ||
-                                haversineKm(fmdxIndexLat, fmdxIndexLon, lat, lon) >= FMDX_REINDEX_MIN_DIST_KM;
-
-                            if (needsRebuild) {
-                                try {
-                                    const cached = JSON.parse(fs.readFileSync(FMDX_BULK_FILE, 'utf8'));
-                                    if (cached && cached.raw) {
-                                        buildFmdxIndex(cached.raw);
-                                        fmdxIndexLat = lat;
-                                        fmdxIndexLon = lon;
-                                    }
-                                } catch(e) { /* no cache yet */ }
-                            }
-                        }
+                    if (fmdxLoadedAt > 0 && (fmdxIndexLat === null || haversineKm(fmdxIndexLat, fmdxIndexLon, lat, lon) >= FMDX_REINDEX_MIN_DIST_KM)) {
+                        try {
+                            const cached = JSON.parse(fs.readFileSync(FMDX_BULK_FILE, 'utf8'));
+                            if (cached && cached.raw) { buildFmdxIndex(cached.raw); fmdxIndexLat = lat; fmdxIndexLon = lon; }
+                        } catch(e) {}
                     }
                 }
-            } catch(e) { /* ignore */ }
+            } catch(e) {}
         });
-        ws.on('close', () => { gpsWsConnected = false; scheduleGpsWsReconnect(); });
-        ws.on('error', () => { gpsWsConnected = false; scheduleGpsWsReconnect(); });
+        gpsWsClient.on('close', () => scheduleGpsWsReconnect());
+        gpsWsClient.on('error', () => scheduleGpsWsReconnect());
     }
 
     function scheduleGpsWsReconnect() {
         if (gpsWsReconnTimer) return;
         gpsWsReconnTimer = setTimeout(() => { gpsWsReconnTimer = null; connect(); }, 15000);
     }
-
     setTimeout(connect, 5000);
 }
 
@@ -225,19 +130,10 @@ function loadOwnLocation() {
         const cfgPath = path.join(__dirname, '../../config.json');
         if (fs.existsSync(cfgPath)) {
             const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-            const lat = parseFloat(cfg?.identification?.lat);
-            const lon = parseFloat(cfg?.identification?.lon);
-            if (!isNaN(lat) && !isNaN(lon)) {
-                ownLat = roundGps(lat);
-                ownLon = roundGps(lon);
-                logInfo(`[${PLUGIN_NAME}] Own location: ${ownLat}, ${ownLon}`);
-            } else {
-                logWarn(`[${PLUGIN_NAME}] No valid lat/lon in config.json – distance filter disabled`);
-            }
+            const lat = parseFloat(cfg?.identification?.lat), lon = parseFloat(cfg?.identification?.lon);
+            if (!isNaN(lat) && !isNaN(lon)) { ownLat = roundGps(lat); ownLon = roundGps(lon); }
         }
-    } catch(e) {
-        logWarn(`[${PLUGIN_NAME}] Could not read config.json for location: ${e.message}`);
-    }
+    } catch(e) {}
 }
 
 function haversineKm(lat1, lon1, lat2, lon2) {
@@ -265,41 +161,27 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
 }
 
 function roundFreq(freqStr) {
-    if (!freqStr) return freqStr;
     const f = parseFloat(freqStr);
-    if (isNaN(f)) return freqStr;
-    return (Math.round(f * 10) / 10).toFixed(2);
+    return isNaN(f) ? freqStr : (Math.round(f * 10) / 10).toFixed(2);
 }
 
 function parsePSVariants(psRaw) {
     if (!psRaw || typeof psRaw !== 'string') return [];
-    const tokens   = psRaw.split(' ').filter(t => t.length > 0);
     const variants = [];
-    for (const token of tokens) {
-        const chunk = token.slice(0, 8).padEnd(8, ' ').replace(/_/g, ' ');
-        if (chunk.trim().length > 0) variants.push(chunk);
-    }
-    if (variants.length === 0) {
-        const single = psRaw.replace(/_/g, ' ').trim().slice(0, 8).padEnd(8, ' ');
-        if (single.trim().length > 0) variants.push(single);
-    }
+    psRaw.split(' ').forEach(t => { if (t.trim()) variants.push(t.slice(0, 8).padEnd(8, '_').replace(/ /g, '_')); });
+    if (variants.length === 0) variants.push(psRaw.replace(/ /g, '_').trim().slice(0, 8).padEnd(8, '_'));
     return variants;
 }
 
 function nodeHttpGetJSON(url) {
     return new Promise((resolve, reject) => {
-        const mod = url.startsWith('https') ? require('https') : require('http');
-        const req = mod.get(url, { timeout: 60000 }, res => {
-            let body = '';
-            res.on('data', d => { body += d; });
-            res.on('end', () => { try { resolve(JSON.parse(body)); } catch(e) { reject(e); } });
+        const req = (url.startsWith('https') ? require('https') : require('http')).get(url, { timeout: 60000 }, res => {
+            let body = ''; res.on('data', d => body += d); res.on('end', () => { try { resolve(JSON.parse(body)); } catch(e) { reject(e); } });
         });
-        req.on('error',   reject);
-        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+        req.on('error', reject); req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     });
 }
 
-// ── MUF API Checker ──────────────────────────────────────────
 async function checkMUFStatus() {
     if (mufMode === 'OFF') return;
     const regionMap = { 'EU': 'europe', 'NA': 'north_america', 'AU': 'australia' };
@@ -308,90 +190,42 @@ async function checkMUFStatus() {
 
     try {
         const json = await nodeHttpGetJSON('https://fmdx.org/includes/tools/get_muf.php');
-        const regionData = json[regionKey];
-        
-        let mufActive = false;
-        if (regionData && regionData.max_frequency && regionData.max_frequency !== 'No data') {
-            const mufValue = parseFloat(regionData.max_frequency);
-            if (mufValue > 0) mufActive = true;
-        }
-
-        if (mufActive) {
-            if (!isRecording) {
-                logInfo(`[${PLUGIN_NAME}] Valid MUF detected for ${mufMode} (${regionData.max_frequency} MHz). Auto-starting recording.`);
-                mufTriggeredRecord = true;
-                startServerRecording();
-            }
-        } else {
-            if (isRecording && mufTriggeredRecord) {
-                logInfo(`[${PLUGIN_NAME}] MUF is no longer valid for ${mufMode}. Auto-stopping recording.`);
-                stopServerRecording(true); // <--- Pass true here
-            }
-        }
-    } catch (e) {
-        logWarn(`[${PLUGIN_NAME}] MUF check failed: ${e.message}`);
-    }
+        if (json[regionKey] && parseFloat(json[regionKey].max_frequency) > 0) {
+            if (!isRecording) { mufTriggeredRecord = true; startServerRecording(); }
+        } else if (isRecording && mufTriggeredRecord) { stopServerRecording(true); }
+    } catch (e) {}
 }
 
-// ── Recording Helpers ────────────────────────────────────────
 function startServerRecording() {
     if (isRecording) return;
     if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
     const d = new Date();
-    const ts = `${d.getFullYear()}${(d.getMonth()+1).toString().padStart(2,'0')}${d.getDate().toString().padStart(2,'0')}_${d.getHours().toString().padStart(2,'0')}${d.getMinutes().toString().padStart(2,'0')}${d.getSeconds().toString().padStart(2,'0')}`;
-    recordFileName = `RDS_RAW_${ts}.csv`;
-    const filePath = path.join(logDir, recordFileName);
-    recordStream = fs.createWriteStream(filePath, { flags: 'a' });
+    recordFileName = `RDS_RAW_${d.getFullYear()}${(d.getMonth()+1).toString().padStart(2,'0')}${d.getDate().toString().padStart(2,'0')}_${d.getHours().toString().padStart(2,'0')}${d.getMinutes().toString().padStart(2,'0')}${d.getSeconds().toString().padStart(2,'0')}.csv`;
+    recordStream = fs.createWriteStream(path.join(logDir, recordFileName), { flags: 'a' });
     recordStream.write('Timestamp,Frequency_MHz,PI,Block2,Block3,Block4,Errors,AI_PS,AI_Conf,FMDX_Name,ITU\n');
     isRecording = true;
-    logInfo(`[${PLUGIN_NAME}] Recording started: ${recordFileName}`);
     broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording: true, mufMode });
 }
 
 function stopServerRecording(silent = false) {
     if (!isRecording) return;
     if (recordStream) { recordStream.end(); recordStream = null; }
-    isRecording = false;
-    logInfo(`[${PLUGIN_NAME}] Recording stopped: ${recordFileName}`);
-    broadcast({ 
-        type: 'rdsm_rds_follow_state', 
-        enabled: rdsFollowMode, 
-        locked: rdsFollowLocked, 
-        isRecording: false, 
-        downloadUrl: silent ? null : `/logs/${recordFileName}`, 
-        mufMode,
-        silentStop: silent 
-    });
-    mufTriggeredRecord = false;
+    isRecording = false; mufTriggeredRecord = false;
+    broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording: false, downloadUrl: silent ? null : `/logs/${recordFileName}`, mufMode, silentStop: silent });
 }
 
-// ── FMDX loading ─────────────────────────────────────────────
 async function loadFmdxBulk() {
-    if (ownLat === null || ownLon === null) {
-        logWarn(`[${PLUGIN_NAME}] fmdx.org bulk load skipped – no location in config.json`);
-        return;
-    }
     if (fs.existsSync(FMDX_BULK_FILE)) {
         try {
             const cached = JSON.parse(fs.readFileSync(FMDX_BULK_FILE, 'utf8'));
-            const fresh  = cached._ts && (Date.now() - cached._ts) < FMDX_BULK_TTL_MS;
-            const hasRaw = cached.raw && typeof cached.raw === 'object';
-            if (fresh && hasRaw) {
-                fmdxLoadedAt = cached._ts;
-                buildFmdxIndex(cached.raw);
-                fmdxIndexLat = ownLat;
-                fmdxIndexLon = ownLon;
+            if (cached._ts && (Date.now() - cached._ts) < FMDX_BULK_TTL_MS && cached.raw) {
+                fmdxLoadedAt = cached._ts; buildFmdxIndex(cached.raw);
                 if (Object.keys(fmdxByFreq).length > 0) {
-                    logInfo(`[${PLUGIN_NAME}] fmdx.org DB restored from cache`);
-                    const remaining = FMDX_BULK_TTL_MS - (Date.now() - cached._ts);
-                    setTimeout(downloadFmdxBulk, Math.max(remaining, 60000));
+                    setTimeout(downloadFmdxBulk, Math.max(FMDX_BULK_TTL_MS - (Date.now() - cached._ts), 60000));
                     return;
                 }
-                logWarn(`[${PLUGIN_NAME}] Cache produced empty index – re-downloading`);
             }
-        } catch(e) {
-            logWarn(`[${PLUGIN_NAME}] Cache read error: ${e.message}`);
-        }
+        } catch(e) {}
     }
     await downloadFmdxBulk();
 }
@@ -399,100 +233,28 @@ async function loadFmdxBulk() {
 async function downloadFmdxBulk() {
     if (ownLat === null || ownLon === null) return;
     const url = `https://maps.fmdx.org/api/?qth=${ownLat},${ownLon}`;
-    logInfo(`[${PLUGIN_NAME}] fmdx.org downloading: ${url}`);
-    let raw;
     try {
+        let raw;
         if (typeof fetch === 'function') {
             const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             raw = await res.json();
-        } else {
-            raw = await nodeHttpGetJSON(url);
-        }
-    } catch(e) {
-        logWarn(`[${PLUGIN_NAME}] fmdx.org download failed: ${e.message} – retry in 10 min`);
-        setTimeout(downloadFmdxBulk, 10 * 60 * 1000);
-        return;
-    }
-    const locations = extractLocations(raw);
-    const txCount   = Object.keys(locations).length;
-    if (txCount === 0) {
-        logWarn(`[${PLUGIN_NAME}] fmdx.org returned empty structure – retry in 10 min`);
-        setTimeout(downloadFmdxBulk, 10 * 60 * 1000);
-        return;
-    }
-    fmdxLoadedAt = Date.now();
-    buildFmdxIndex(raw);
-    fmdxIndexLat = ownLat;
-    fmdxIndexLon = ownLon;
-    logInfo(`[${PLUGIN_NAME}] fmdx.org download complete – ${txCount} tx locations`);
-    try {
+        } else { raw = await nodeHttpGetJSON(url); }
+        
+        fmdxLoadedAt = Date.now();
+        buildFmdxIndex(raw);
+        fmdxIndexLat = ownLat; fmdxIndexLon = ownLon;
         fs.writeFileSync(FMDX_BULK_FILE, JSON.stringify({ _ts: fmdxLoadedAt, raw }), 'utf8');
-        logInfo(`[${PLUGIN_NAME}] fmdx.org DB cached to disk`);
-    } catch(e) {
-        logWarn(`[${PLUGIN_NAME}] Could not save fmdx bulk cache: ${e.message}`);
-    }
-    setTimeout(downloadFmdxBulk, FMDX_BULK_TTL_MS);
-}
-
-function extractLocations(raw) {
-    if (!raw || typeof raw !== 'object') return {};
-    if (raw.locations && typeof raw.locations === 'object' && !Array.isArray(raw.locations))
-        return raw.locations;
-    const firstVal = Object.values(raw)[0];
-    if (firstVal && Array.isArray(firstVal.stations)) return raw;
-    return {};
-}
-
-function sanitizeDatabaseWithFmdx() {
-    let cleanedCount = 0;
-    for (const [pi, entry] of Object.entries(db)) {
-        if (pi === '_meta' || isSpecialPI(pi)) continue;
-        if (entry.psVerifiedRaw) {
-            const candidate = entry.psVerifiedRaw.trim().toUpperCase();
-            const altFreqs = fmdxByPI[pi.toUpperCase()] || [];
-            if (altFreqs.length > 0) {
-                const allVariants = [];
-                altFreqs.forEach(f => { 
-                    if (f.psVariants) allVariants.push(...f.psVariants); 
-                });
-                if (allVariants.length > 0) {
-                    const isValid = allVariants.some(v => {
-                        const refStr = v.trim().toUpperCase();
-                        if (refStr === candidate) return true;
-                        if (refStr.startsWith(candidate)) return true;
-                        if (candidate.startsWith(refStr)) {
-                            if (allVariants.length === 1) return false;
-                            const suffix = candidate.substring(refStr.length);
-                            return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
-                        }
-                        return false;
-                    });
-                    if (!isValid) {
-                        entry.psVerifiedRaw   = null;
-                        entry.psVerifiedRawTs = 0;
-                        entry.ps              = {};
-                        entry.psResolved      = null;
-                        entry.psConf          = new Array(8).fill(0);
-                        dbDirty = true;
-                        cleanedCount++;
-                    }
-                }
-            }
-        }
-    }
-    if (cleanedCount > 0) {
-        logInfo(`[${PLUGIN_NAME}] Database cleanup finished. Purged ${cleanedCount} corrupted stations.`);
-        saveDB();
-    }
+        setTimeout(downloadFmdxBulk, FMDX_BULK_TTL_MS);
+    } catch(e) { setTimeout(downloadFmdxBulk, 10 * 60 * 1000); }
 }
 
 function buildFmdxIndex(raw) {
-    const byFreq     = {};
-    const byPI       = {};
-    let totalEntries = 0;
-    let skippedDist  = 0;
-    const locations  = extractLocations(raw);
+    const byFreq = {};
+    const byPI = {};
+    let locations = {};
+    if (raw.locations && typeof raw.locations === 'object' && !Array.isArray(raw.locations)) locations = raw.locations;
+    else if (Object.values(raw)[0] && Array.isArray(Object.values(raw)[0].stations)) locations = raw;
 
     for (const [txId, txData] of Object.entries(locations)) {
         if (!txData || !Array.isArray(txData.stations)) continue;
@@ -500,379 +262,96 @@ function buildFmdxIndex(raw) {
         const txLon  = parseFloat(txData.lon);
         const txName = txData.name || txId; 
         const txItu  = txData.itu  || null;
-
-        if (isNaN(txLat) || isNaN(txLon)) continue;
-        const distKm  = Math.round(haversineKm(ownLat, ownLon, txLat, txLon));
-        const azimuth = calculateBearing(ownLat, ownLon, txLat, txLon);
-
-        if (distKm > FMDX_RADIUS_KM) { skippedDist++; continue; }
+        
+        let distKm = null;
+        let azimuth = null;
+        if (!isNaN(txLat) && !isNaN(txLon) && ownLat !== null && ownLon !== null) {
+            distKm = Math.round(haversineKm(ownLat, ownLon, txLat, txLon));
+            azimuth = calculateBearing(ownLat, ownLon, txLat, txLon);
+        }
 
         for (const st of txData.stations) {
             if (!st.pi || !st.freq) continue;
-            const f       = roundFreq(String(st.freq));
-            const piUp    = st.pi.toUpperCase();
-            const piRegUp = st.pireg ? st.pireg.toUpperCase() : null;
+            const f = roundFreq(String(st.freq));
             
-            const stErp   = st.erp !== undefined ? st.erp : null;
-            const stPol   = st.pol ? st.pol.toUpperCase() : null;
-
             const entry = {
-                pi: piUp, pireg: piRegUp,
+                pi: st.pi.toUpperCase(), pireg: st.pireg ? st.pireg.toUpperCase() : null,
                 psVariants: parsePSVariants(st.ps),
                 station: st.station || txName,
                 txName: txName, itu: txItu,
-                lat: txLat, lon: txLon, distKm, azimuth,
-                erp: stErp, pol: stPol
+                distKm: distKm, azimuth: azimuth,
+                erp: st.erp !== undefined ? st.erp : null, 
+                pol: st.pol ? st.pol.toUpperCase() : null
             };
-
+            
             if (!byFreq[f]) byFreq[f] = [];
             byFreq[f].push(entry);
 
-            if (!byPI[piUp]) byPI[piUp] = [];
-            byPI[piUp].push({ freq: f, distKm, azimuth, station: entry.station,
-                txName: txName, itu: txItu, erp: stErp, pol: stPol,
-                psVariants: entry.psVariants, pireg: piRegUp });
-
-            if (piRegUp && piRegUp !== piUp) {
-                if (!byPI[piRegUp]) byPI[piRegUp] = [];
-                byPI[piRegUp].push({ freq: f, distKm, azimuth, station: entry.station,
-                    txName: txName, itu: txItu, erp: stErp, pol: stPol,
-                    psVariants: entry.psVariants, pireg: piRegUp, piMain: piUp });
-            }
-            totalEntries++;
+            if (!byPI[st.pi.toUpperCase()]) byPI[st.pi.toUpperCase()] = [];
+            byPI[st.pi.toUpperCase()].push({ ...entry, freq: f });
         }
     }
-
-    for (const f  of Object.keys(byFreq)) byFreq[f].sort((a, b) => a.distKm - b.distKm);
-    for (const pi of Object.keys(byPI))   byPI[pi].sort((a, b) => a.distKm - b.distKm);
-
+    
+    for (const f of Object.keys(byFreq)) byFreq[f].sort((a, b) => (a.distKm || 9999) - (b.distKm || 9999));
+    for (const pi of Object.keys(byPI)) byPI[pi].sort((a, b) => (a.distKm || 9999) - (b.distKm || 9999));
+    
     fmdxByFreq = byFreq;
-    fmdxByPI   = byPI;
-
-    logInfo(
-        `[${PLUGIN_NAME}] fmdx.org index built: ${totalEntries} entries on ` +
-        `${Object.keys(byFreq).length} frequencies, ` +
-        `${Object.keys(byPI).length} unique PI/PIreg codes ` +
-        `(${skippedDist} tx outside ${FMDX_RADIUS_KM} km)`
-    );
-	
-	sanitizeDatabaseWithFmdx();
+    fmdxByPI = byPI;
 }
 
-function getFreqRefs(freq) {
-    const f    = roundFreq(freq);
-    return fmdxByFreq[f] || [];
+const fmdxCache = {};
+async function fetchFmdxForFreq(freq) {
+    if (!freq || freq === '-') return null;
+    const rounded = roundFreq(freq);
+    if (fmdxByFreq[rounded] && fmdxByFreq[rounded].length > 0) return fmdxByFreq[rounded];
+    
+    if (fmdxCache[freq] && (Date.now() - fmdxCache[freq].ts < 86400000)) return fmdxCache[freq].data;
+    try {
+        const res = await fetch(`https://maps.fmdx.org/api/?freq=${freq}`, { signal: AbortSignal.timeout(10000) });
+        if (!res.ok) return null;
+        const data = await res.json();
+        
+        let searchData = data.locations ? data.locations : (data.data ? data.data : data);
+        let liveEntries = [];
+        for (const locKey in searchData) {
+            const loc = searchData[locKey];
+            if (!loc || !loc.stations) continue;
+            
+            const txLat  = parseFloat(loc.lat);
+            const txLon  = parseFloat(loc.lon);
+            let distKm = null;
+            let azimuth = null;
+            if (!isNaN(txLat) && !isNaN(txLon) && ownLat !== null && ownLon !== null) {
+                distKm = Math.round(haversineKm(ownLat, ownLon, txLat, txLon));
+                azimuth = calculateBearing(ownLat, ownLon, txLat, txLon);
+            }
+            
+            loc.stations.forEach(st => {
+                liveEntries.push({
+                    pi: st.pi.toUpperCase(), pireg: st.pireg ? st.pireg.toUpperCase() : null,
+                    psVariants: parsePSVariants(st.ps), station: st.station, txName: loc.name || locKey, itu: loc.itu || '',
+                    distKm: distKm, azimuth: azimuth, erp: st.erp !== undefined ? st.erp : null, pol: st.pol ? st.pol.toUpperCase() : null
+                });
+            });
+        }
+        fmdxCache[freq] = { ts: Date.now(), data: liveEntries };
+        return liveEntries;
+    } catch (e) { return null; }
 }
 
-function getAltFreqsForPI(pi) {
-    if (!pi || pi === '----' || pi === '?') return [];
-    return fmdxByPI[pi.toUpperCase()] || [];
-}
-
-function getAltFreqsForPIAndPS(pi, confirmedPS) {
-    const all = getAltFreqsForPI(pi);
-    if (!confirmedPS || typeof confirmedPS !== 'string' || confirmedPS.trim().length === 0)
-        return all;
-    const normConfirmed = confirmedPS.trim().toUpperCase();
-    const filtered = all.filter(item => {
-        if (!item.psVariants || item.psVariants.length === 0) return false;
-        return item.psVariants.some(v => {
-            const normV = v.trim().toUpperCase();
-            if (!normV) return false;
-            return normV === normConfirmed ||
-                   normConfirmed.startsWith(normV) ||
-                   normV.startsWith(normConfirmed);
-        });
-    });
-    return filtered.length > 0 ? filtered : all;
-}
-
-let dataHandler = null;
-try { dataHandler = require('../../server/datahandler'); }
-catch(e) { logWarn(`[${PLUGIN_NAME}] Could not load datahandler: ${e.message}`); }
-
-const RDS_CHARSET = [
-    ' ','!','"','#','¤','%','&',"'",
-    '(',')', '*','+',',','-','.','/',
-    '0','1','2','3','4','5','6','7',
-    '8','9',':',';','<','=','>','?',
-    '@','A','B','C','D','E','F','G',
-    'H','I','J','K','L','M','N','O',
-    'P','Q','R','S','T','U','V','W',
-    'X','Y','Z','[','\\',']','―','_',
-    '‖','a','b','c','d','e','f','g',
-    'h','i','j','k','l','m','n','o',
-    'p','q','r','s','t','u','v','w',
-    'x','y','z','{','|','}','¯',' ',
-    'á','à','é','è','í','ì','ó','ò',
-    'ú','ù','Ñ','Ç','Ş','β','¡','Ĳ',
-    'â','ä','ê','ë','î','ï','ô','ö',
-    'û','ü','ñ','ç','ş','ǧ','ı','ĳ',
-    'ª','α','©','‰','Ǧ','ě','ň','ő',
-    'π','€','£','$','←','↑','→','↓',
-    'º','¹','²','³','±','İ','ń','ű',
-    'µ','¿','÷','°','¼','½','¾','§',
-    'Á','À','É','È','Í','Ì','Ó','Ò',
-    'Ú','Ù','Ř','Č','Š','Ž','Ð','Ŀ',
-    'Â','Ä','Ê','Ë','Î','Ï','Ô','Ö',
-    'Û','Ü','ř','č','š','ž','đ','ŀ',
-    'Ã','Å','Æ','Œ','ŷ','Ý','Õ','Ø',
-    'Þ','Ŋ','Ŕ','Ć','Ś','Ź','Ŧ','ð',
-    'ã','å','æ','œ','ŵ','ý','õ','ø',
-    'þ','ŋ','ŕ','ć','ś','ź','ŧ',' ',
-];
-
-function rdsChar(b) {
-    if (b === 0x0D) return '\r';
-    if (b < 0x20)  return ' ';
-    return RDS_CHARSET[b - 0x20] || ' ';
-}
-
-function decodeAFCode(code) {
-    if (code >= 1 && code <= 204) return (code + 875) / 10;
-    return null;
-}
-
-const RDS_COUNTRY = (() => {
-    const T = {
-        0xE0: { 0x1:'DE', 0x2:'DZ', 0x3:'AD', 0x4:'IL', 0x5:'IT',
-                0x6:'BE', 0x7:'RU', 0x8:'PS', 0x9:'AL', 0xA:'AT',
-                0xB:'HU', 0xC:'MT', 0xD:'DE', 0xF:'EG' },
-        0xE1: { 0x1:'GR', 0x2:'CY', 0x3:'SM', 0x4:'CH', 0x5:'JO',
-                0x6:'FI', 0x7:'LU', 0x8:'BG', 0x9:'DK', 0xA:'GI',
-                0xB:'IQ', 0xC:'GB', 0xD:'LY', 0xE:'RO', 0xF:'FR' },
-        0xE2: { 0x1:'MA', 0x2:'CZ', 0x3:'PL', 0x4:'VA', 0x5:'SK',
-                0x6:'SY', 0x7:'TN', 0x9:'LI', 0xA:'IS',
-                0xB:'MC', 0xC:'LT', 0xD:'RS', 0xE:'ES', 0xF:'NO' },
-        0xE3: { 0x1:'ME', 0x2:'IE', 0x3:'TR', 0x5:'TJ',
-                0x8:'NL', 0x9:'LV', 0xA:'LB', 0xB:'AZ',
-                0xC:'HR', 0xD:'KZ', 0xE:'SE', 0xF:'BY' },
-        0xE4: { 0x1:'MD', 0x2:'EE', 0x3:'MK',
-                0x6:'UA', 0x7:'XK',
-                0x8:'PT', 0x9:'SI',
-                0xA:'AM', 0xB:'UZ', 0xC:'GE',
-                0xE:'TM', 0xF:'BA' },
-        0xE5: { 0x3:'KG' },
-    };
-    const NAMES = {
-        'DE':'Germany',         'DZ':'Algeria',         'AD':'Andorra',
-        'IL':'Israel',          'IT':'Italy',            'BE':'Belgium',
-        'RU':'Russia',          'PS':'Palestine',        'AL':'Albania',
-        'AT':'Austria',         'HU':'Hungary',          'MT':'Malta',
-        'EG':'Egypt',           'GR':'Greece',           'CY':'Cyprus',
-        'SM':'San Marino',      'CH':'Switzerland',      'JO':'Jordan',
-        'FI':'Finland',         'LU':'Luxembourg',       'BG':'Bulgaria',
-        'DK':'Denmark',         'GI':'Gibraltar',        'IQ':'Iraq',
-        'GB':'United Kingdom',  'LY':'Libya',            'RO':'Romania',
-        'FR':'France',          'MA':'Morocco',          'CZ':'Czech Republic',
-        'PL':'Poland',          'VA':'Vatican',          'SK':'Slovakia',
-        'SY':'Syria',           'TN':'Tunisia',          'LI':'Liechtenstein',
-        'IS':'Iceland',         'MC':'Monaco',           'LT':'Lithuania',
-        'RS':'Serbia',          'ES':'Spain',            'NO':'Norway',
-        'ME':'Montenegro',      'IE':'Ireland',          'TR':'Turkey',
-        'TJ':'Tajikistan',      'NL':'Netherlands',      'LV':'Latvia',
-        'LB':'Lebanon',         'AZ':'Azerbaijan',       'HR':'Croatia',
-        'KZ':'Kazakhstan',      'SE':'Sweden',           'BY':'Belarus',
-        'MD':'Moldova',         'EE':'Estonia',          'MK':'North Macedonia',
-        'UA':'Ukraine',         'PT':'Portugal',         'SI':'Slovenia',
-        'AM':'Armenia',         'UZ':'Uzbekistan',       'GE':'Georgia',
-        'TM':'Turkmenistan',    'BA':'Bosnia',           'KG':'Kyrgyzstan',
-        'XK':'Kosovo',
-    };
-    return { T, NAMES };
-})();
-
-function lookupCountry(pi, eccByte) {
-    if (!pi || pi === '?' || pi === '----') return null;
-    if (!eccByte || eccByte === 0) return null;
-    const piNibble = (parseInt(pi, 16) >> 12) & 0xF;
-    if (piNibble === 0) return null;
-    const eccMap = RDS_COUNTRY.T[eccByte];
-    if (!eccMap) return null;
-    const iso = eccMap[piNibble];
-    if (!iso) return null;
-    return { iso, name: RDS_COUNTRY.NAMES[iso] || iso };
-}
-
-function isPSStringClean(ps) {
-    if (!ps || typeof ps !== 'string') return false;
-    for (let i = 0; i < ps.length; i++) {
-        const code = ps.charCodeAt(i);
-        if (code < 0x20) return false;
-        if (code >= 0x7F && code < 0xA0) return false;
-    }
-    return true;
-}
-
-function updateQualWindow(errB) {
-    const zeroCount = errB.filter(e => e === 0).length;
-    qualWindow.push(zeroCount);
-    if (qualWindow.length > QUAL_WINDOW_SIZE) qualWindow.shift();
-}
-
-function recentZeroErrFraction() {
-    if (qualWindow.length === 0) return 0;
-    const totalSlots = qualWindow.length * 4;
-    const zeroSlots  = qualWindow.reduce((s, n) => s + n, 0);
-    return zeroSlots / totalSlots;
-}
-
-function qualityAllowsLock() {
-    if (qualWindow.length < 5) return false;
-    return recentZeroErrFraction() >= QUAL_LOCK_MIN_ZERO;
-}
-
-function eccCountryMultiplier(refEntry) {
-    if (!refEntry) return 1.0;
-    if (!piConfirmed) return 1.0;
-    const pi      = currentState.pi;
-    const dbEntry = (pi && !isSpecialPI(pi)) ? db[pi] : null;
-    if (!dbEntry?.ecc) return 1.0;
-
-    const eccByte    = parseInt(dbEntry.ecc, 16);
-    const currentISO = (() => {
-        const c = lookupCountry(pi, eccByte);
-        return c ? c.iso : null;
-    })();
-    if (!currentISO) return 1.0;
-
-    const refCountry = lookupCountry(refEntry.pi, eccByte);
-    if (refCountry && refCountry.iso === currentISO) return 1.0;
-
-    return 0.5;
-}
-
-function computeAFCoverage(pi) {
-    if (!pi || isSpecialPI(pi)) return 0;
-    const altFreqs = getAltFreqsForPI(pi);
-    if (altFreqs.length === 0) return 0;
-
-    const dbFreqs = new Set(altFreqs.map(item => parseFloat(item.freq).toFixed(1)));
-    if (dbFreqs.size === 0) return 0;
-
-    const receivedFreqSet = new Set();
-    for (const f of currentState.afSet)
-        receivedFreqSet.add(parseFloat(f).toFixed(1));
-    if (currentState.freq)
-        receivedFreqSet.add(parseFloat(currentState.freq).toFixed(1));
-
-    let matched = 0;
-    for (const dbFreq of dbFreqs) {
-        if (receivedFreqSet.has(dbFreq)) matched++;
-    }
-    return Math.min(1, matched / dbFreqs.size);
-}
+const RDS_CHARSET = [' ','!','"','#','¤','%','&',"'",'(',')','*','+',',','-','.','/','0','1','2','3','4','5','6','7','8','9',':',';','<','=','>','?','@','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z','[','\\',']','―','_','‖','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z','{','|','}','¯',' ','á','à','é','è','í','ì','ó','ò','ú','ù','Ñ','Ç','Ş','β','¡','Ĳ','â','ä','ê','ë','î','ï','ô','ö','û','ü','ñ','ç','ş','ǧ','ı','ĳ','ª','α','©','‰','Ǧ','ě','ň','ő','π','€','£','$','←','↑','→','↓','º','¹','²','³','±','İ','ń','ű','µ','¿','÷','°','¼','½','¾','§','Á','À','É','È','Í','Ì','Ó','Ò','Ú','Ù','Ř','Č','Š','Ž','Ð','Ŀ','Â','Ä','Ê','Ë','Î','Ï','Ô','Ö','Û','Ü','ř','č','š','ž','đ','ŀ','Ã','Å','Æ','Œ','ŷ','Ý','Õ','Ø','Þ','Ŋ','Ŕ','Ć','Ś','Ź','Ŧ','ð','ã','å','æ','œ','ŵ','ý','õ','ø','þ','ŋ','ŕ','ć','ś','ź','ŧ',' '];
+function rdsChar(b) { return b === 0x0D ? '\r' : (b < 0x20 ? ' ' : (RDS_CHARSET[b - 0x20] || ' ')); }
+function decodeAFCode(code) { return (code >= 1 && code <= 204) ? (code + 875) / 10 : null; }
 
 function countCleanRawPositions() {
     let n = 0;
     for (let i = 0; i < 8; i++) {
-        const e = currentState.psErrBuf?.[i] ?? 3;
-        if (e <= 1) n++;
+        if ((currentState.psErrBuf[i] ?? 3) <= 1) n++;
     }
     return n;
 }
 
-function computeStationConfidence(pi) {
-    if (!pi || pi === '----' || pi === '?') return 0;
-    if (isSpecialPI(pi)) return 0.8;
-
-    const entry = db[pi] || null;
-    const ref   = findRefEntry(pi);
-
-    const cleanRawPos = countCleanRawPositions();
-    const rawFactor   = Math.min(1, cleanRawPos / 8);
-
-    const livePS = currentState.psBuf.join('');
-    if (cleanRawPos === 8 && entry?.psVerifiedRaw === livePS) {
-        return 1.0; 
-    }
-
-    const baseRefScore = computeRefMatchScore(pi);
-    const eccMult      = ref ? eccCountryMultiplier(ref) : 1.0;
-    const refFactor    = ref ? (baseRefScore * eccMult) : 0;
-
-    const votedAvg = entry?.psConf
-        ? entry.psConf.reduce((a, b) => a + b, 0) / 8
-        : 0;
-
-    const afterConfirmBonus = currentState.psRoundReceivedAfterConfirm ? 0.10 : 0.0;
-    const dynamicPenalty    = (entry?.psIsDynamic || (ref?.psVariants?.length > 1)) ? 0.15 : 0.0;
-
-    let eccAdjust = 0.0;
-    if (entry?.ecc && ref && piConfirmed) {
-        eccAdjust = eccMult >= 1.0 ? +0.08 : -0.15;
-    }
-
-    const afCoverage      = computeAFCoverage(pi);
-    const afCoverageBonus = afCoverage >= 0.5 ? afCoverage * 0.10 : 0.0;
-
-    let conf = (rawFactor * 0.42) +
-               (refFactor * 0.33) +
-               (votedAvg  * 0.18) +
-               afterConfirmBonus +
-               afCoverageBonus +
-               eccAdjust -
-               dynamicPenalty;
-
-    if (cleanRawPos === 8 && conf < 0.95) {
-        conf += 0.10;
-    }
-
-    return Math.min(1, Math.max(0, conf));
-}
-
-function computeProvisionalPS(pi) {
-    if (!pi || pi === '----' || pi === '?') return null;
-    if (psLocked && lastBroadcastPS)
-        return lastBroadcastPS.padEnd(8, ' ').slice(0, 8);
-
-    const entry = (!isSpecialPI(pi) && db[pi]) ? db[pi] : null;
-    const ref   = findRefEntry(pi);
-
-    if (entry?.psVerifiedRaw && isPSStringClean(entry.psVerifiedRaw) &&
-        entry.psVerifiedRaw.trim().length > 0)
-        return entry.psVerifiedRaw.padEnd(8, ' ').slice(0, 8);
-
-    if (ref?.psVariants?.length) {
-        let bestVariant = ref.psVariants[0];
-        let bestScore   = 0;
-        const psUpper   = currentState.psBuf.join('').toUpperCase();
-        for (const v of ref.psVariants) {
-            const rv = v.toUpperCase().padEnd(8, ' ');
-            const pb = psUpper.padEnd(8, ' ');
-            let m = 0, c = 0;
-            for (let i = 0; i < 8; i++) {
-                if ((currentState.psErrBuf[i] ?? 3) <= 1 && rv[i] !== ' ') {
-                    c++;
-                    if (rv[i] === pb[i]) m++;
-                }
-            }
-            const s = c > 0 ? (m / c) : 0;
-            if (s > bestScore) { bestScore = s; bestVariant = v; }
-        }
-        let hybrid = '';
-        const refStr = bestVariant.padEnd(8, ' ');
-        for (let i = 0; i < 8; i++) {
-            const rawChar = currentState.psBuf[i] || ' ';
-            const rawErr  = currentState.psErrBuf[i] ?? 3;
-            const refChar = refStr[i] || ' ';
-            hybrid += (rawErr <= 1 && rawChar !== ' ' &&
-                       rawChar.toUpperCase() === refChar.toUpperCase())
-                ? rawChar : refChar;
-        }
-        return hybrid.padEnd(8, ' ').slice(0, 8);
-    }
-
-    if (entry?.psResolved && entry.psResolved.trim().length > 0)
-        return entry.psResolved.padEnd(8, ' ').slice(0, 8);
-
-    if (countCleanRawPositions() >= 4 && currentState.psRoundReceivedAfterConfirm)
-        return currentState.psBuf.join('').padEnd(8, ' ').slice(0, 8);
-
-    return null;
-}
-
-function calculatePropagationScore(ref, dbEntry) {
+function calculatePropagationScore(ref) {
     if (!ref) return 0;
     const distKm = ref.distKm || 9999;
     let distScore = 0;
@@ -880,7 +359,9 @@ function calculatePropagationScore(ref, dbEntry) {
     if (distKm <= 100) distScore = 100;
     else if (distKm <= 300) distScore = 80;
     else if (distKm <= 800) distScore = 40; 
-    else if (distKm <= 2500) distScore = 20; 
+    else if (distKm <= 2500) {
+        distScore = mufTriggeredRecord ? 60 : 20; 
+    }
     else distScore = 5;
     
     const erp = ref.erp || 0.1; 
@@ -890,7 +371,7 @@ function calculatePropagationScore(ref, dbEntry) {
     if (ref.txName) {
         let sharedSites = 0;
         for (const f of currentState.afSet) {
-            const freqRefs = getFreqRefs(f);
+            const freqRefs = fmdxByFreq[parseFloat(f).toFixed(2)] || [];
             if (freqRefs.some(r => r.txName === ref.txName)) {
                 sharedSites++;
             }
@@ -901,1885 +382,516 @@ function calculatePropagationScore(ref, dbEntry) {
     let spEBonus = 0;
     if (distKm > 800 && distKm < 2500) {
         const cleanCount = countCleanRawPositions();
-        if (cleanCount >= 4) spEBonus = 20;
+        if (cleanCount >= 4) spEBonus = mufTriggeredRecord ? 40 : 20; 
     }
     
-    let histBonus = 0;
-    if (dbEntry && dbEntry.seenCount > 10) {
-        histBonus = 15;
-    }
-    
-    return distScore + pwrScore + siteBonus + spEBonus + histBonus;
+    return distScore + pwrScore + siteBonus + spEBonus;
 }
 
-function findBestRefEntry(pi) {
-    if (!currentState.freqRefs || !pi || !currentState.freq) return null;
-    if (isSpecialPI(pi)) return null;
-    const piUp = pi.toUpperCase();
-    const dbEntry = db[pi];
+async function runLocalAiPrediction(pi) {
+    if (!currentState.freq || currentState.freq === '-') return;
 
-    let candidates = currentState.freqRefs.filter(r => r.pi === piUp);
-    if (candidates.length === 0) {
-        candidates = currentState.freqRefs.filter(r => r.pireg && r.pireg === piUp);
-    }
-
-    if (candidates.length === 0) return null;
-
-    const livePSUpper = currentState.psBuf.join('').toUpperCase().padEnd(8, ' ');
-    const cleanPositions = currentState.psBuf.map((_, i) => ((currentState.psErrBuf[i] ?? 3) <= 1));
-    const memPS = (dbEntry && dbEntry.psVerifiedRaw) ? dbEntry.psVerifiedRaw.trim().toUpperCase() : null;
-
-    if (candidates.length === 1) {
-        const cand = candidates[0];
-        const cleanCharsCount = cleanPositions.filter(Boolean).length;
-        
-        if (cleanCharsCount >= 2 && cand.psVariants && cand.psVariants.length > 0) {
-            let bestNetScore = -99;
-            for (const v of cand.psVariants) {
-                const rv = v.toUpperCase().padEnd(8, ' ');
-                let matchPts = 0; 
-                let mismatchPts = 0;
-                
-                for (let i = 0; i < 8; i++) {
-                    if (cleanPositions[i] && rv[i] !== ' ' && livePSUpper[i] !== ' ') {
-                        if (rv[i] === livePSUpper[i]) matchPts++;
-                        else mismatchPts++;
-                    }
-                }
-                const netScore = matchPts - mismatchPts;
-                if (netScore > bestNetScore) bestNetScore = netScore;
-            }
-            if (bestNetScore < 0) {
-                return null; 
-            }
-        }
-        return cand;
-    }
-
-    const liveAFs = Array.from(currentState.afSet);
-    const now = Date.now();
-    const activeAzimuths = [];
-    const activeItus = new Set();
-    
-    for (const [key, e] of Object.entries(db)) {
-        if (key === '_meta' || isSpecialPI(key) || key === piUp) continue;
-        if ((now - (e.seen || 0)) < 5 * 60000) { 
-            const refs = fmdxByPI[key];
-            if (refs && refs.length > 0) {
-                if (refs[0].itu) activeItus.add(refs[0].itu);
-                if (refs[0].azimuth !== undefined) activeAzimuths.push(refs[0].azimuth);
-            }
-        }
-    }
-
-    let bestCandidate = null;
-    let highestScore = -1;
-    
-    for (const cand of candidates) {
-        let score = calculatePropagationScore(cand, dbEntry); 
-        
-        let afMatches = 0;
-        if (liveAFs.length > 0) {
-            for (const af of liveAFs) {
-                const afRefs = getFreqRefs(af);
-                if (afRefs.some(r => r.pi === piUp && (r.station === cand.station || r.txName === cand.txName))) {
-                    afMatches++;
-                }
-            }
-        }
-        score += (afMatches * 100); 
-        
-        let maxPsScore = 0;
-        if (cand.psVariants && cand.psVariants.length > 0) {
-            for (const v of cand.psVariants) {
-                const rv = v.toUpperCase().padEnd(8, ' ');
-                let matchPts = 0; 
-                let mismatchPts = 0;
-                for (let i = 0; i < 8; i++) {
-                    if (cleanPositions[i] && rv[i] !== ' ') {
-                        if (rv[i] === livePSUpper[i]) matchPts++;
-                        else mismatchPts++;
-                    }
-                }
-                const netPsScore = matchPts - mismatchPts;
-                if (netPsScore > maxPsScore) maxPsScore = netPsScore;
-            }
-        }
-        if (maxPsScore > 0) score += (maxPsScore * 30); 
-
-        if (cand.distKm < 800 && memPS && cand.psVariants && cand.psVariants.length > 0) {
-            const isMatch = cand.psVariants.some(v => {
-                const rv = v.trim().toUpperCase();
-                return rv === memPS || memPS.startsWith(rv) || rv.startsWith(memPS);
-            });
-            if (isMatch) score += 2000; 
-        }
-
-        if (cand.distKm > 800) {
-            if (activeItus.has(cand.itu)) {
-                score += 800; 
-            }
-            let azMatch = false;
-            for (const activeAz of activeAzimuths) {
-                let diff = Math.abs(cand.azimuth - activeAz);
-                if (diff > 180) diff = 360 - diff;
-                if (diff <= 40) { azMatch = true; break; }
-            }
-            if (azMatch) score += 800;
-        }
-        
-        if (score > highestScore) {
-            highestScore = score;
-            bestCandidate = cand;
-        }
-    }
-    
-    return bestCandidate;
-}
-
-function findRefEntry(pi) { return findBestRefEntry(pi); }
-
-function computeRefMatchScore(pi) {
-    if (isSpecialPI(pi)) return 0;
-    const ref  = findRefEntry(pi);
-    if (!ref?.psVariants?.length) return 0;
-    const buf  = currentState.psBuf;
-    const errB = currentState.psErrBuf || new Array(8).fill(3);
-    const cleanPositions = buf.map((_, i) => errB[i] <= 1);
-    const cleanCount     = cleanPositions.filter(Boolean).length;
-
-    let best = 0;
-    if (cleanCount < 2) {
-        const entry = db[pi];
-        if (!entry?.psResolved) return 0;
-        const resolved = entry.psResolved.toUpperCase().padEnd(8, ' ');
-        for (const variant of ref.psVariants) {
-            const rv = variant.toUpperCase().padEnd(8, ' ');
-            let m = 0, c = 0;
-            for (let i = 0; i < 8; i++) { c++; if (rv[i] === resolved[i]) m++; }
-            const s = c > 0 ? m / c : 0;
-            if (s > best) best = s;
-        }
-    } else {
-        for (const variant of ref.psVariants) {
-            const rv = variant.toUpperCase().padEnd(8, ' ');
-            let m = 0, c = 0;
-            for (let i = 0; i < 8; i++) {
-                if (!cleanPositions[i]) continue;
-                c++;
-                if (rv[i] === (buf[i] || ' ').toUpperCase()) m++;
-            }
-            const s = c > 0 ? m / c : 0;
-            if (s > best) best = s;
-        }
-    }
-
-    return best * eccCountryMultiplier(ref);
-}
-
-function isPIAllowed(pi) {
-    if (!pi || pi === '----') return false;
-    if (isSpecialPI(pi)) return true;
-    return true;
-}
-
-function getConfirmThreshold(pi) {
-        if (isSpecialPI(pi)) return PI_CONFIRM_THRESHOLD;
-        const refs = currentState.freqRefs;
-
-        let threshold = 4; 
-        
-        if (refs && refs.length > 0) {
-            const piUp   = pi ? pi.toUpperCase() : '';
-            const inFmdx = refs.some(r => r.pi === piUp || (r.pireg && r.pireg === piUp));
-            
-            if (!inFmdx) {
-                threshold = 6; 
-            } else {
-                const ref = findRefEntry(pi);
-                const distKm = ref?.distKm ?? 9999;
-                
-                if (distKm < 300) threshold = 2;      
-                else if (distKm > 800) threshold = 6; 
-            }
-        } else {
-            threshold = 6; 
-        }
-
-    let evidenceScore = 0;
-    const entry = db[pi];
-    if (entry?.ecc)                        evidenceScore++;
-    if (entry?.af && entry.af.length >= 2) evidenceScore++;
-    if (recentZeroErrFraction() >= 0.75)   evidenceScore++;
-    
-    const cleanChars = countCleanRawPositions();
-    if (cleanChars >= 1) evidenceScore += 2; 
-    if (cleanChars >= 4) evidenceScore += 2;
-
-    threshold = Math.max(1, threshold - Math.floor(evidenceScore / 2));
-    return threshold;
-}
-
-function loadDB() {
-    try {
-        if (fs.existsSync(DB_FILE)) {
-            const raw = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-            
-            if (!raw._meta || raw._meta.dbVersion !== DB_VERSION) {
-                logInfo(`[${PLUGIN_NAME}] Database version mismatch. Performing one-time wipe to version ${DB_VERSION}.`);
-                
-                let preservedFollowMode = true;
-                let preservedFollowLocked = true;
-                
-                if (raw._meta) {
-                    if (typeof raw._meta.rdsFollowMode === 'boolean') preservedFollowMode = raw._meta.rdsFollowMode;
-                    if (typeof raw._meta.rdsFollowLocked === 'boolean') preservedFollowLocked = raw._meta.rdsFollowLocked;
-                }
-                
-                rdsFollowMode     = preservedFollowMode;
-                nativeRDSDisabled = preservedFollowMode;
-                rdsFollowLocked   = preservedFollowLocked;
-                
-                db = { _meta: { rdsFollowMode: preservedFollowMode, rdsFollowLocked: preservedFollowLocked, dbVersion: DB_VERSION } };
-                dbDirty = true;
-                saveDB();
-                return; 
-            }
-
-            if (raw._meta && typeof raw._meta === 'object') {
-                if (typeof raw._meta.rdsFollowMode === 'boolean') {
-                    rdsFollowMode     = raw._meta.rdsFollowMode;
-                    nativeRDSDisabled = rdsFollowMode;
-                }
-                if (typeof raw._meta.rdsFollowLocked === 'boolean') {
-                    rdsFollowLocked = raw._meta.rdsFollowLocked;
-                }
-            }
-            
-            for (const [pi, entry] of Object.entries(raw)) {
-                if (pi === '_meta') continue;
-                if (isSpecialPI(pi)) { delete raw[pi]; continue; }
-                delete entry.rt; delete entry.rtLast; delete entry.psDynamicBuf;
-                
-                if (entry.ps && typeof entry.ps === 'object') {
-                    for (const [posKey, posData] of Object.entries(entry.ps)) {
-                        if (!posData || typeof posData !== 'object') continue;
-                        if (posData.votes && typeof posData.votes === 'object') {
-                            const migrated = {};
-                            for (const [ch, arr] of Object.entries(posData.votes)) {
-                                if (!Array.isArray(arr) || arr.length === 0) continue;
-                                const totalW = arr.reduce((s, e) => s + (e.w || 0), 0);
-                                const times  = arr.map(e => e.ts || 0).filter(Boolean);
-                                migrated[ch] = {
-                                    w: totalW, count: arr.length,
-                                    firstSeen: times.length ? Math.min(...times) : Date.now(),
-                                    lastSeen:  times.length ? Math.max(...times) : Date.now(),
-                                };
-                            }
-                            raw[pi].ps[posKey] = migrated;
-                        }
-                    }
-                }
-                if (entry.freq) entry.freq = roundFreq(entry.freq);
-                if (!Array.isArray(entry.af)) entry.af = [];
-                if (entry.psVerifiedRaw && !isPSStringClean(entry.psVerifiedRaw)) {
-                    entry.psVerifiedRaw = null; entry.psVerifiedRawTs = 0;
-                }
-            }
-            db = raw;
-            logInfo(`[${PLUGIN_NAME}] AI memory loaded: ${Object.keys(db).filter(k => k !== '_meta').length} stations`);
-        } else {
-            db = { _meta: { rdsFollowMode: true, rdsFollowLocked: true, dbVersion: DB_VERSION } };
-            logInfo(`[${PLUGIN_NAME}] AI memory: new database file created`);
-        }
-    } catch(e) {
-        logWarn(`[${PLUGIN_NAME}] Could not load AI DB: ${e.message} – starting fresh`);
-        db = { _meta: { rdsFollowMode: true, rdsFollowLocked: true, dbVersion: DB_VERSION } };
-    }
-}
-
-function saveDB() {
-    if (!dbDirty) return;
-    try {
-        const now           = Date.now();
-        const expireMs      = STATION_EXPIRE_DAYS * 86400000;
-        const quickExpireMs = QUICK_EXPIRE_DAYS   * 86400000;
-        const toSave        = {};
-        toSave._meta = { rdsFollowMode, rdsFollowLocked, savedAt: now, dbVersion: DB_VERSION };
-        for (const [pi, entry] of Object.entries(db)) {
-            if (pi === '_meta') continue;
-            if (isSpecialPI(pi)) continue;
-            
-            const ageMs = now - (entry.seen || 0);
-            
-            const isSpE = entry.distKm !== undefined && entry.distKm >= 800;
-            const speExpireMs = SPE_EXPIRE_MINUTES * 60000;
-            if (isSpE && ageMs > speExpireMs) continue;
-
-            if (!isSpE && ageMs > expireMs) continue;
-
-            const hasPS     = entry.ps && Object.keys(entry.ps).length > 0;
-            const hasUseful = hasPS || entry.ecc || (entry.pty > 0) ||
-                              (Array.isArray(entry.af) && entry.af.length > 0);
-            if (!hasUseful && (entry.seenCount || 0) <= 2 &&
-                (now - (entry.seen || 0)) > quickExpireMs) continue;
-            if (entry.psVerifiedRaw && !isPSStringClean(entry.psVerifiedRaw)) {
-                entry.psVerifiedRaw = null; entry.psVerifiedRawTs = 0;
-            }
-            const { psDynamicBuf, ...saveable } = entry; 
-            toSave[pi] = saveable;
-        }
-        const stationKeys = Object.keys(toSave).filter(k => k !== '_meta');
-        if (stationKeys.length > MAX_STATIONS) {
-            stationKeys.sort((a, b) => (toSave[a].seen || 0) - (toSave[b].seen || 0))
-                       .slice(0, stationKeys.length - MAX_STATIONS)
-                       .forEach(k => delete toSave[k]);
-        }
-        fs.writeFileSync(DB_FILE, JSON.stringify(toSave), 'utf8');
-        dbDirty = false;
-    } catch(e) {
-        logError(`[${PLUGIN_NAME}] Could not save AI DB: ${e.message}`);
-    }
-}
-
-setInterval(saveDB, DB_SAVE_INTERVAL);
-process.on('SIGINT',  () => { saveDB(); if (recordStream) recordStream.end(); process.exit(0); });
-process.on('SIGTERM', () => { saveDB(); if (recordStream) recordStream.end(); process.exit(0); });
-process.on('exit',    () => { try { saveDB(); if (recordStream) recordStream.end(); } catch(e) {} });
-
-function ensurePI(pi) {
-    if (!db[pi]) {
-        db[pi] = {
-            freq: null, ps: {},
-            psResolved: null, psConf: new Array(8).fill(0),
-            psIsDynamic: false,
-            psLastRaw: new Array(8).fill(null), psLastRawTs: 0,
-            pty: -1, tp: false, ta: false, ms: -1, stereo: false,
-            ecc: null, af: [], seen: Date.now(), seenCount: 0,
-        };
-        Object.defineProperty(db[pi], 'psDynamicBuf', {
-            value: [], writable: true, enumerable: false, configurable: true,
-        });
-    } else {
-        if (!db[pi].psDynamicBuf)
-            Object.defineProperty(db[pi], 'psDynamicBuf', {
-                value: [], writable: true, enumerable: false, configurable: true,
-            });
-        if (!Array.isArray(db[pi].af)) db[pi].af = [];
-    }
-    return db[pi];
-}
-
-function findKnownPIForFreq(freq) {
-    if (!freq) return null;
-    const rounded = roundFreq(freq);
-    let bestPI = null, bestScore = 0;
-    for (const [pi, entry] of Object.entries(db)) {
-        if (pi === '_meta') continue;
-        if (isSpecialPI(pi)) continue;
-        if (entry.freq !== rounded) continue;
-        const resolved = entry.psResolved || '';
-        if (resolved.trim().length < 1) continue;
-        const avgConf = entry.psConf ? entry.psConf.reduce((a, b) => a + b, 0) / 8 : 0;
-        const score   = Math.log10(Math.max(1, entry.seenCount)) * 0.5 + avgConf * 0.5;
-        if (score > bestScore) { bestScore = score; bestPI = pi; }
-    }
-    return bestPI;
-}
-
-function cacheAF(pi, freqMHz) {
-    if (isSpecialPI(pi) || freqMHz === null || freqMHz === undefined) return;
-    const entry   = ensurePI(pi);
-    const rounded = Math.round(freqMHz * 10) / 10;
-    if (!entry.af.includes(rounded)) {
-        entry.af.push(rounded);
-        entry.af.sort((a, b) => a - b);
-        dbDirty = true;
-    }
-}
-
-function votePS(pi, pos, char, weight, errLevel) {
-    if (!pi || pi === '----' || !char || char < ' ') return;
-    if (isSpecialPI(pi)) return;
-    if (errLevel > 1) return;
-    const entry = ensurePI(pi);
-    if (entry.psIsDynamic) {
-        entry.psLastRaw[pos] = char;
-        entry.psLastRawTs    = Date.now();
-        dbDirty = true;
+    if (isSpecialPI(pi)) {
+        let rawPS = currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
+        currentState.latestAi = { ps: rawPS, conf: 100, fmdx: 'Special PI', itu: '', reason: `DB bypassed for special PI ${pi}.`, statusColor: '#6c757d' };
         return;
     }
-    if (!entry.ps[pos]) entry.ps[pos] = {};
-    const posVotes = entry.ps[pos];
-    const now      = Date.now();
-    const halfMs   = VOTE_HALFLIFE_DAYS * 86400000;
-    for (const [ch, v] of Object.entries(posVotes)) {
-        const ageMs = now - (v.lastSeen || now);
-        v.w        = v.w * Math.pow(0.5, ageMs / halfMs);
-        v.lastSeen = now;
-        if (v.w < 0.1 && v.count < 3) delete posVotes[ch];
-    }
-    let finalWeight = weight;
-    if (posVotes[char] && posVotes[char].w > 0) {
-        const competitorW = Object.entries(posVotes)
-            .filter(([ch]) => ch !== char)
-            .reduce((s, [, v]) => s + v.w, 0);
-        if (posVotes[char].w > competitorW * 2) finalWeight = weight * CONSISTENCY_BOOST;
-    }
-    if (!posVotes[char])
-        posVotes[char] = { w: 0, count: 0, firstSeen: now, lastSeen: now };
-    posVotes[char].w       += finalWeight;
-    posVotes[char].count   += 1;
-    posVotes[char].lastSeen = now;
-    entry.psResolved = resolvePS(pi);
-    entry.psConf     = computePSConf(pi);
-    dbDirty = true;
-}
 
-function getWeightedVotes(posVotes) {
-    if (!posVotes || typeof posVotes !== 'object') return {};
-    const now    = Date.now();
-    const halfMs = VOTE_HALFLIFE_DAYS * 86400000;
-    const expMs  = VOTE_EXPIRE_DAYS   * 86400000;
-    const result = {};
-    for (const [ch, v] of Object.entries(posVotes)) {
-        const ageMs = now - (v.lastSeen || now);
-        if (ageMs > expMs) continue;
-        const decayed = v.w * Math.pow(0.5, ageMs / halfMs);
-        if (decayed > 0.01) result[ch] = decayed;
+    const freqRefs = await fetchFmdxForFreq(currentState.freq);
+    if (!freqRefs) return;
+
+    let matchingStations = [];
+    for (const st of freqRefs) {
+        let piMatch = false;
+        if (st.pi && st.pi === pi) piMatch = true;
+        else if (st.pireg) {
+            const piregs = st.pireg.toString().split(/[,|/ ]+/);
+            if (piregs.some(p => p === pi)) piMatch = true;
+        }
+        if (piMatch) {
+            let possiblePS = st.psVariants.length > 0 ? st.psVariants : [st.station.replace(/ /g, '_').padEnd(8, '_')];
+            st.possiblePS = possiblePS;
+            matchingStations.push(st);
+        }
     }
-    return result;
-}
 
-function resolvePS(pi) {
-    const entry = db[pi];
-    if (!entry) return null;
-    let result = '';
-    for (let i = 0; i < 8; i++) {
-        const wv = getWeightedVotes(entry.ps[i]);
-        if (!Object.keys(wv).length) { result += ' '; continue; }
-        let best = ' ', bestN = 0;
-        for (const [ch, n] of Object.entries(wv)) { if (n > bestN) { bestN = n; best = ch; } }
-        result += best;
+    if (matchingStations.length === 0) {
+        let rawPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
+                    currentState.rawAccumulatedPS : 
+                    currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
+        currentState.latestAi = { 
+            ps: rawPS,
+            conf: 0, 
+            fmdx: '', 
+            itu: '', 
+            reason: `No DB entry found for PI ${pi}. Falling back to raw data.`, 
+            statusColor: '#6c757d' 
+        };
+        return;
     }
-    return result;
-}
 
-function computePSConf(pi) {
-    const entry = db[pi];
-    if (!entry) return new Array(8).fill(0);
-    return Array.from({ length: 8 }, (_, i) => {
-        const wv = getWeightedVotes(entry.ps[i]);
-        if (!wv) return 0;
-        const vals  = Object.values(wv).sort((a, b) => b - a);
-        const total = vals.reduce((a, b) => a + b, 0);
-        if (total === 0) return 0;
-        const best       = vals[0], second = vals[1] || 0;
-        const share      = best / total;
-        const dominance  = total > 1 ? (best - second) / total : share;
-        const totalCount = Object.values(entry.ps[i] || {})
-            .reduce((s, v) => s + (v.count || 0), 0);
-        const voteFactor = Math.min(1, totalCount / 30);
-        return Math.min(0.97, share * 0.5 + dominance * 0.3 + voteFactor * 0.2);
-    });
-}
+    const decodedPairs = [];
+    for (let i = 0; i < 8; i += 2) {
+        if ((currentState.psErrBuf[i] <= 1 && currentState.psBuf[i] !== ' ') || (currentState.psErrBuf[i+1] <= 1 && currentState.psBuf[i+1] !== ' ')) {
+            const c0 = (currentState.psErrBuf[i] <= 1 && currentState.psBuf[i] !== ' ') ? currentState.psBuf[i].toUpperCase() : null;
+            const c1 = (currentState.psErrBuf[i+1] <= 1 && currentState.psBuf[i+1] !== ' ') ? currentState.psBuf[i+1].toUpperCase() : null;
+            decodedPairs.push({ index: i, c0, c1 });
+        }
+    }
 
-function checkPSDynamic(pi, psString) {
-    if (isSpecialPI(pi)) return;
-    const entry = ensurePI(pi);
-    const buf   = entry.psDynamicBuf;
+    const decodedCharCount = currentState.psBuf.filter((c, i) => c !== ' ' && currentState.psErrBuf[i] <= 1).length;
+    let candidateStations = [];
+
+    for (const s of matchingStations) {
+        let perfectFrames = [];
+        for (const dbPs of s.possiblePS) {
+            const psUpper = dbPs.toUpperCase();
+            let matchesThisFrame = true;
+            for (const pair of decodedPairs) {
+                if (pair.c0 !== null && psUpper[pair.index] !== pair.c0) matchesThisFrame = false;
+                if (pair.c1 !== null && psUpper[pair.index + 1] !== pair.c1) matchesThisFrame = false;
+            }
+            if (matchesThisFrame) perfectFrames.push(dbPs);
+        }
+
+        let isChimera = true;
+        for (const pair of decodedPairs) {
+            let pairFound = false;
+            for (const dbPs of s.possiblePS) {
+                const psUpper = dbPs.toUpperCase();
+                let pairMatches = true;
+                if (pair.c0 !== null && psUpper[pair.index] !== pair.c0) pairMatches = false;
+                if (pair.c1 !== null && psUpper[pair.index + 1] !== pair.c1) pairMatches = false;
+                if (pairMatches) { pairFound = true; break; }
+            }
+            if (!pairFound) { isChimera = false; break; } 
+        }
+
+        if (perfectFrames.length > 0 || isChimera) candidateStations.push({ station: s, perfectFrames, isChimera: perfectFrames.length === 0 && isChimera });
+    }
+
+    if (candidateStations.length > 1) {
+        const uniqueItus = [...new Set(candidateStations.map(c => c.station.itu).filter(i => i))];
+        if (uniqueItus.length === 1) candidateStations = [candidateStations[0]];
+    }
     
-    buf.push(psString);
-    if (buf.length > 8) buf.shift();
-    
-    if (entry.psDynamicFrames === undefined) entry.psDynamicFrames = 0;
+    if (candidateStations.length > 1) {
+        let highestScore = -1;
+        let bestCandidate = candidateStations[0];
+        for (const cand of candidateStations) {
+            const score = calculatePropagationScore(cand.station);
+            if (score > highestScore) {
+                highestScore = score;
+                bestCandidate = cand;
+            }
+        }
+        candidateStations = [bestCandidate];
+    }
 
-    if (buf.length < 3) return;
+    let currentReason = "", currentColor = "", psRes = null, confRes = 0, fmdxRes = '', ituRes = '';
+    let refTxName = null, refErp = null, refPol = null, refDistKm = null, refAzimuth = null;
 
-    const isCurrentlyDynamic = detectScrollPS(buf) || detectChangingPS(buf);
-
-    if (isCurrentlyDynamic) {
-        entry.psDynamicFrames = 0;
+    if (matchingStations.length === 1 && decodedCharCount === 0) {
+        const best = matchingStations[0];
+        psRes = best.possiblePS[0]; confRes = 100; fmdxRes = best.station; ituRes = best.itu;
+        refTxName = best.txName; refErp = best.erp; refPol = best.pol; refDistKm = best.distKm; refAzimuth = best.azimuth;
+        currentReason = `Only 1 station in DB for PI ${pi}. Using primary frame.`; currentColor = "#28a745";
+    } else if (candidateStations.length === 1) {
+        const candidate = candidateStations[0];
+        fmdxRes = candidate.station.station; ituRes = candidate.station.itu;
+        refTxName = candidate.station.txName; refErp = candidate.station.erp; refPol = candidate.station.pol; refDistKm = candidate.station.distKm; refAzimuth = candidate.station.azimuth;
         
-        if (!entry.psIsDynamic) {
-            entry.psIsDynamic = true;
-            entry.ps = {}; 
-            entry.psResolved = null;
-            entry.psConf = new Array(8).fill(0);
-            dbDirty = true;
-        }
-    } else if (entry.psIsDynamic) {
-        entry.psDynamicFrames++;
-        if (entry.psDynamicFrames > 50) { 
-            entry.psIsDynamic = false;
-            entry.psDynamicFrames = 0;
-            buf.length = 0; 
-            dbDirty = true;
-        }
-    }
-}
-
-function detectScrollPS(buf) {
-    if (buf.length < 3) return false;
-    let scrollCount = 0;
-    
-    for (let i = 1; i < buf.length; i++) {
-        const a = buf[i-1].trim(), b = buf[i].trim();
-        if (!a || !b || a === b) continue; 
+        let bestCurrentFrame = candidate.station.possiblePS[0];
+        let maxScore = -1, perfectScoreFrame = null;
         
-        let isShifted = false;
-        for (let shift = 1; shift <= 7; shift++) {
-            const rotatedLeft  = a.slice(shift) + a.slice(0, shift);
-            const rotatedRight = a.slice(-shift) + a.slice(0, a.length - shift);
-            
-            const cleanB = b.replace(/_/g, ' ');
-            if (rotatedLeft.replace(/_/g, ' ') === cleanB || 
-                rotatedRight.replace(/_/g, ' ') === cleanB) {
-                isShifted = true; 
-                break;
-            }
+        for (const dbPs of candidate.station.possiblePS) {
+            const psUpper = dbPs.toUpperCase();
+            let score = 0;
+            for (let i = 0; i < 8; i++) if (currentState.psErrBuf[i] <= 1 && currentState.psBuf[i] !== ' ' && psUpper[i] === currentState.psBuf[i].toUpperCase()) score++;
+            if (score > maxScore) { maxScore = score; bestCurrentFrame = dbPs; }
+            if (score === 8) perfectScoreFrame = dbPs; 
         }
-        if (isShifted) scrollCount++;
-    }
-    return (scrollCount / (buf.length - 1)) > 0.6;
-}
+        
+        if (perfectScoreFrame) currentState.frozenPs = perfectScoreFrame;
 
-function detectChangingPS(buf) {
-    if (buf.length < 5) return false;
-    
-    const validTokens = buf.map(s => s.trim()).filter(s => s.length >= 2);
-    const counts = {};
-    for (const s of validTokens) {
-        counts[s] = (counts[s] || 0) + 1;
-    }
-    
-    const distinctWords = Object.keys(counts).filter(key => {
-        return !Object.keys(counts).some(other => {
-            return other.length > key.length && other.toLowerCase().startsWith(key.toLowerCase());
-        });
-    });
-    
-    let recurring = 0;
-    for (const word of distinctWords) {
-        if (counts[word] >= 2) recurring++;
-    }
-    
-    return recurring >= 2;
-}
-
-function checkAndLockPS(pi) {
-    if (isSpecialPI(pi)) return;
-    if (!piConfirmed) return;
-    const entry = pi ? db[pi] : null;
-    if (!entry) return;
-
-    const ref         = findRefEntry(pi);
-    const stationConf = computeStationConfidence(pi);
-
-    const stableMs = (lastProvisionalPS && provisionalFirstSeenTs)
-        ? (Date.now() - provisionalFirstSeenTs) : 0;
-
-    const allRawVerified = currentState.psErrBuf.every(e => e <= 1) &&
-                           currentState.psBuf.filter(c => c && c !== ' ').length >= 2 &&
-                           currentState.psRoundReceivedAfterConfirm;
-
-    let bestVariant = null, bestScore = 0;
-    if (ref?.psVariants?.length > 0) {
-        const psBufUpper = currentState.psBuf.join('').toUpperCase();
-        for (const v of ref.psVariants) {
-            const rv = v.toUpperCase().padEnd(8, ' ');
-            const pb = psBufUpper.padEnd(8, ' ');
-            let m = 0, c = 0;
-            for (let i = 0; i < 8; i++) {
-                if (rv[i] !== ' ') { c++; if (rv[i] === pb[i]) m++; }
-            }
-            const s = c > 0 ? m / c : 0;
-            if (s > bestScore) { bestScore = s; bestVariant = v; }
+        if (currentState.frozenPs) {
+            psRes = currentState.frozenPs; confRes = 100;
+            currentReason = perfectScoreFrame ? `Unambiguous match! Solid 100% lock on frame '${currentState.frozenPs}'.` : `Station locked. Holding frozen frame '${currentState.frozenPs}'.`;
+            currentColor = "#28a745";
+        } else {
+            psRes = bestCurrentFrame; confRes = 100; 
+            currentReason = candidate.perfectFrames.length > 0 ? `Unambiguous station match! Building PS.` : `Unambiguous station match! Building PS (Chimera).`;
+            currentColor = "#28a745";
         }
-    }
-    const refMatchIsGood = bestVariant && bestScore >= 0.75;
-
-    const strongEvidence = (computeRefMatchScore(pi) >= 0.98 && countCleanRawPositions() >= 6);
-
-    const allowLock =
-        strongEvidence ||
-        (stationConf >= LOCK_MIN_CONF &&
-         stableMs    >= LOCK_MIN_STABLE_MS &&
-         (qualityAllowsLock() || countCleanRawPositions() >= 7)) ||
-        (stationConf >= LOCK_STRONG_EVIDENCE_CONF && qualityAllowsLock());
-
-    const buildHybridPS = (referenceStr) => {
-        let h = '';
-        const cr = referenceStr.padEnd(8, ' ');
-        for (let i = 0; i < 8; i++) {
-            const rc = currentState.psBuf[i] || ' ';
-            const re = currentState.psErrBuf[i];
-            h += (re <= 1 && rc.toUpperCase() === cr[i].toUpperCase()) ? rc : cr[i];
-        }
-        return h;
-    };
-
-    if (!psLocked) {
-        if (!allowLock) return;
-
-        let newPS = null, lockReason = '';
-
-        if (entry.psVerifiedRaw && isPSStringClean(entry.psVerifiedRaw) &&
-            entry.psVerifiedRaw.trim().length > 0) {
-            if (ref?.psVariants?.length > 0) {
-                if (refMatchIsGood && bestScore >= 0.8) newPS = buildHybridPS(bestVariant);
-                else                                     newPS = entry.psVerifiedRaw;
-            } else {
-                newPS = entry.psVerifiedRaw;
-            }
-            if (newPS) lockReason = 'DB verified string';
-        }
-
-        if (!newPS && refMatchIsGood) {
-            newPS = buildHybridPS(bestVariant);
-            lockReason = `FMDX match ${Math.round(bestScore * 100)}%`;
-        }
-
-        if (allRawVerified) {
-            const candidate = currentState.psBuf.join('');
-            if (isPSStringClean(candidate)) {
-                const nu = candidate.trim().toUpperCase();
-                
-                const ok = !ref?.psVariants?.length ||
-                    ref.psVariants.some(v => {
-                        const refStr = v.trim().toUpperCase();
-                        if (refStr === nu) return true;
-                        if (refStr.startsWith(nu)) return true;
-                        if (nu.startsWith(refStr)) {
-                            if (ref.psVariants.length === 1) return false;
-                            const suffix = nu.substring(refStr.length);
-                            return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
-                        }
-                        return false;
-                    });
-                    
-                if (ok && !entry.psVerifiedRaw) {
-                    entry.psVerifiedRaw    = candidate;
-                    entry.psVerifiedRawTs  = Date.now();
-                    dbDirty = true;
-                }
-            }
-        }
-
-        if (!newPS && allRawVerified) {
-            const candidate = currentState.psBuf.join('');
-            if (isPSStringClean(candidate)) {
-                const nu = candidate.trim().toUpperCase();
-                const ok = !ref?.psVariants?.length ||
-                    ref.psVariants.some(v => {
-                        const refStr = v.trim().toUpperCase();
-                        if (refStr === nu) return true;
-                        if (refStr.startsWith(nu)) return true;
-                        if (nu.startsWith(refStr)) {
-                            if (ref.psVariants.length === 1) return false;
-                            const suffix = nu.substring(refStr.length);
-                            return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
-                        }
-                        return false;
-                    });
-
-                if (ok) {
-                    newPS = candidate;
-                    lockReason = 'Raw RDS fully verified';
-                }
-            }
-        }
-
-        if (newPS) {
-            psLocked = true; lastBroadcastPS = newPS; lastLockReason = lockReason;
-            if (_aiTimer) { clearTimeout(_aiTimer); _aiTimer = null; }
-            const prediction = buildAIPrediction(pi);
-            currentState.lastPrediction = prediction;
-            setTimeout(() => {
-                broadcast({ type: 'rdsm_ai', ...prediction, ts: Date.now() });
-                if (rdsFollowMode) applyFollowToDataHandler();
-            }, AI_BROADCAST_DELAY);
-        }
+    } else if (candidateStations.length > 1) {
+        const first = candidateStations[0].station;
+        psRes = first.possiblePS[0]; confRes = 50; fmdxRes = first.station; ituRes = first.itu;
+        refTxName = first.txName; refErp = first.erp; refPol = first.pol; refDistKm = first.distKm; refAzimuth = first.azimuth;
+        currentReason = `Ambiguous! Decoded pairs fit multiple DIFFERENT stations. Waiting for more data.`; currentColor = "#fd7e14";
     } else {
-        if (ref?.psVariants?.length > 1 && refMatchIsGood) {
-            const cu = (lastBroadcastPS || '').toUpperCase().padEnd(8, ' ');
-            const bv = bestVariant.toUpperCase().padEnd(8, ' ');
-            if (cu !== bv) {
-                lastBroadcastPS = buildHybridPS(bestVariant);
-                entry.psIsDynamic = true; dbDirty = true;
-                if (_aiTimer) { clearTimeout(_aiTimer); _aiTimer = null; }
-                const prediction = buildAIPrediction(pi);
-                currentState.lastPrediction = prediction;
-                setTimeout(() => {
-                    broadcast({ type: 'rdsm_ai', ...prediction, ts: Date.now() });
-                    if (rdsFollowMode) applyFollowToDataHandler();
-                }, AI_BROADCAST_DELAY);
+        const validItus = matchingStations.map(s => s.itu).filter(i => i !== undefined && i !== "");
+        const uniqueItus = [...new Set(validItus)];
+        
+        if (uniqueItus.length === 1) {
+            const fallbackMatch = matchingStations[0]; 
+            fmdxRes = fallbackMatch.station; ituRes = fallbackMatch.itu || uniqueItus[0];
+            refTxName = fallbackMatch.txName; refErp = fallbackMatch.erp; refPol = fallbackMatch.pol; refDistKm = fallbackMatch.distKm; refAzimuth = fallbackMatch.azimuth;
+            
+            if (currentState.frozenPs) {
+                psRes = currentState.frozenPs; confRes = 100;
+                currentReason = `Signal mismatch detected. Ignoring errors and holding frozen frame '${currentState.frozenPs}'.`; currentColor = "#28a745"; 
+            } else {
+                psRes = fallbackMatch.possiblePS[0]; confRes = 100; 
+                currentReason = `Unique ITU Match! All valid DB entries belong to '${uniqueItus[0]}'. Using primary frame.`; currentColor = "#28a745";
             }
-        }
-        if (allRawVerified) {
-            const freshPS = currentState.psBuf.join('');
-            if (isPSStringClean(freshPS)) {
-                const fu = freshPS.trim().toUpperCase();
-                const eu = (entry.psVerifiedRaw || '').trim().toUpperCase();
-                if (fu !== eu) {
-                    const ok = !ref?.psVariants?.length ||
-                        ref.psVariants.some(v => {
-                            const refStr = v.trim().toUpperCase();
-                            if (refStr === fu) return true;
-                            if (refStr.startsWith(fu)) return true;
-                            if (fu.startsWith(refStr)) {
-                                if (ref.psVariants.length === 1) return false;
-                                const suffix = fu.substring(refStr.length);
-                                return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
-                            }
-                            return false;
-                        });
-                        
-                    if (ok) {
-                        entry.psVerifiedRaw = freshPS; entry.psVerifiedRawTs = Date.now();
-                        dbDirty = true;
-                    }
-                }
+        } else {
+            let rawPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
+                        currentState.rawAccumulatedPS : 
+                        currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
+            if (currentState.frozenPs) {
+                psRes = currentState.frozenPs; confRes = 100;
+                currentReason = `Signal mismatch detected. Ignoring errors and holding frozen frame '${currentState.frozenPs}'.`; currentColor = "#28a745"; 
+            } else {
+                psRes = rawPS; confRes = 0;
+                currentReason = `Mismatch Error! Decoded chars conflict with known frames. Passing raw data.`; currentColor = "#dc3545";
             }
         }
     }
+
+    currentState.latestAi = { 
+        ps: psRes, conf: confRes, fmdx: fmdxRes, itu: ituRes, 
+        reason: currentReason, statusColor: currentColor,
+        refTxName, refErp, refPol, refDistKm, refAzimuth
+    };
 }
 
-let txUpdateTimer = null;
-function scheduleDataHandlerUpdate(pi) {
-    if (!dataHandler || rdsFollowMode || !piConfirmed || psLocked) return;
-    if (txUpdateTimer) clearTimeout(txUpdateTimer);
-    txUpdateTimer = setTimeout(() => {
-        txUpdateTimer = null;
-        if (!piConfirmed) return;
-        const entry = db[pi];
-        if (!entry) return;
-        if (pi && pi !== '?' && pi !== '----') {
-            dataHandler.dataToSend.pi  = pi;
-            dataHandler.initialData.pi = pi;
-        }
-        dataHandler.dataToSend.ps = '        ';
-        const psStr = buildPSString(pi);
-        if (psStr && psStr.trim().length > 0) {
-            lastBroadcastPS = psStr;
-            dataHandler.dataToSend.ps = psStr;
-        }
-        if (entry.pty >= 0) dataHandler.dataToSend.pty = entry.pty;
-        if (currentState.freq) dataHandler.dataToSend.freq = currentState.freq;
-    }, 500);
-}
-
-function normPS(s) { return (!s || typeof s !== 'string') ? s : s; }
-
-function buildPSString(pi) {
-    const entry = db[pi];
-    if (!entry) return '';
-    if (entry.psIsDynamic) {
-        const raw = entry.psLastRaw || [];
-        if (raw.every(c => c !== null)) return raw.map(c => c || ' ').join('');
-        return '';
-    }
-    if (entry.psVerifiedRaw && isPSStringClean(entry.psVerifiedRaw))
-        return entry.psVerifiedRaw;
-    return entry.psResolved || '';
-}
+let dataHandler = null;
+try { dataHandler = require('../../server/datahandler'); } catch(e) {}
 
 function clearRDSInDataHandler() {
     if (!dataHandler) return;
-    const rdsFields = {
-        pi: '?', ps: '', ps_errors: '', pty: 0, tp: 0, ta: 0, ms: -1,
-        rt0: '', rt1: '', rt0_errors: '', rt1_errors: '', rt_flag: '',
-        rds: false, ecc: null, country_name: '', country_iso: 'UN',
-        lic: 0, lang: ''
-    };
+    const rdsFields = { pi: '?', ps: '        ', ps_errors: '0,0,0,0,0,0,0,0', pty: 0, tp: 0, ta: 0, ms: -1, rt0: '', rt1: '', rt0_errors: '', rt1_errors: '', rt_flag: '', rds: false, ecc: null, country_name: '', country_iso: 'UN', lic: 0, lang: '' };
     Object.assign(dataHandler.dataToSend,  rdsFields);
     Object.assign(dataHandler.initialData, rdsFields);
     if (Array.isArray(dataHandler.dataToSend.af))  dataHandler.dataToSend.af.length  = 0;
     if (Array.isArray(dataHandler.initialData.af)) dataHandler.initialData.af.length = 0;
-    else dataHandler.initialData.af = dataHandler.dataToSend.af;
-    piConfirmCount = 0; piConfirmed = false; piPendingBroadcast = false;
-    currentState.lastPrediction = null;
-	
-	if (currentState.freq) {
+    
+    if (currentState.freq) {
         const freqFmt = parseFloat(currentState.freq).toFixed(3);
-        dataHandler.dataToSend.freq  = freqFmt;
-        dataHandler.initialData.freq = freqFmt;
+        dataHandler.dataToSend.freq  = freqFmt; dataHandler.initialData.freq = freqFmt;
     }
-}
-
-function applyAFToDataHandler() {
-    if (!dataHandler || !rdsFollowMode) return;
-    if (!Array.isArray(dataHandler.dataToSend.af)) dataHandler.dataToSend.af = [];
-    dataHandler.dataToSend.af.length = 0;
-    for (const f of currentState.afSet)
-        dataHandler.dataToSend.af.push(Math.round(parseFloat(f) * 1000));
-    dataHandler.dataToSend.af.sort((a, b) => a - b);
 }
 
 function applyFollowToDataHandler() {
-    if (!dataHandler || !rdsFollowMode || !piConfirmed) return;
-    
+    if (!dataHandler || !rdsFollowMode) return;
     const pi = currentState.pi;
-
-    if (pi && !isSpecialPI(pi)) {
-        const entry = db[pi];
-        const isKnownOnFreq = entry && entry.freq === roundFreq(currentState.freq);
-        
-        const validPsChars = currentState.psBuf.filter((char, i) => 
-            char !== ' ' && (currentState.psErrBuf[i] ?? 3) <= 1
-        ).length;
-
-        if (!isKnownOnFreq && validPsChars < 3) {
-            return; 
-        }
-    }
-	
-	const entry = (!isSpecialPI(pi) && pi) ? db[pi] : null;
-    const ref   = findRefEntry(pi);
-    const pred  = currentState.lastPrediction;
+    if (!pi || isSpecialPI(pi)) return;
 
     dataHandler.dataToSend.pi  = (pi && pi !== '----' && pi !== '?') ? pi : '?';
     dataHandler.initialData.pi = dataHandler.dataToSend.pi;
 
-    const getDbMixedCasePS = () => {
-        let candidate = null;
-        if (entry?.psVerifiedRaw && isPSStringClean(entry.psVerifiedRaw) &&
-            entry.psVerifiedRaw.trim().length > 0) {
-            candidate = entry.psVerifiedRaw;
-        } else if (entry?.psResolved && entry.psResolved.trim().length > 0 &&
-            !entry.psResolved.includes('?')) {
-            candidate = entry.psResolved;
-        }
-
-        if (candidate && ref?.psVariants?.length > 0) {
-            const isValid = ref.psVariants.some(v => {
-                const refStr = v.trim().toUpperCase();
-                const cand = candidate.trim().toUpperCase();
-                
-                if (refStr === cand) return true;
-                if (refStr.startsWith(cand)) return true;
-                
-                if (cand.startsWith(refStr)) {
-                    if (ref.psVariants.length === 1) return false;
-                    const suffix = cand.substring(refStr.length);
-                    return /^[A-Z0-9 \-\.\+]+$/.test(suffix);
-                }
-                return false;
-            });
-            
-            if (!isValid) return null; 
-        }
-        return candidate;
-    };
-
-    if (isSpecialPI(pi)) {
-        const rawPS      = currentState.psBuf.join('');
-        const hasContent = rawPS.trim().length > 0 && currentState.psErrBuf.every(e => e <= 1);
-        if (hasContent) {
-            dataHandler.dataToSend.ps        = rawPS;
-            dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-            dataHandler.initialData.ps       = rawPS;
-            lastBroadcastPS = rawPS;
-        } else if (lastBroadcastPS) {
-            dataHandler.dataToSend.ps        = lastBroadcastPS;
-            dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-            dataHandler.initialData.ps       = lastBroadcastPS;
-        } else {
-            dataHandler.dataToSend.ps        = '        ';
-            dataHandler.dataToSend.ps_errors = '';
-        }
-        const rtLive = buildRTString();
-        if (rtLive.trim().length >= 3) {
-            const rtFlag = currentState.rtAB >= 0 ? currentState.rtAB : 0;
-            if (rtFlag === 0) { dataHandler.dataToSend.rt0 = rtLive; dataHandler.dataToSend.rt0_errors = ''; }
-            else              { dataHandler.dataToSend.rt1 = rtLive; dataHandler.dataToSend.rt1_errors = ''; }
-            dataHandler.dataToSend.rt_flag  = rtFlag;
-            dataHandler.initialData.rt0     = dataHandler.dataToSend.rt0;
-            dataHandler.initialData.rt1     = dataHandler.dataToSend.rt1;
-            dataHandler.initialData.rt_flag = rtFlag;
-        }
-        dataHandler.dataToSend.tp  = currentState.tp ? 1 : 0;
-        dataHandler.dataToSend.ta  = currentState.ta ? 1 : 0;
-        dataHandler.dataToSend.ms  = currentState.ms;
-        dataHandler.dataToSend.rds = true;
-        applyAFToDataHandler();
-        return;
-    }
-
-    if (!lastBroadcastPS) {
-        const dbStr = getDbMixedCasePS();
-        const validPsChars = currentState.psBuf.filter((char, i) => char !== ' ' && (currentState.psErrBuf[i] ?? 3) <= 1).length;
-
-        if (dbStr) {
-            lastBroadcastPS = dbStr;
-        } else if (ref?.psVariants?.length > 0) {
-            if (validPsChars > 0) {
-                lastBroadcastPS = ref.psVariants[0].padEnd(8, ' ');
-            } else {
-                lastBroadcastPS = '        '; 
-            }
-        }
-    }
-
-    const isDynamic          = (entry?.psIsDynamic || false);
-    const isScrollingNonFmdx = entry?.psIsDynamic && (!ref?.psVariants || ref.psVariants.length <= 1);
-
-    if (psLocked && lastBroadcastPS && !isScrollingNonFmdx) {
-        dataHandler.dataToSend.ps        = lastBroadcastPS;
-        dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-        dataHandler.initialData.ps       = lastBroadcastPS;
-    } else if (isScrollingNonFmdx) {
-        const raw      = entry?.psLastRaw;
-        const rawClean = currentState.psErrBuf.every(e => e <= 1);
-        if (raw && raw.every(c => c !== null) && rawClean) {
-            const psStr = raw.map(c => c || ' ').join('');
-            lastBroadcastPS = psStr;
-            dataHandler.dataToSend.ps        = psStr;
-            dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-            dataHandler.initialData.ps       = psStr;
-        } else if (lastBroadcastPS) {
-            dataHandler.dataToSend.ps        = lastBroadcastPS;
-            dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-            dataHandler.initialData.ps       = lastBroadcastPS;
-        } else {
-            dataHandler.dataToSend.ps = '        '; dataHandler.dataToSend.ps_errors = '';
-        }
-    } else if (isDynamic) {
-        if (ref?.psVariants?.length > 0) {
-            let bv = null, bs = 0;
-            for (const v of ref.psVariants) {
-                const rv = v.toUpperCase().padEnd(8, ' ');
-                const pb = currentState.psBuf.join('').toUpperCase().padEnd(8, ' ');
-                let m = 0, c = 0;
-                for (let i = 0; i < 8; i++) {
-                    if (rv[i] !== ' ' && currentState.psErrBuf[i] <= 1) { c++; if (rv[i] === pb[i]) m++; }
-                }
-                const s = c > 0 ? m / c : 0;
-                if (s > bs) { bs = s; bv = v; }
-            }
-            if (bv && bs >= 0.5) {
-                const psStr = getDbMixedCasePS() || bv.padEnd(8, ' ');
-                lastBroadcastPS = psStr;
-                dataHandler.dataToSend.ps        = psStr;
-                dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-                dataHandler.initialData.ps       = psStr;
-            } else if (lastBroadcastPS) {
-                dataHandler.dataToSend.ps        = lastBroadcastPS;
-                dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-                dataHandler.initialData.ps       = lastBroadcastPS;
-            } else {
-                dataHandler.dataToSend.ps = '        '; dataHandler.dataToSend.ps_errors = '';
-            }
-        }
-    } else if (pred?.ps && Array.isArray(pred.ps)) {
-        const ms = computeRefMatchScore(pi);
-        
-        if (ms >= 0.4 && ref?.psVariants?.length > 0) {
-            const dbStr = getDbMixedCasePS();
-            const psStr = dbStr ? dbStr : ref.psVariants[0].padEnd(8, ' ');
-            
-            lastBroadcastPS = psStr;
-            dataHandler.dataToSend.ps        = psStr;
-            dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-            dataHandler.initialData.ps       = psStr;
-        } else {
-            const goodSlots = pred.ps.filter(s =>
-                s && s.src !== 'empty' && s.src !== 'ai-bigram' && s.conf >= 0.5).length;
-            if (goodSlots >= 4 || lastBroadcastPS) {
-                const psStr = pred.ps.map(s =>
-                    (s && s.src !== 'empty' && s.src !== 'ai-bigram' && s.char) ? s.char : ' ').join('');
-                if (!lastBroadcastPS || goodSlots >= 4) lastBroadcastPS = psStr;
-                dataHandler.dataToSend.ps        = lastBroadcastPS;
-                dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-                dataHandler.initialData.ps       = lastBroadcastPS;
-            }
-        }
-    } else if (lastBroadcastPS) {
-        dataHandler.dataToSend.ps        = lastBroadcastPS;
-        dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-        dataHandler.initialData.ps       = lastBroadcastPS;
-    } else {
-        dataHandler.dataToSend.ps = '        '; dataHandler.dataToSend.ps_errors = '';
-    }
-
-    if (dataHandler.dataToSend.ps)  dataHandler.dataToSend.ps  = normPS(dataHandler.dataToSend.ps);
-    if (dataHandler.initialData.ps) dataHandler.initialData.ps = normPS(dataHandler.initialData.ps);
-    if (lastBroadcastPS)            lastBroadcastPS             = normPS(lastBroadcastPS);
-
-    dataHandler.dataToSend.pty = (entry?.pty >= 0) ? entry.pty : 0;
-    dataHandler.dataToSend.tp  = currentState.tp ? 1 : 0;
-    dataHandler.dataToSend.ta  = currentState.ta ? 1 : 0;
-    dataHandler.dataToSend.ms  = currentState.ms;
-
-    const rtLive = buildRTString();
-    const rtSrc  = rtLive.trim().length >= 3 ? rtLive
-                 : (pred?.rt?.text?.trim().length >= 3 ? pred.rt.text : null);
-    if (rtSrc) {
-        const rtFlag = currentState.rtAB >= 0 ? currentState.rtAB : 0;
-        if (rtFlag === 0) { dataHandler.dataToSend.rt0 = rtSrc; dataHandler.dataToSend.rt0_errors = ''; }
-        else              { dataHandler.dataToSend.rt1 = rtSrc; dataHandler.dataToSend.rt1_errors = ''; }
-        dataHandler.dataToSend.rt_flag  = rtFlag;
-        dataHandler.initialData.rt0     = dataHandler.dataToSend.rt0;
-        dataHandler.initialData.rt1     = dataHandler.dataToSend.rt1;
-        dataHandler.initialData.rt_flag = rtFlag;
-    } else {
-        dataHandler.dataToSend.rt0 = ''; dataHandler.dataToSend.rt1 = '';
-        dataHandler.dataToSend.rt0_errors = ''; dataHandler.dataToSend.rt1_errors = '';
-        dataHandler.initialData.rt0 = ''; dataHandler.initialData.rt1 = '';
-    }
-
-    const eccByte = entry?.ecc ? parseInt(entry.ecc, 16) : null;
-    if (eccByte) {
-        dataHandler.dataToSend.ecc = eccByte;
-        const country = lookupCountry(pi, eccByte);
-        dataHandler.dataToSend.country_iso  = country ? country.iso  : 'UN';
-        dataHandler.dataToSend.country_name = country ? country.name : '';
-		
-        dataHandler.dataToSend.lic = 0;
-        dataHandler.dataToSend.lang = '';
-    }
+    let targetPS = '        ';
     
-    dataHandler.dataToSend.lic = 0;
-    dataHandler.dataToSend.lang = '';
+    if (currentState.frozenPs) {
+        targetPS = currentState.frozenPs;
+    } else if (currentState.latestAi && currentState.latestAi.ps && currentState.latestAi.conf > 0 && currentState.latestAi.ps.trim().length > 0) {
+        targetPS = currentState.latestAi.ps;
+    } else {
+        targetPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
+                   currentState.rawAccumulatedPS : 
+                   currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
+    }
 
-    dataHandler.dataToSend.rds = !!(pi && pi !== '?');
-    applyAFToDataHandler();
+    dataHandler.dataToSend.ps = targetPS;
+    dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+    dataHandler.initialData.ps = targetPS;
+    
+    dataHandler.dataToSend.tp = currentState.tp ? 1 : 0;
+    dataHandler.dataToSend.ta = currentState.ta ? 1 : 0;
+    dataHandler.dataToSend.ms = currentState.ms;
+    dataHandler.dataToSend.pty = currentState.pty;
+
+    let rtLive = '';
+    for (let i = 0; i < 64; i++) {
+        const sl = currentState.rtSlots[i];
+        if (!sl || sl.char === '\r') break;
+        if (sl.conf > 0) rtLive += sl.char; else if (rtLive.length > 0) break;
+    }
+    rtLive = rtLive.trimEnd();
+
+    if (rtLive.trim().length >= 3) {
+        const rtFlag = currentState.rtAB >= 0 ? currentState.rtAB : 0;
+        if (rtFlag === 0) { dataHandler.dataToSend.rt0 = rtLive; dataHandler.dataToSend.rt0_errors = ''; }
+        else              { dataHandler.dataToSend.rt1 = rtLive; dataHandler.dataToSend.rt1_errors = ''; }
+        dataHandler.dataToSend.rt_flag = rtFlag;
+        dataHandler.initialData.rt0 = dataHandler.dataToSend.rt0;
+        dataHandler.initialData.rt1 = dataHandler.dataToSend.rt1;
+        dataHandler.initialData.rt_flag = rtFlag;
+    }
+
+    if (currentState.ecc) dataHandler.dataToSend.ecc = parseInt(currentState.ecc, 16);
+    dataHandler.dataToSend.rds = true;
+
+    if (!Array.isArray(dataHandler.dataToSend.af)) dataHandler.dataToSend.af = [];
+    dataHandler.dataToSend.af.length = 0;
+    for (const f of currentState.afSet) dataHandler.dataToSend.af.push(Math.round(parseFloat(f) * 1000));
+    dataHandler.dataToSend.af.sort((a, b) => a - b);
 }
 
 function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
     if (!b2hex) return;
+    const g2 = parseInt(b2hex, 16), g3 = b3hex ? parseInt(b3hex, 16) : NaN, g4 = b4hex ? parseInt(b4hex, 16) : NaN;
+    const gT = (g2 >> 12) & 0x0F, vB = (g2 >> 11) & 0x01;
+    const blkAok = errB[0] <= 1, blkBok = errB[1] <= 1;
 
-    updateQualWindow(errB);
-
-    const g2 = parseInt(b2hex, 16);
-    const g3 = b3hex ? parseInt(b3hex, 16) : NaN;
-    const g4 = b4hex ? parseInt(b4hex, 16) : NaN;
-    const gT = (g2 >> 12) & 0x0F;
-    const vB = (g2 >> 11) & 0x01;
-    const tp = !!((g2 >> 10) & 0x01);
-    const pty = (g2 >> 5) & 0x1F;
-    const c3 = CONF_TABLE[errB[2]];
-    const c4 = CONF_TABLE[errB[3]];
-    const blkAok = errB[0] <= 1;
-    const blkBok = errB[1] <= 1;
-
-    const entry = isSpecialPI(pi) ? null : ensurePI(pi);
-    if (entry) {
-        entry.seenCount++; entry.seen = Date.now();
-        if (currentState.freq) entry.freq = roundFreq(currentState.freq);
-        if (blkAok && blkBok) { entry.tp = tp; currentState.tp = tp; if (pty > 0) entry.pty = pty; }
-        dbDirty = true;
-    } else {
-        if (blkAok && blkBok) currentState.tp = tp;
+    if (blkAok && blkBok) {
+        currentState.tp = !!((g2 >> 10) & 0x01);
+        currentState.pty = (g2 >> 5) & 0x1F;
     }
 
-    if (gT === 0 && vB === 0) {
+    if (gT === 0) {
         if (blkAok && blkBok) {
-            const ta  = !!((g2 >> 4) & 0x01);
-            const ms  = !!((g2 >> 3) & 0x01);
-            const seg =    g2 & 0x03;
-            const di  = !!((g2 >> 2) & 0x01);
-            if (entry) { entry.ta = ta; entry.ms = ms ? 1 : 0; }
-            currentState.ta = ta; currentState.ms = ms ? 1 : 0;
-            if (seg === 3) { if (entry) entry.stereo = di; currentState.stereo = di; }
+            currentState.ta = !!((g2 >> 4) & 0x01);
+            currentState.ms = !!((g2 >> 3) & 0x01) ? 1 : 0;
+            if ((g2 & 0x03) === 3) currentState.stereo = !!((g2 >> 2) & 0x01);
         }
-        if (b3hex && errB[2] <= 1 && blkAok && blkBok) {
+        if (vB === 0 && b3hex && errB[2] <= 1 && blkAok && blkBok) {
             const af1 = (g3 >> 8) & 0xFF, af2 = g3 & 0xFF;
-            if (af1 !== 250) { const f1 = decodeAFCode(af1); if (f1 !== null) { const r = Math.round(f1*10)/10; currentState.afSet.add(r); if (!isSpecialPI(pi)) cacheAF(pi, r); } }
-            if (af2 !== 250) { const f2 = decodeAFCode(af2); if (f2 !== null) { const r = Math.round(f2*10)/10; currentState.afSet.add(r); if (!isSpecialPI(pi)) cacheAF(pi, r); } }
+            if (af1 !== 250) { const f1 = decodeAFCode(af1); if (f1 !== null) currentState.afSet.add(Math.round(f1*10)/10); }
+            if (af2 !== 250) { const f2 = decodeAFCode(af2); if (f2 !== null) currentState.afSet.add(Math.round(f2*10)/10); }
         }
-        if (b4hex && c4 > 0) {
-            const seg = g2 & 0x03, addr = seg * 2;
+        if (b4hex && errB[3] <= 2) {
+            const seg = g2 & 0x03;
+            const addr = seg * 2;
             const c0 = rdsChar((g4 >> 8) & 0xFF), c1 = rdsChar(g4 & 0xFF);
-            const weight = errB[3] === 0 ? 10 : errB[3] === 1 ? 5 : 0;
-            if (weight > 0 && blkAok && blkBok) {
-                if (c0 !== '\r') votePS(pi, addr,     c0, weight, errB[3]);
-                if (c1 !== '\r') votePS(pi, addr + 1, c1, weight, errB[3]);
-            }
-            if (c0 !== '\r') { currentState.psBuf[addr]     = c0; currentState.psErrBuf[addr]     = errB[3]; currentState.psSegsSeen.add(seg); }
-            if (c1 !== '\r') { currentState.psBuf[addr + 1] = c1; currentState.psErrBuf[addr + 1] = errB[3]; }
-            if (currentState.psSegsSeen.size >= 4 && !currentState.psRoundComplete) {
-                currentState.psRoundComplete = true;
-                if (!isSpecialPI(pi)) checkPSDynamic(pi, currentState.psBuf.join(''));
-                if (entry && currentState.psErrBuf.every(e => e <= 1)) {
-                    entry.psLastRaw = [...currentState.psBuf]; entry.psLastRawTs = Date.now(); dbDirty = true;
+            
+            if (c0 !== '\r' && errB[3] <= currentState.psErrBuf[addr]) { currentState.psBuf[addr] = c0; currentState.psErrBuf[addr] = errB[3]; currentState.psSegsSeen.add(seg); }
+            if (c1 !== '\r' && errB[3] <= currentState.psErrBuf[addr+1]) { currentState.psBuf[addr+1] = c1; currentState.psErrBuf[addr+1] = errB[3]; currentState.psSegsSeen.add(seg); }
+            
+            if (currentState.psSegsSeen.size >= 4) {
+                if (currentState.psErrBuf.every(e => e <= 1)) {
+                    currentState.rawAccumulatedPS = currentState.psBuf.join('');
                 }
-                if (!currentState.psRoundReceivedAfterConfirm && piConfirmed)
-                    currentState.psRoundReceivedAfterConfirm = true;
-                currentState.psSegsSeen.clear(); currentState.psRoundComplete = false;
-                checkAndLockPS(pi); scheduleDataHandlerUpdate(pi);
+                currentState.psSegsSeen.clear();
             }
         }
     }
 
-    if (gT === 0 && vB === 1) {
-        if (blkAok && blkBok) {
-            const ta  = !!((g2 >> 4) & 0x01);
-            const ms  = !!((g2 >> 3) & 0x01);
-            const seg =    g2 & 0x03;
-            const di  = !!((g2 >> 2) & 0x01);
-            if (entry) { entry.ta = ta; entry.ms = ms ? 1 : 0; }
-            currentState.ta = ta; currentState.ms = ms ? 1 : 0;
-            if (seg === 3) { if (entry) entry.stereo = di; currentState.stereo = di; }
-        }
-        if (b4hex && c4 > 0) {
-            const seg = g2 & 0x03, addr = seg * 2;
-            const c0 = rdsChar((g4 >> 8) & 0xFF), c1 = rdsChar(g4 & 0xFF);
-            const weight = errB[3] === 0 ? 10 : errB[3] === 1 ? 5 : 0;
-            if (weight > 0 && blkAok && blkBok) {
-                if (c0 !== '\r') votePS(pi, addr,     c0, weight, errB[3]);
-                if (c1 !== '\r') votePS(pi, addr + 1, c1, weight, errB[3]);
-            }
-            if (c0 !== '\r') { currentState.psBuf[addr]     = c0; currentState.psErrBuf[addr]     = errB[3]; currentState.psSegsSeen.add(seg); }
-            if (c1 !== '\r') { currentState.psBuf[addr + 1] = c1; currentState.psErrBuf[addr + 1] = errB[3]; }
-            if (currentState.psSegsSeen.size >= 4 && !currentState.psRoundComplete) {
-                currentState.psRoundComplete = true;
-                if (!isSpecialPI(pi)) checkPSDynamic(pi, currentState.psBuf.join(''));
-                if (entry && currentState.psErrBuf.every(e => e <= 1)) {
-                    entry.psLastRaw = [...currentState.psBuf]; entry.psLastRawTs = Date.now(); dbDirty = true;
-                }
-                if (!currentState.psRoundReceivedAfterConfirm && piConfirmed)
-                    currentState.psRoundReceivedAfterConfirm = true;
-                currentState.psSegsSeen.clear(); currentState.psRoundComplete = false;
-                checkAndLockPS(pi); scheduleDataHandlerUpdate(pi);
-            }
-        }
-    }
-
-    if (gT === 2 && vB === 0) {
-        const abF = (g2 >> 4) & 0x01, addr = (g2 & 0x0F) * 4;
+    if (gT === 2) {
+        const abF = (g2 >> 4) & 0x01, addr = vB === 0 ? (g2 & 0x0F) * 4 : (g2 & 0x0F) * 2;
         if (abF !== currentState.rtAB) {
             currentState.rtSlots = Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 }));
-            currentState.rtAB    = abF;
+            currentState.rtAB = abF;
         }
-        if (b3hex && c3 > 0) {
-            currentState.rtSlots[addr    ] = { char: rdsChar((g3 >> 8) & 0xFF), conf: c3 };
-            currentState.rtSlots[addr + 1] = { char: rdsChar(g3 & 0xFF),        conf: c3 };
+        if (vB === 0 && b3hex && errB[2] <= 2) {
+            currentState.rtSlots[addr] = { char: rdsChar((g3 >> 8) & 0xFF), conf: 1 };
+            currentState.rtSlots[addr + 1] = { char: rdsChar(g3 & 0xFF), conf: 1 };
         }
-        if (b4hex && c4 > 0) {
-            currentState.rtSlots[addr + 2] = { char: rdsChar((g4 >> 8) & 0xFF), conf: c4 };
-            currentState.rtSlots[addr + 3] = { char: rdsChar(g4 & 0xFF),        conf: c4 };
-        }
-    }
-
-    if (gT === 2 && vB === 1) {
-        const abF = (g2 >> 4) & 0x01, addr = (g2 & 0x0F) * 2;
-        if (abF !== currentState.rtAB) {
-            currentState.rtSlots = Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 }));
-            currentState.rtAB    = abF;
-        }
-        if (b4hex && c4 > 0) {
-            currentState.rtSlots[addr    ] = { char: rdsChar((g4 >> 8) & 0xFF), conf: c4 };
-            currentState.rtSlots[addr + 1] = { char: rdsChar(g4 & 0xFF),        conf: c4 };
+        if (b4hex && errB[3] <= 2) {
+            const offset = vB === 0 ? 2 : 0;
+            currentState.rtSlots[addr + offset] = { char: rdsChar((g4 >> 8) & 0xFF), conf: 1 };
+            currentState.rtSlots[addr + offset + 1] = { char: rdsChar(g4 & 0xFF), conf: 1 };
         }
     }
 
-    if (gT === 1 && vB === 0 && b3hex && errB[2] <= 1 && entry) {
-        const variant = (g3 >> 12) & 0x07;
-        if (variant === 0) {
-            const eccByte = g3 & 0xFF;
-            if (eccByte > 0) {
-                entry.ecc = eccByte.toString(16).toUpperCase().padStart(2, '0');
-                dbDirty   = true;
-                if (rdsFollowMode && dataHandler && piConfirmed) {
-                    dataHandler.dataToSend.ecc = eccByte;
-                    const country = lookupCountry(pi, eccByte);
-                    if (country) {
-                        dataHandler.dataToSend.country_iso  = country.iso;
-                        dataHandler.dataToSend.country_name = country.name;
-                    }
-                }
-            }
+    if (gT === 1 && vB === 0 && b3hex && errB[2] <= 1 && ((g3 >> 12) & 0x07) === 0) {
+        const eccByte = g3 & 0xFF;
+        if (eccByte > 0) currentState.ecc = eccByte.toString(16).toUpperCase().padStart(2, '0');
+    }
+
+    runLocalAiPrediction(pi).then(() => {
+        let psSlots = [];
+        if (currentState.latestAi && currentState.latestAi.ps) {
+            for (let i = 0; i < 8; i++) psSlots.push({ char: currentState.latestAi.ps[i] || ' ', conf: currentState.latestAi.conf / 100 });
         }
-    }
-}
-
-const BIGRAM = {
-    ' ':{'R':25,'S':20,'M':18,'F':15,'D':14,'N':12,'B':11,'K':10,'H':9,'L':8,'C':7,'W':6,'T':5,'A':5,'G':4,'E':4,'P':4,'1':3,'2':3,'3':3},
-    'R':{'A':20,'E':18,'O':15,'D':12,'S':10,'I':9,'U':8,'T':7,' ':6,'N':5,'K':4,'C':4,'L':4,'1':3,'2':3},
-    'A':{'D':15,'N':14,'S':12,'L':10,'M':9,'T':8,'R':7,'1':6,'2':5,'3':4,'K':4,' ':4,'X':3,'P':3},
-    'S':{'T':18,'E':16,'P':12,'O':10,'A':9,' ':8,'U':7,'W':6,'K':6,'N':5,'1':4,'2':3,'H':3,'I':3},
-    'I':{'N':20,'O':15,'S':12,'E':10,'R':8,' ':7,'C':6,'T':6,'1':5,'F':4,'L':4,'D':3},
-    'O':{'N':18,'S':15,'R':12,'L':10,' ':9,'U':8,'K':7,'T':6,'M':5,'D':5,'1':4,'P':4,'F':3},
-    'T':{'E':20,'H':18,'A':15,'S':12,'R':10,'O':8,'I':7,'U':6,' ':5,'1':4,'2':3,'W':3,'N':3},
-    'E':{'R':18,'N':15,'S':12,'L':10,'A':9,'T':8,'X':7,'C':6,' ':5,'W':5,'G':4,'1':4,'2':3},
-    'N':{'D':15,'E':14,'A':12,'S':10,' ':9,'O':8,'T':7,'I':6,'G':5,'R':4,'1':4,'2':3,'W':3},
-    'D':{'R':20,'E':15,'A':12,'I':10,'S':8,'U':7,'1':6,'2':5,'3':4,' ':4},
-    'L':{'A':15,'E':14,'I':12,'O':10,'U':8,' ':7,'T':6,'1':5,'2':4,'D':4,'S':3},
-    'G':{'E':18,'A':12,'O':10,'S':8,'R':7,' ':6,'U':5,'1':4,'2':3,'N':3,'I':3},
-    'K':{'A':15,'I':12,'O':10,'U':8,'E':7,' ':6,'1':5,'2':4,'3':3,'N':3,'L':3},
-    'C':{'H':18,'A':15,'O':12,'L':10,'E':9,'K':8,'I':7,'U':6,'1':5,'2':4,'3':3,'R':3},
-    'F':{'M':40,'R':12,'L':8,'E':6,'U':5,'I':4,'O':3,'A':3},
-    'M':{'D':15,'U':10,'A':9,'X':8,'E':8,'I':7,'S':5,'1':4,'2':3,'3':3},
-    'H':{'I':15,'A':12,'E':10,'U':8,'R':7,'O':6,'1':5,'2':4,'N':3},
-    'P':{'O':15,'L':12,'R':10,'A':9,'E':8,'I':7,'U':6,'1':5,'2':4,'3':3},
-    'U':{'R':15,'N':12,'S':10,'E':8,'1':6,'2':5,'3':4,'K':4,'L':3},
-    'W':{'D':20,'A':15,'E':12,'I':10,'S':8,'R':7,'1':6,'2':5,'3':4,' ':4},
-    'B':{'B':20,'A':15,'R':12,'E':10,'1':8,'2':7,'C':6,' ':4,'Y':3},
-    'X':{'T':15,'1':12,'2':10,'3':8,'4':6,' ':5},
-    '1':{'0':20,'1':15,'2':12,'3':10,'4':8,'5':7,'6':6,'7':5,'8':4,'9':3,' ':3},
-    '2':{'0':20,'1':15,'2':12,'3':10,'4':8,'5':7,'6':6,'7':5,'8':4,'9':3,' ':3},
-    '3':{'0':15,'1':12,'2':10,'3':8,'4':7,'5':6,'6':5,'7':4,'8':3,'9':3,' ':3},
-};
-
-function bigramScore(a, b) { 
-    if (!a || !b) return 1;
-    return (BIGRAM[a]?.[b] || 1);
-}
-
-function buildRTString() {
-    let rt = '';
-    for (let i = 0; i < 64; i++) {
-        const sl = currentState.rtSlots[i];
-        if (!sl || sl.char === '\r') break;
-        if (sl.conf > 0) rt += sl.char; else if (rt.length > 0) break;
-    }
-    return rt.trimEnd();
-}
-
-function buildAIPrediction(pi) {
-    const entry   = (!isSpecialPI(pi) && pi) ? db[pi] : null;
-    const ref     = findRefEntry(pi);
-    const psSlots = [];
-
-    if (psLocked && lastBroadcastPS && entry && !entry.psIsDynamic) {
-        for (let i = 0; i < 8; i++)
-            psSlots.push({ char: lastBroadcastPS[i] || ' ', conf: 1.0, src: 'raw-0' });
-    } else if (isSpecialPI(pi)) {
-        for (let i = 0; i < 8; i++) {
-            const rawChar = currentState.psBuf[i] || ' ';
-            const rawErr  = currentState.psErrBuf[i];
-            const rawConf = CONF_TABLE[Math.min(rawErr, 3)];
-            psSlots.push(rawChar !== ' ' && rawErr <= 1
-                ? { char: rawChar, conf: rawConf, src: `raw-${rawErr}` }
-                : { char: rawChar, conf: 0, src: 'empty' });
+        
+        let psLocked = false;
+        let psLockReason = '';
+        if (currentState.frozenPs) {
+            psLocked = true;
+            psLockReason = 'Frozen DB Frame';
+        } else if (currentState.latestAi.conf === 100 && currentState.latestAi.fmdx) {
+            psLocked = true;
+            psLockReason = 'DB verified string';
         }
-    } else {
-        for (let i = 0; i < 8; i++) {
-            const rawChar = currentState.psBuf[i];
-            const rawErr  = currentState.psErrBuf[i];
-            const rawConf = CONF_TABLE[Math.min(rawErr, 3)];
 
-            if (entry?.psIsDynamic && entry.psLastRaw?.[i] != null &&
-                currentState.psRoundReceivedAfterConfirm) {
-                psSlots.push({ char: entry.psLastRaw[i], conf: 0.9, src: 'ai-dynamic' }); continue;
-            }
-            if (rawErr <= 1 && rawChar && rawChar !== ' ' && currentState.psRoundReceivedAfterConfirm) {
-                psSlots.push({ char: rawChar, conf: rawConf, src: `raw-${rawErr}` }); continue;
-            }
-            if (entry && !entry.psIsDynamic && entry.ps[i]) {
-                const wv = getWeightedVotes(entry.ps[i]);
-                if (Object.keys(wv).length > 0) {
-                    let best = ' ', bestW = 0;
-                    for (const [ch, w] of Object.entries(wv)) { if (w > bestW) { bestW = w; best = ch; } }
-                    const total = Object.values(wv).reduce((a, b) => a + b, 0);
-                    const conf  = Math.min(0.95, bestW / total);
-                    if (conf > 0.3) {
-                        const dc = (rawChar && rawChar !== ' ' && rawErr <= 1 &&
-                            rawChar.toUpperCase() === best.toUpperCase()) ? rawChar : best;
-                        psSlots.push({ char: dc, conf,
-                            src: 'ai-voted-' + (conf > 0.7 ? 'high' : conf > 0.5 ? 'mid' : 'low') });
-                        continue;
-                    }
-                }
-            }
-            
-            if (ref?.psVariants?.length > 0) {
-                const refPS = ref.psVariants[0].padEnd(8, ' ');
-                const ms  = computeRefMatchScore(pi);
-                
-                if (ms >= 0.4) {
-                    const src = ms >= 0.5 ? 'ref-match' : 'ref-seed';
-                    
-                    if (refPS[i] === ' ' && (!entry?.psIsDynamic && ref.psVariants.length === 1)) {
-                        psSlots.push({ char: ' ', conf: 0.3 + ms * 0.4, src: 'ref-match' }); 
-                        continue;
-                    }
-                    
-                    if (refPS[i] !== ' ') {
-                        const dc  = (rawChar && rawChar !== ' ' && rawErr <= 1 &&
-                            rawChar.toUpperCase() === refPS[i].toUpperCase()) ? rawChar : refPS[i];
-                        psSlots.push({ char: dc, conf: 0.3 + ms * 0.4, src }); 
-                        continue;
-                    }
-                }
-            }
-            
-            if (i > 0 && psSlots[i-1]) {
-                const bg = Object.entries(BIGRAM[psSlots[i-1].char] || {}).sort((a, b) => b[1] - a[1]);
-                if (bg.length > 0) { psSlots.push({ char: bg[0][0], conf: 0.1, src: 'ai-bigram' }); continue; }
-            }
-            psSlots.push({ char: ' ', conf: 0, src: 'empty' });
-        }
-    }
+        let altFreqs = fmdxByPI[pi] || [];
+        
+        broadcast({ 
+            type: 'rdsm_ai', ts: Date.now(), pi: pi, ps: psSlots, 
+            psName: currentState.latestAi.fmdx, stats: { 
+                refItu: currentState.latestAi.itu,
+                refTxName: currentState.latestAi.refTxName,
+                refErp: currentState.latestAi.refErp,
+                refPol: currentState.latestAi.refPol,
+                refDistKm: currentState.latestAi.refDistKm,
+                refAzimuth: currentState.latestAi.refAzimuth
+            },
+            aiReason: currentState.latestAi.reason, aiColor: currentState.latestAi.statusColor,
+            aiConf: currentState.latestAi.conf,
+            af: Array.from(currentState.afSet),
+            altFreqs: altFreqs,
+            psLocked: psLocked,
+            psLockReason: psLockReason
+        });
 
-    const rtText   = buildRTString();
-    const rtResult = rtText.trim().length >= 3
-        ? { text: rtText, score: 0.8, src: 'raw-rt' }
-        : (entry?.rtLast?.trim().length >= 3
-            ? { text: entry.rtLast, score: 0.5, src: 'ai-rt-last' } : null);
-
-    const psVoteTotal = entry ? Object.values(entry.ps).reduce((a, posVotes) => {
-        const wv = getWeightedVotes(posVotes);
-        return a + Object.values(wv).reduce((x, y) => x + y, 0);
-    }, 0) : 0;
-
-    const refMatchScore = computeRefMatchScore(pi);
-    const stationConf   = computeStationConfidence(pi);
-    const provisionalPS = computeProvisionalPS(pi);
-    const afCoverage    = computeAFCoverage(pi);
-
-    const now = Date.now();
-    if (provisionalPS && provisionalPS !== lastProvisionalPS) {
-        lastProvisionalPS      = provisionalPS;
-        provisionalFirstSeenTs = now;
-    } else if (!provisionalPS) {
-        lastProvisionalPS      = null;
-        provisionalFirstSeenTs = 0;
-    }
-    const stableMs      = (provisionalPS && provisionalFirstSeenTs) ? (now - provisionalFirstSeenTs) : 0;
-    const psProvisional = (provisionalPS && stationConf >= PROVISIONAL_MIN_CONF) ? provisionalPS : null;
-
-    let psName = null, psNameSrc = null, psVariants = [];
-    if (!isSpecialPI(pi) && ref?.psVariants?.length > 0) {
-        psVariants = ref.psVariants.map(v => v.trim()).filter(v => v.length > 0);
-        psName     = ref.station?.trim().length > 0 ? ref.station.trim() : null;
-        psNameSrc  = 'fmdx';
-    }
-
-    const psIsDynamicEffective = (entry?.psIsDynamic || false);
-
-    const rawAltFreqs = (!isSpecialPI(pi) && psLocked && lastBroadcastPS)
-        ? getAltFreqsForPIAndPS(pi, lastBroadcastPS)
-        : (!isSpecialPI(pi) ? getAltFreqsForPI(pi) : []);
-
-    const seenFreqs = new Set();
-    const altFreqs  = [];
-    for (const item of rawAltFreqs) {
-        const key = parseFloat(item.freq).toFixed(1);
-        if (!seenFreqs.has(key)) {
-            seenFreqs.add(key);
-            altFreqs.push({ freq: parseFloat(item.freq).toFixed(1),
-                distKm: item.distKm, station: item.station, psVariants: item.psVariants || [] });
-        }
-    }
-    altFreqs.sort((a, b) => parseFloat(a.freq) - parseFloat(b.freq));
-
-    const afArray = Array.from(currentState.afSet)
-        .map(f => parseFloat(f.toFixed ? f.toFixed(1) : String(f)))
-        .sort((a, b) => a - b);
-
-    const dbFreqEntries = getDbEntriesForFreq(currentState.freq);
-
-    return {
-        pi, 
-		nativeWebserverPI: nativePI,
-        ps: psSlots, rt: rtResult, af: afArray,
-        nativeWebserverPS: nativePS,
-        psName, psNameSrc, psVariants: ref?.psVariants || [], altFreqs, psLocked,
-        itu: ref?.itu || null,
-        psProvisional,
-        psProvisionalConf: stationConf,
-        psStableMs:        stableMs,
-        psLockReason:      lastLockReason,
-        dbFreqEntries,
-        stats: {
-            freq:          entry?.freq    || currentState.freq,
-            seenCount:     entry?.seenCount || 0,
-            psVoteTotal:   Math.round(psVoteTotal),
-            psIsDynamic:   psIsDynamicEffective,
-            psLocked,
-            refStation:    ref?.station   || null,
-            refTxName:     ref?.txName    || null,
-            refItu:        ref?.itu       || null,
-            refDistKm:     ref?.distKm    ?? null,
-            refAzimuth:    ref?.azimuth   ?? null,
-            refErp:        ref?.erp       ?? null,
-            refPol:        ref?.pol       || null,
-            refMatchScore: Math.round(refMatchScore * 100),
-            pireg:         ref?.pireg     || null,
-            piMain:        ref?.piMain    || null,
-            stationConf:   Math.round(stationConf * 100),
-            afCoverage:    Math.round(afCoverage * 100),
-            qualZeroErr:   Math.round(recentZeroErrFraction() * 100),
-        },
-    };
-}
-
-function onPIConfirmed(pi) {
-    if (isSpecialPI(pi)) {
-        const prediction = buildAIPrediction(pi);
-        currentState.lastPrediction = prediction;
-        setTimeout(() => broadcast({ type: 'rdsm_ai', ...prediction, ts: Date.now() }), AI_BROADCAST_DELAY);
-        if (dataHandler) { dataHandler.dataToSend.pi = pi; dataHandler.initialData.pi = pi; dataHandler.dataToSend.rds = true; }
         if (rdsFollowMode) applyFollowToDataHandler();
-        return;
-    }
-
-    const entry = ensurePI(pi);
-    const ref   = findRefEntry(pi);
-	
-	if (ref && ref.distKm !== undefined) {
-        entry.distKm = ref.distKm;
-    }
-
-    if (entry.psIsDynamic && ref?.psVariants?.length === 1) {
-        entry.psIsDynamic = false;
-        entry.ps          = {};
-        entry.psResolved  = null;
-        entry.psConf      = new Array(8).fill(0);
-        dbDirty = true;
-    }
-
-    if (ref?.psVariants?.length > 0 && Object.keys(entry.ps).length === 0) {
-        const refPS = ref.psVariants[0].padEnd(8, ' ');
-        for (let i = 0; i < 8; i++) {
-            if (refPS[i] && refPS[i] !== ' ') {
-                if (!entry.ps[i]) entry.ps[i] = {};
-                entry.ps[i][refPS[i]] = { w: 1.0, count: 1, firstSeen: Date.now(), lastSeen: Date.now() };
-            }
-        }
-        entry.psResolved = resolvePS(pi);
-        entry.psConf     = computePSConf(pi);
-        dbDirty = true;
-    }
-
-    if (entry.psVerifiedRaw) {
-        if (!isPSStringClean(entry.psVerifiedRaw)) {
-            entry.psVerifiedRaw = null; entry.psVerifiedRawTs = 0; dbDirty = true;
-        } else if (ref?.psVariants?.length > 0) {
-            const su = entry.psVerifiedRaw.trim().toUpperCase();
-            const ok = ref.psVariants.some(v => {
-                const vu = v.trim().toUpperCase();
-                return su === vu || su.startsWith(vu) || vu.startsWith(su);
-            });
-            if (!ok) {
-                entry.psVerifiedRaw = null; entry.psVerifiedRawTs = 0; dbDirty = true;
-            }
-        }
-    }
-
-    if (!psLocked) checkAndLockPS(pi);
-
-    const prediction = buildAIPrediction(pi);
-    currentState.lastPrediction = prediction;
-    setTimeout(() => broadcast({ type: 'rdsm_ai', ...prediction, ts: Date.now() }), AI_BROADCAST_DELAY);
-
-    if (dataHandler) {
-        if (pi && pi !== '?' && pi !== '----') { dataHandler.dataToSend.pi = pi; dataHandler.initialData.pi = pi; }
-        dataHandler.dataToSend.rds = true;
-    }
-    if (rdsFollowMode) applyFollowToDataHandler();
+    });
 }
 
 function parseAndDispatch(raw) {
     let dataHex, errorHex;
-    if (raw.length >= 18) {
-        dataHex = raw.slice(0, 16); errorHex = raw.slice(16, 18);
-    } else if (raw.length === 14) {
+    if (raw.length >= 18) { dataHex = raw.slice(0, 16); errorHex = raw.slice(16, 18); } 
+    else if (raw.length === 14) {
         if (!legacyPiCache || legacyPiCache.length < 4) return;
         const legacyErr = parseInt(raw.slice(12), 16);
-        let errNew      = (legacyPiCache.length - 4) << 6;
-        errNew |= (legacyErr & 0x03) << 4;
-        errNew |= (legacyErr & 0x0C);
-        errNew |= (legacyErr & 0x30) >> 4;
-        dataHex  = legacyPiCache.slice(0, 4) + raw.slice(0, 12);
+        let errNew = (legacyPiCache.length - 4) << 6 | (legacyErr & 0x03) << 4 | (legacyErr & 0x0C) | (legacyErr & 0x30) >> 4;
+        dataHex = legacyPiCache.slice(0, 4) + raw.slice(0, 12);
         errorHex = errNew.toString(16).padStart(2, '0');
     } else return;
 
     const errByte = parseInt(errorHex, 16);
-    const errB    = [(errByte>>6)&3, (errByte>>4)&3, (errByte>>2)&3, errByte&3];
-
+    const errB = [(errByte>>6)&3, (errByte>>4)&3, (errByte>>2)&3, errByte&3];
     const piRawUpper = dataHex.slice(0, 4).toUpperCase();
-    const b2hex = dataHex.slice(4,  8);
-    const b3hex = dataHex.slice(8,  12);
-    const b4hex = dataHex.slice(12, 16);
+    const b2hex = dataHex.slice(4,  8), b3hex = dataHex.slice(8,  12), b4hex = dataHex.slice(12, 16);
 
-    // --- NEW FILTER ---
-    // If Block 3 AND Block 4 have error level 2 or 3, the frame has no payload.
-    // If Block 1 (PI) is > 1, the station identity is corrupt.
-    // We skip writing these empty/corrupt frames to the CSV.
     const noPayload = (errB[2] >= 2 && errB[3] >= 2);
     const badPI = (errB[0] > 1);
 
     if (isRecording && recordStream && !noPayload && !badPI) {
-        const tsStr = new Date().toISOString();
-        const freqStr = currentState.freq || '-';
-        const piRec = piRawUpper;
-        const errStr = errB.join('');
-
-        const pred = currentState.lastPrediction;
         let aiPs = '________', aiConf = 0, fmdx = '', itu = '';
-        if (pred) {
-            aiPs = pred.ps ? pred.ps.map(s => s.char && s.char !== ' ' ? s.char : '_').join('').padEnd(8, '_').replace(/,/g, '') : '________';
-            aiConf = pred.ps ? Math.round((pred.ps.reduce((acc, s) => acc + (s.conf || 0), 0) / 8) * 100) : 0;
-            fmdx = pred.psName ? pred.psName.replace(/,/g, '') : '';
-            itu = (pred.stats && pred.stats.refItu) ? pred.stats.refItu.replace(/,/g, '') : '';
+        if (currentState.latestAi && currentState.latestAi.ps) {
+            aiPs = currentState.latestAi.ps.padEnd(8, '_').replace(/ /g, '_'); // Force underscores
+            aiConf = currentState.latestAi.conf;
+            fmdx = currentState.latestAi.fmdx ? currentState.latestAi.fmdx.replace(/,/g, '') : '';
+            itu = currentState.latestAi.itu ? currentState.latestAi.itu.replace(/,/g, '') : '';
         }
-
-        const csvLine = `${tsStr},${freqStr},${piRec},${b2hex},${b3hex},${b4hex},${errStr},"${aiPs}",${aiConf},"${fmdx}","${itu}"\n`;
-        recordStream.write(csvLine);
+        recordStream.write(`${new Date().toISOString()},${currentState.freq || '-'},${piRawUpper},${b2hex},${b3hex},${b4hex},${errB.join('')},"${aiPs}",${aiConf},"${fmdx}","${itu}"\n`);
     }
 
-    // Stop execution completely if the PI code is bad
     if (badPI) return;
-    const pi = piRawUpper;
 
-    if (pi !== currentState.pi) {
-        currentState.pi        = pi;
-        piConfirmCount         = 1;
-        piConfirmed            = false;
-        piPendingBroadcast     = false;
-        psLocked               = false;
-        lastBroadcastPS        = null;
-        lastProvisionalPS      = null;
-        provisionalFirstSeenTs = 0;
-        lastLockReason         = null;
-        qualWindow             = [];
-
+    if (piRawUpper !== currentState.pi) {
+        currentState.pi = piRawUpper;
         currentState.psBuf.fill(' '); currentState.psErrBuf.fill(3);
         currentState.psSegsSeen.clear();
+        currentState.rawAccumulatedPS = '        ';
         currentState.rtSlots = Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 }));
-        currentState.rtAB    = -1;
-        currentState.afSet   = new Set();
-        currentState.psRoundReceivedAfterConfirm = false;
-
-        if (!isSpecialPI(pi)) {
-            const e = db[pi];
-            if (e) {
-                if (e.psDynamicBuf) e.psDynamicBuf.length = 0;
-                else Object.defineProperty(e, 'psDynamicBuf', { value: [], writable: true, enumerable: false, configurable: true });
-                e.psIsDynamic = false;
-                e.psLastRaw   = new Array(8).fill(null);
-                e.psLastRawTs = 0;
-            }
-        }
-        currentState.freqRefs = isSpecialPI(pi) ? [] : getFreqRefs(currentState.freq);
-
-    } else {
-        piConfirmCount++;
+        currentState.rtAB = -1; currentState.afSet.clear(); currentState.frozenPs = null;
     }
 
-    const threshold = getConfirmThreshold(pi);
-
-    if (!piConfirmed && piConfirmCount >= threshold) {
-        if (!isPIAllowed(pi)) { piConfirmCount = 0; return; }
-        piConfirmed = true;
-        broadcast({ type: 'rdsm_raw', pi, freq: currentState.freq, errB });
-        onPIConfirmed(pi);
-    } else if (piConfirmed) {
-        broadcast({ type: 'rdsm_raw', pi, freq: currentState.freq, b2: b2hex, b3: b3hex, b4: b4hex, errB });
-    }
-
-    if (!pi || pi === '----') return;
-    decodeGroup(pi, b2hex, b3hex, b4hex, errB);
-    if (piConfirmed) scheduleAIBroadcast(pi);
-}
-
-let _aiTimer = null;
-function scheduleAIBroadcast(pi) {
-    if (_aiTimer) return;
-    _aiTimer = setTimeout(() => {
-        _aiTimer = null;
-        if (!piConfirmed || currentState.pi !== pi) return;
-        const prediction = buildAIPrediction(pi);
-        currentState.lastPrediction = prediction;
-        broadcast({ type: 'rdsm_ai', ...prediction, ts: Date.now() });
-        if (rdsFollowMode) applyFollowToDataHandler();
-    }, AI_BROADCAST_DELAY);
+    decodeGroup(piRawUpper, b2hex, b3hex, b4hex, errB);
+    
+    broadcast({ type: 'rdsm_raw', ts: new Date().toISOString(), pi: piRawUpper, freq: currentState.freq, b2: b2hex, b3: b3hex, b4: b4hex, errB });
 }
 
 function broadcast(payload) {
     if (!pluginsWss) return;
     const msg = JSON.stringify(payload);
-    pluginsWss.clients.forEach(c => {
-        if (c.readyState === c.OPEN) try { c.send(msg); } catch(e) {}
-    });
-}
-
-function stripRDSLines(data) { // eslint-disable-line no-unused-vars
-    return data.split('\n').filter(l => !l.startsWith('R')).join('\n');
+    pluginsWss.clients.forEach(c => { if (c.readyState === c.OPEN) try { c.send(msg); } catch(e) {} });
 }
 
 function interceptLines(data) {
     for (const line of data.split('\n')) {
         const l = line.trim();
-        if (l.startsWith('P') && l.length >= 5) {
-            legacyPiCache = l.slice(1).trim();
-        } else if (l.startsWith('T') && l.length >= 2) {
+        if (l.startsWith('P') && l.length >= 5) legacyPiCache = l.slice(1).trim();
+        else if (l.startsWith('T') && l.length >= 2) {
             const freq = (parseFloat(l.slice(1)) / 1000).toFixed(3);
             if (freq !== currentState.freq) {
-                currentState.freq  = freq;
-                currentFreq        = freq;
-                currentState.pi    = null;
-                nativePI = '----';
-                nativePS = '        ';
-                piConfirmCount     = 0;
-                piConfirmed        = false;
-                piPendingBroadcast = false;
-                psLocked           = false;
-                lastBroadcastPS    = null;
-                lastProvisionalPS      = null;
-                provisionalFirstSeenTs = 0;
-                lastLockReason         = null;
-                qualWindow             = []; 
-                currentState.psBuf.fill(' ');
-                currentState.psErrBuf.fill(3);
+                currentState.freq = freq; currentState.pi = null;
+                nativePI = '?';
+                currentState.psBuf.fill(' '); currentState.psErrBuf.fill(3);
                 currentState.psSegsSeen.clear();
+                currentState.rawAccumulatedPS = '        ';
                 currentState.rtSlots = Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 }));
-                currentState.rtAB    = -1;
-                currentState.afSet   = new Set();
-                currentState.psRoundReceivedAfterConfirm = false;
-                currentState.freqRefs = getFreqRefs(freq);
-                currentState.lastPrediction = null;
-                if (_aiTimer) { clearTimeout(_aiTimer); _aiTimer = null; }
-                legacyPiCache = null;
-                clearRDSInDataHandler();
-
-                broadcast({
-                    type:  'rdsm_freq',
-                    freq,
-                    reset: true,
-                    pi:    null,
-                    ps:    null,
-                    dbFreqEntries: getDbEntriesForFreq(freq),
-                    stats: {
-                        freq,
-                        seenCount:     0,
-                        psVoteTotal:   0,
-                        psIsDynamic:   false,
-                        psLocked:      false,
-                        refStation:    null,
-                        refDistKm:     null,
-                        refMatchScore: 0,
-                        pireg:         null,
-                        piMain:        null,
-                    },
-                });
-
-                const knownPI = findKnownPIForFreq(freq);
-                if (knownPI) {
-                    currentState.pi             = knownPI;
-                    currentState.lastPrediction = buildAIPrediction(knownPI);
-                    piPendingBroadcast          = true;
-                }
+                currentState.rtAB = -1; currentState.afSet.clear(); currentState.frozenPs = null;
+                legacyPiCache = null; clearRDSInDataHandler();
+                broadcast({ type: 'rdsm_freq', freq, reset: true });
             }
-        } else if (l.startsWith('R') && l.length >= 14) {
-            parseAndDispatch(l.slice(1).trim());
-        }
+        } else if (l.startsWith('R') && l.length >= 14) parseAndDispatch(l.slice(1).trim());
     }
 }
 
 function hookDataHandler(dh) {
     if (!dh || typeof dh.handleData !== 'function') return;
     const orig = dh.handleData.bind(dh);
-
     dh.handleData = function(wss, receivedData, rdsWss) {
         if (!pluginsMainWss && wss) pluginsMainWss = wss;
-
         interceptLines(receivedData);
-
         if (aiExclusiveMode) return;
 
-        if (rdsFollowMode && piConfirmed) {
+        if (rdsFollowMode && currentState.pi) {
             applyFollowToDataHandler();
-
-            const fields = [
-                'pi', 'ps', 'ps_errors', 'pty', 'tp', 'ta', 'ms',
-                'rt0', 'rt1', 'rt0_errors', 'rt1_errors', 'rt_flag',
-                'ecc', 'country_iso', 'country_name', 'af', 
-                'lic', 'lang'
-            ];
-
-            const lockedData = {};
-            const lockedInit = {};
-
+            const fields = ['pi', 'ps', 'ps_errors', 'pty', 'tp', 'ta', 'ms', 'rt0', 'rt1', 'rt0_errors', 'rt1_errors', 'rt_flag', 'ecc', 'country_iso', 'country_name', 'af', 'lic', 'lang'];
+            const lockedData = {}, lockedInit = {};
             fields.forEach(f => {
-                lockedData[f] = dh.dataToSend[f];
-                lockedInit[f] = dh.initialData[f];
-
-                Object.defineProperty(dh.dataToSend, f, {
-                    get: () => lockedData[f],
-                    set: (val) => {
-                        if (f === 'pi') nativePI = val;
-                        if (f === 'ps') nativePS = val;
-                    },
-                    configurable: true,
-                    enumerable: true
-                });
-
-                Object.defineProperty(dh.initialData, f, {
-                    get: () => lockedInit[f],
-                    set: () => {},
-                    configurable: true,
-                    enumerable: true
-                });
+                lockedData[f] = dh.dataToSend[f]; lockedInit[f] = dh.initialData[f];
+                Object.defineProperty(dh.dataToSend, f, { get: () => lockedData[f], set: (val) => { if (f === 'pi') nativePI = val; if (f === 'ps') nativePS = val; }, configurable: true, enumerable: true });
+                Object.defineProperty(dh.initialData, f, { get: () => lockedInit[f], set: () => {}, configurable: true, enumerable: true });
             });
-
             const result = orig.call(this, wss, receivedData, rdsWss);
-
             fields.forEach(f => {
-                lockedData[f] = dh.dataToSend[f];
-                lockedInit[f] = dh.initialData[f];
-
-                Object.defineProperty(dh.dataToSend, f, {
-                    get: () => lockedData[f],
-                    set: (val) => {
-                        lockedData[f] = val;
-                    },
-                    configurable: true,
-                    enumerable: true
-                });
-
-                Object.defineProperty(dh.initialData, f, {
-                    get: () => lockedInit[f],
-                    set: (val) => {
-                        lockedInit[f] = val;
-                    },
-                    configurable: true,
-                    enumerable: true
-                });
+                lockedData[f] = dh.dataToSend[f]; lockedInit[f] = dh.initialData[f];
+                Object.defineProperty(dh.dataToSend, f, { get: () => lockedData[f], set: (val) => { lockedData[f] = val; }, configurable: true, enumerable: true });
+                Object.defineProperty(dh.initialData, f, { get: () => lockedInit[f], set: (val) => { lockedInit[f] = val; }, configurable: true, enumerable: true });
             });
-
             return result;
         }
-
         const result = orig.call(this, wss, receivedData, rdsWss);
-        
-        nativePI = dh.dataToSend.pi;
-        nativePS = dh.dataToSend.ps;
-
+        nativePI = dh.dataToSend.pi; nativePS = dh.dataToSend.ps;
         return result;
     };
     logInfo(`[${PLUGIN_NAME}] datahandler hooked`);
 }
 
 function handlePluginMessage(ws, raw) {
-    let msg;
-    try { msg = JSON.parse(raw); } catch(e) { return; }
-
+    let msg; try { msg = JSON.parse(raw); } catch(e) { return; }
     if (msg.type === 'rdsm_get_rds_follow') {
-        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode })); }
-        catch(e) {}
+        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode })); } catch(e) {}
         return;
     }
-    
     if (msg.type === 'rdsm_set_rds_follow') {
-        const next = !!msg.enabled;
-        if (next !== rdsFollowMode) {
-            rdsFollowMode     = next;
-            nativeRDSDisabled = next;
-            dbDirty = true;
-            logInfo(`[${PLUGIN_NAME}] RDS Follow ${next ? 'ENABLED' : 'DISABLED'}`);
-            if (!next) clearRDSInDataHandler();
-            else if (piConfirmed) applyFollowToDataHandler();
-        }
+        rdsFollowMode = !!msg.enabled; nativeRDSDisabled = rdsFollowMode;
+        if (!rdsFollowMode) clearRDSInDataHandler(); else if (currentState.pi) applyFollowToDataHandler();
         broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode });
         return;
     }
-    
     if (msg.type === 'rdsm_set_rds_lock') {
-        const next = !!msg.locked;
-        if (next !== rdsFollowLocked) {
-            rdsFollowLocked = next;
-            dbDirty = true;
-            logInfo(`[${PLUGIN_NAME}] RDS Follow Lock set to: ${next ? 'LOCKED' : 'UNLOCKED'}`);
-        }
+        rdsFollowLocked = !!msg.locked;
         broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode });
         return;
     }
-
-    if (msg.type === 'rdsm_toggle_record') {
-        if (!msg.isAdmin) return;
-        if (!isRecording) {
-            mufTriggeredRecord = false; 
-            startServerRecording();
-        } else {
-            mufTriggeredRecord = false;
-            stopServerRecording();
-        }
+    if (msg.type === 'rdsm_toggle_record' && msg.isAdmin) {
+        if (!isRecording) { mufTriggeredRecord = false; startServerRecording(); } else { mufTriggeredRecord = false; stopServerRecording(); }
         return;
     }
-    
-    if (msg.type === 'rdsm_set_muf_mode') {
-        if (!msg.isAdmin) return;
+    if (msg.type === 'rdsm_set_muf_mode' && msg.isAdmin) {
         mufMode = msg.mode;
-        logInfo(`[${PLUGIN_NAME}] MUF Auto-Record mode set to: ${mufMode}`);
-        
-        if (mufCheckInterval) {
-            clearInterval(mufCheckInterval);
-            mufCheckInterval = null;
-        }
-        
-        if (mufMode !== 'OFF') {
-            mufCheckInterval = setInterval(checkMUFStatus, 60000);
-            checkMUFStatus(); // Initial check
-        } else {
-            if (isRecording && mufTriggeredRecord) {
-                stopServerRecording(true); // <--- Pass true here
-            }
-            mufTriggeredRecord = false;
-        }
+        if (mufCheckInterval) { clearInterval(mufCheckInterval); mufCheckInterval = null; }
+        if (mufMode !== 'OFF') { mufCheckInterval = setInterval(checkMUFStatus, 60000); checkMUFStatus(); } 
+        else { if (isRecording && mufTriggeredRecord) stopServerRecording(true); mufTriggeredRecord = false; }
         broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode });
         return;
-    }
-    
-    if (msg.type === 'rdsm_delete_pi') {
-        const piToDel = msg.pi ? msg.pi.toUpperCase() : null;
-        if (piToDel && db[piToDel]) {
-            delete db[piToDel];
-            dbDirty = true;
-            logInfo(`[${PLUGIN_NAME}] PI ${piToDel} deleted from local database by admin request.`);
-        }
-        return;
-    }
-}
-
-function registerAPIRoutes() {
-    try {
-        const app = pluginsApi.getHttpServer();
-        if (!app) return;
-        app.on('request', (req, res) => {
-            if (req.method === 'GET' && req.url === '/api/rdsm/stats') {
-                if (res.headersSent) return;
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    stationCount:  Object.keys(db).filter(k => k !== '_meta').length,
-                    fmdxFreqCount: Object.keys(fmdxByFreq).length,
-                    fmdxPICount:   Object.keys(fmdxByPI).length,
-                    rdsFollowMode, rdsFollowLocked, aiExclusiveMode,
-                    piConfirmed, psLocked,
-                    currentPI:   currentState.pi,
-                    currentFreq,
-                }));
-            }
-        });
-    } catch(e) {
-        logWarn(`[${PLUGIN_NAME}] Could not register API routes: ${e.message}`);
     }
 }
 
 function init() {
+    if (fs.existsSync(OLD_MEMORY_FILE)) {
+        try {
+            fs.unlinkSync(OLD_MEMORY_FILE);
+            logInfo(`[${PLUGIN_NAME}] Legacy cache file 'rdsm_memory.json' deleted.`);
+        } catch (e) {
+            logWarn(`[${PLUGIN_NAME}] Could not delete 'rdsm_memory.json': ${e.message}`);
+        }
+    }
+
     loadOwnLocation();
     startGpsWsListener();
-    loadDB();
     if (dataHandler) hookDataHandler(dataHandler);
-
-    pluginsWss     = pluginsApi.getPluginsWss();
+    pluginsWss = pluginsApi.getPluginsWss();
     pluginsMainWss = pluginsApi.getWss();
-
-    if (pluginsWss) {
-        pluginsWss.on('connection', (ws) => {
-            ws.on('message', (raw) => handlePluginMessage(ws, raw));
-        });
-    }
-
-    try { registerAPIRoutes(); } catch(e) {
-        logWarn(`[${PLUGIN_NAME}] Could not register API routes: ${e.message}`);
-    }
-
-    loadFmdxBulk().catch(e => logWarn(`[${PLUGIN_NAME}] fmdx.org load error: ${e.message}`));
-
+    if (pluginsWss) pluginsWss.on('connection', ws => ws.on('message', raw => handlePluginMessage(ws, raw)));
+    loadFmdxBulk();
     logInfo(`[${PLUGIN_NAME}] v${pluginConfig.version} initialised`);
 }
 

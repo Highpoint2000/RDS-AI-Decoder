@@ -2,11 +2,14 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="1913" height="836" alt="Screenshot 2026-04-14 105410" src="https://github.com/user-attachments/assets/145f8528-566e-403a-a4d9-4f4cd49cfb44" />
 
+## Version 3.0
 
-## Version 2.8
-
-- MUF detection (automatic start/stop) integrated for automatic RDS raw recording. Admins can choose between MUF EU, NA, and AU within the plugin.
-- Design adjustments
+- New Stateless Architecture: Completely removed the local database (rdsm_memory.json), which eliminates persistent "Ghost PIs" and the need for manual cleanups.
+- Replaced the old point-based voting system with an instant, real-time mathematical matching engine using "Perfect Frame" and "Chimera" logic.
+- Automatically fetches global transmitter data via the FMDX API for incoming signals, bypassing previous local distance (QTH) restrictions.
+- Modular Realtime Log: Introduced a detached, draggable, and resizable log panel featuring granular, inclusive data filters (PS, RT, AF, ECC, TP, TA, etc.).
+- MUF Auto-Record & Analytics: Added region-based MUF tracking that triggers automatic server-side CSV recording. The UI now displays rich analytics like transmitter distance, azimuth, and ERP/Polarization.
+- RAW Decoder Integration: Full support for parallel live usage (via WebSocket) and post-event forensics (CSV analysis) alongside the standalone RDS RAW Decoder tool: https://highpoint.fmdx.org/webtools/rds-raw-decoder.html
 
 ## Installation notes:
 
@@ -39,6 +42,11 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 2.8
+
+- MUF detection (automatic start/stop) integrated for automatic RDS raw recording. Admins can choose between MUF EU, NA, and AU within the plugin.
+- Design adjustments
 
 ### Version 2.7
 
