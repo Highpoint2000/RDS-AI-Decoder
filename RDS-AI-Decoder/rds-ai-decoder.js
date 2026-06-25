@@ -2,7 +2,7 @@
 //                                                           //
 //  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V3.0)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-24      //
+//  by Highpoint                last update: 2026-06-25      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -643,9 +643,16 @@ function renderRealtimeLog() {
 
     function syncFollowUI() {
         const panelBtn = document.getElementById('rdsm-follow-btn');
+        const lockBtn = document.getElementById('rdsm-lock-btn');
         if (panelBtn) {
             panelBtn.className = '';
             if (st.rdsFollow) { panelBtn.classList.add('on'); panelBtn.classList.add(st.rdsFollowLocked ? 'locked' : 'unlocked'); }
+        }
+        if (lockBtn) {
+            lockBtn.innerHTML = st.rdsFollowLocked ? '&#128274;' : '&#128275;';
+            lockBtn.title = st.rdsFollowLocked ? 'Locked (Admin only)' : 'Unlocked (Public toggle allowed)';
+            lockBtn.style.opacity = isAdmin ? '1' : '0.5';
+            lockBtn.style.cursor  = isAdmin ? 'pointer' : 'not-allowed';
         }
         const navBtn = document.getElementById('rdsm-btn');
         if (navBtn) {
@@ -749,10 +756,14 @@ function renderRealtimeLog() {
         .rgc{font-size:9px;font-weight:700;padding:1px 4px;border-radius:3px; background:transparent;color:#444;border:1px solid rgba(255,255,255,0.1); min-width:24px;text-align:center;transition:border-color .3s,box-shadow .3s,color .3s;}
         .rgc.on{background:transparent;color:#fff;border-color:var(--color-main-bright,#4a90d9); box-shadow: 0 0 3px rgba(74, 144, 217, 0.4);}
         
+        #rdsm-follow-wrap { display:flex; align-items:center; }
         #rdsm-follow-btn{ display:inline-flex;align-items:center;gap:4px; font-size:9px;font-weight:700;letter-spacing:.6px;text-transform:uppercase; color:#555;background:#181a24;border:1px solid #2a2d3a;border-radius:5px; padding:2px 8px 2px 6px;white-space:nowrap;user-select:none; transition:color .2s,border-color .2s,background .2s; }
         #rdsm-follow-btn.on.locked {color:#ff4444;border-color:#ff4444;background:#2a1111;}
         #rdsm-follow-btn.on.unlocked {color:#44ff88;border-color:#44ff88;background:#0d1a12;}
         
+        #rdsm-lock-btn { background:none;border:none;font-size:14px;cursor:pointer; margin-left:6px;padding:0;transition:transform 0.2s; user-select:none; filter: grayscale(20%); }
+        #rdsm-lock-btn:hover { transform: scale(1.1); }
+
         #rdsm-log-btn{font-size:10px;font-weight:700;color:#777; text-transform:uppercase;letter-spacing:1px; cursor:pointer; display:flex; align-items:center; gap:4px; margin-left:auto;}
         #rdsm-log-btn:hover{color:#fff;}
         #rdsm-log-arrow{font-size:8px;transition:transform .2s; display:inline-block; transform:rotate(-90deg);}
@@ -876,7 +887,10 @@ function renderRealtimeLog() {
           </div>
           <div id="rdsm-stats">
             <span id="rdsm-gc">Groups: 0</span>
-            <div id="rdsm-follow-btn" title="RDS Follow Indicator">RDS Follow</div>
+            <span id="rdsm-follow-wrap">
+              <div id="rdsm-follow-btn" title="RDS Follow Indicator">RDS Follow</div>
+              <button id="rdsm-lock-btn" title="Lock/Unlock RDS Follow">🔒</button>
+            </span>
             <span id="rdsm-ber-wrap">BER <span id="rdsm-bw"><div id="rdsm-bf" style="width:0%"></div></span> <span id="rdsm-bp">0%</span></span>
           </div>
         </div>
@@ -928,6 +942,19 @@ function renderRealtimeLog() {
             if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'rdsm_set_muf_mode', mode: nextMode, isAdmin: true }));
         });
 
+        document.getElementById('rdsm-lock-btn').addEventListener('click', () => {
+            if (!isAdmin) {
+                sendToast('warning', pluginName, 'Administrator login required to lock/unlock.');
+                return;
+            }
+            const next = !st.rdsFollowLocked;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type:'rdsm_set_rds_lock', locked: next }));
+            }
+            st.rdsFollowLocked = next;
+            syncFollowUI();
+        });
+
         document.getElementById('rdsm-log-btn').addEventListener('click', () => {
             logOpen = !logOpen;
             c.classList.toggle('log-open', logOpen);
@@ -965,7 +992,7 @@ function makeDrag(el, h, storageKey, isResizable = false) {
         } catch(e) {}
 
         h.addEventListener('mousedown', e => {
-            if (['rdsm-close', 'rdsm-record-btn', 'rdsm-muf-btn', 'rdsm-log-btn', 'rdsm-log-pause-btn'].includes(e.target.id)) return;
+            if (['rdsm-close', 'rdsm-record-btn', 'rdsm-muf-btn', 'rdsm-log-btn', 'rdsm-log-pause-btn', 'rdsm-lock-btn'].includes(e.target.id)) return;
             dr = true; el.classList.add('drag');
             sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect(); sl = r.left; st2 = r.top;

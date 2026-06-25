@@ -3,14 +3,10 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 <img width="2315" height="773" alt="image" src="https://github.com/user-attachments/assets/fd315024-af0d-4032-9879-a066759ceedd" />
 
 
-## Version 3.0
+## Version 3.0a Hotfix Version
 
-- New Stateless Architecture: Completely removed the local database (rdsm_memory.json), which eliminates persistent "Ghost PIs" and the need for manual cleanups.
-- Replaced the old point-based voting system with an instant, real-time mathematical matching engine using "Perfect Frame" and "Chimera" logic.
-- Automatically fetches global transmitter data via the FMDX API for incoming signals, bypassing previous local distance (QTH) restrictions.
-- Modular Realtime Log: Introduced a detached, draggable, and resizable log panel featuring granular, inclusive data filters (PS, RT, AF, ECC, TP, TA, etc.).
-- MUF Auto-Record & Analytics: Added region-based MUF tracking that triggers automatic server-side CSV recording. The UI now displays rich analytics like transmitter distance, azimuth, and ERP/Polarization.
-- RAW Decoder Integration: Full support for parallel live usage (via WebSocket) and post-event forensics (CSV analysis) alongside the standalone RDS RAW Decoder tool: https://highpoint.fmdx.org/webtools/rds-raw-decoder.html
+- ECC Country Flag Fix: Restored the legacy country-mapping logic. The server now explicitly sets country_iso to 'UN' (Unknown) when no Extended Country Code (ECC) is received, preventing the web server from incorrectly guessing a country flag based solely on the PI code.  
+- Admin UI Restoration: Implemented the Admin Padlock (🔒/🔓) UI and logic into the client-side plugin, enabling guest users to toggle the RDS Follow feature when unlocked by an administrator.
 
 ## Installation notes:
 
@@ -43,6 +39,15 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 3.0
+
+- New Stateless Architecture: Completely removed the local database (rdsm_memory.json), which eliminates persistent "Ghost PIs" and the need for manual cleanups.
+- Replaced the old point-based voting system with an instant, real-time mathematical matching engine using "Perfect Frame" and "Chimera" logic.
+- Automatically fetches global transmitter data via the FMDX API for incoming signals, bypassing previous local distance (QTH) restrictions.
+- Modular Realtime Log: Introduced a detached, draggable, and resizable log panel featuring granular, inclusive data filters (PS, RT, AF, ECC, TP, TA, etc.).
+- MUF Auto-Record & Analytics: Added region-based MUF tracking that triggers automatic server-side CSV recording. The UI now displays rich analytics like transmitter distance, azimuth, and ERP/Polarization.
+- RAW Decoder Integration: Full support for parallel live usage (via WebSocket) and post-event forensics (CSV analysis) alongside the standalone RDS RAW Decoder tool: https://highpoint.fmdx.org/webtools/rds-raw-decoder.html
 
 ### Version 2.8
 

@@ -2,12 +2,11 @@
 //                                                           //
 //  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.0)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-24      //
+//  by Highpoint                last update: 2026-06-25      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
 ///////////////////////////////////////////////////////////////
-
 
 'use strict';
 
@@ -71,6 +70,10 @@ let fmdxByFreq   = {};
 let fmdxByPI     = {};
 let fmdxLoadedAt = 0;
 
+// Logging State Trackers to prevent console spam
+let lastLoggedECC = null;
+let lastLoggedISO = null;
+
 let currentState = {
     pi: null, freq: null,
     psBuf:    new Array(8).fill(' '),
@@ -85,6 +88,55 @@ let currentState = {
     frozenPs: null,
     rawAccumulatedPS: '        '
 };
+
+const RDS_COUNTRY = (() => {
+    const T = {
+        0xE0: { 0x1:'DE', 0x2:'DZ', 0x3:'AD', 0x4:'IL', 0x5:'IT', 0x6:'BE', 0x7:'RU', 0x8:'PS', 0x9:'AL', 0xA:'AT', 0xB:'HU', 0xC:'MT', 0xD:'DE', 0xF:'EG' },
+        0xE1: { 0x1:'GR', 0x2:'CY', 0x3:'SM', 0x4:'CH', 0x5:'JO', 0x6:'FI', 0x7:'LU', 0x8:'BG', 0x9:'DK', 0xA:'GI', 0xB:'IQ', 0xC:'GB', 0xD:'LY', 0xE:'RO', 0xF:'FR' },
+        0xE2: { 0x1:'MA', 0x2:'CZ', 0x3:'PL', 0x4:'VA', 0x5:'SK', 0x6:'SY', 0x7:'TN', 0x9:'LI', 0xA:'IS', 0xB:'MC', 0xC:'LT', 0xD:'RS', 0xE:'ES', 0xF:'NO' },
+        0xE3: { 0x1:'ME', 0x2:'IE', 0x3:'TR', 0x5:'TJ', 0x8:'NL', 0x9:'LV', 0xA:'LB', 0xB:'AZ', 0xC:'HR', 0xD:'KZ', 0xE:'SE', 0xF:'BY' },
+        0xE4: { 0x1:'MD', 0x2:'EE', 0x3:'MK', 0x6:'UA', 0x7:'XK', 0x8:'PT', 0x9:'SI', 0xA:'AM', 0xB:'UZ', 0xC:'GE', 0xE:'TM', 0xF:'BA' },
+        0xE5: { 0x3:'KG' },
+    };
+    const NAMES = {
+        'DE':'Germany',         'DZ':'Algeria',         'AD':'Andorra',
+        'IL':'Israel',          'IT':'Italy',            'BE':'Belgium',
+        'RU':'Russia',          'PS':'Palestine',        'AL':'Albania',
+        'AT':'Austria',         'HU':'Hungary',          'MT':'Malta',
+        'EG':'Egypt',           'GR':'Greece',           'CY':'Cyprus',
+        'SM':'San Marino',      'CH':'Switzerland',      'JO':'Jordan',
+        'FI':'Finland',         'LU':'Luxembourg',       'BG':'Bulgaria',
+        'DK':'Denmark',         'GI':'Gibraltar',        'IQ':'Iraq',
+        'GB':'United Kingdom',  'LY':'Libya',            'RO':'Romania',
+        'FR':'France',          'MA':'Morocco',          'CZ':'Czech Republic',
+        'PL':'Poland',          'VA':'Vatican',          'SK':'Slovakia',
+        'SY':'Syria',           'TN':'Tunisia',          'LI':'Liechtenstein',
+        'IS':'Iceland',         'MC':'Monaco',           'LT':'Lithuania',
+        'RS':'Serbia',          'ES':'Spain',            'NO':'Norway',
+        'ME':'Montenegro',      'IE':'Ireland',          'TR':'Turkey',
+        'TJ':'Tajikistan',      'NL':'Netherlands',      'LV':'Latvia',
+        'LB':'Lebanon',         'AZ':'Azerbaijan',       'HR':'Croatia',
+        'KZ':'Kazakhstan',      'SE':'Sweden',           'BY':'Belarus',
+        'MD':'Moldova',         'EE':'Estonia',          'MK':'North Macedonia',
+        'UA':'Ukraine',         'PT':'Portugal',         'SI':'Slovenia',
+        'AM':'Armenia',         'UZ':'Uzbekistan',       'GE':'Georgia',
+        'TM':'Turkmenistan',    'BA':'Bosnia',           'KG':'Kyrgyzstan',
+        'XK':'Kosovo',
+    };
+    return { T, NAMES };
+})();
+
+function lookupCountry(pi, eccByte) {
+    if (!pi || pi === '?' || pi === '----') return null;
+    if (!eccByte || eccByte === 0) return null;
+    const piNibble = (parseInt(pi, 16) >> 12) & 0xF;
+    if (piNibble === 0) return null;
+    const eccMap = RDS_COUNTRY.T[eccByte];
+    if (!eccMap) return null;
+    const iso = eccMap[piNibble];
+    if (!iso) return null;
+    return { iso, name: RDS_COUNTRY.NAMES[iso] || iso };
+}
 
 function roundGps(coord) { return Math.round(coord * 100) / 100; }
 
@@ -630,7 +682,30 @@ function applyFollowToDataHandler() {
         dataHandler.initialData.rt_flag = rtFlag;
     }
 
-    if (currentState.ecc) dataHandler.dataToSend.ecc = parseInt(currentState.ecc, 16);
+    if (currentState.ecc) {
+        const eccByte = parseInt(currentState.ecc, 16);
+        dataHandler.dataToSend.ecc = eccByte;
+        const country = lookupCountry(pi, eccByte);
+        dataHandler.dataToSend.country_iso = country ? country.iso : 'UN';
+        dataHandler.dataToSend.country_name = country ? country.name : '';
+        
+        dataHandler.dataToSend.lic = 0;
+        dataHandler.dataToSend.lang = '';
+
+        if (lastLoggedECC !== currentState.ecc || lastLoggedISO !== dataHandler.dataToSend.country_iso) {
+            lastLoggedECC = currentState.ecc;
+            lastLoggedISO = dataHandler.dataToSend.country_iso;
+        }
+    } else {
+        if (lastLoggedECC !== 'NONE' || lastLoggedISO !== 'UN') {
+            lastLoggedECC = 'NONE';
+            lastLoggedISO = 'UN';
+        }
+    }
+
+    dataHandler.dataToSend.lic = 0;
+    dataHandler.dataToSend.lang = '';
+    
     dataHandler.dataToSend.rds = true;
 
     if (!Array.isArray(dataHandler.dataToSend.af)) dataHandler.dataToSend.af = [];
@@ -697,7 +772,23 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
 
     if (gT === 1 && vB === 0 && b3hex && errB[2] <= 1 && ((g3 >> 12) & 0x07) === 0) {
         const eccByte = g3 & 0xFF;
-        if (eccByte > 0) currentState.ecc = eccByte.toString(16).toUpperCase().padStart(2, '0');
+        if (eccByte > 0) {
+            const eccStr = eccByte.toString(16).toUpperCase().padStart(2, '0');
+            
+            if (currentState.ecc !== eccStr) {
+                logInfo(`[${PLUGIN_NAME}] 📥 Received ECC from RDS Signal: 0x${eccStr}`);
+                currentState.ecc = eccStr;
+            }
+
+            if (rdsFollowMode && dataHandler && pi && !isSpecialPI(pi)) {
+                dataHandler.dataToSend.ecc = eccByte;
+                const country = lookupCountry(pi, eccByte);
+                if (country) {
+                    dataHandler.dataToSend.country_iso = country.iso;
+                    dataHandler.dataToSend.country_name = country.name;
+                }
+            }
+        }
     }
 
     runLocalAiPrediction(pi).then(() => {
@@ -774,11 +865,16 @@ function parseAndDispatch(raw) {
 
     if (piRawUpper !== currentState.pi) {
         currentState.pi = piRawUpper;
+        
+        lastLoggedECC = null;
+        lastLoggedISO = null;
+
         currentState.psBuf.fill(' '); currentState.psErrBuf.fill(3);
         currentState.psSegsSeen.clear();
         currentState.rawAccumulatedPS = '        ';
         currentState.rtSlots = Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 }));
         currentState.rtAB = -1; currentState.afSet.clear(); currentState.frozenPs = null;
+        currentState.ecc = null;
     }
 
     decodeGroup(piRawUpper, b2hex, b3hex, b4hex, errB);
@@ -801,11 +897,16 @@ function interceptLines(data) {
             if (freq !== currentState.freq) {
                 currentState.freq = freq; currentState.pi = null;
                 nativePI = '?';
+                
+                lastLoggedECC = null;
+                lastLoggedISO = null;
+
                 currentState.psBuf.fill(' '); currentState.psErrBuf.fill(3);
                 currentState.psSegsSeen.clear();
                 currentState.rawAccumulatedPS = '        ';
                 currentState.rtSlots = Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 }));
                 currentState.rtAB = -1; currentState.afSet.clear(); currentState.frozenPs = null;
+                currentState.ecc = null;
                 legacyPiCache = null; clearRDSInDataHandler();
                 broadcast({ type: 'rdsm_freq', freq, reset: true });
             }
