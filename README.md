@@ -1,6 +1,7 @@
 # RDS AI Decoder
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
-<img width="1913" height="836" alt="Screenshot 2026-04-14 105410" src="https://github.com/user-attachments/assets/145f8528-566e-403a-a4d9-4f4cd49cfb44" />
+<img width="2315" height="773" alt="image" src="https://github.com/user-attachments/assets/fd315024-af0d-4032-9879-a066759ceedd" />
+
 
 ## Version 3.0
 
