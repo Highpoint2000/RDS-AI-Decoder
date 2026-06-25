@@ -8,6 +8,7 @@
 //                                                           //
 ///////////////////////////////////////////////////////////////
 
+
 'use strict';
 
 const fs         = require('fs');
@@ -602,9 +603,9 @@ function applyFollowToDataHandler() {
                    currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
     }
 
-    dataHandler.dataToSend.ps = targetPS;
+    dataHandler.dataToSend.ps = targetPS.replace(/_/g, ' '); 
     dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-    dataHandler.initialData.ps = targetPS;
+    dataHandler.initialData.ps = dataHandler.dataToSend.ps;
     
     dataHandler.dataToSend.tp = currentState.tp ? 1 : 0;
     dataHandler.dataToSend.ta = currentState.ta ? 1 : 0;
