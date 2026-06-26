@@ -3,10 +3,12 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 <img width="2315" height="773" alt="image" src="https://github.com/user-attachments/assets/fd315024-af0d-4032-9879-a066759ceedd" />
 
 
-## Version 3.0a (Hotfix Version)
+## Version 3.1
 
-- ECC Country Flag Fix: Restored the legacy country-mapping logic. The server now explicitly sets country_iso to 'UN' (Unknown) when no Extended Country Code (ECC) is received, preventing the web server from incorrectly guessing a country flag based solely on the PI code.  
-- Admin UI Restoration: Implemented the Admin Padlock (🔒/🔓) UI and logic into the client-side plugin, enabling guest users to toggle the RDS Follow feature when unlocked by an administrator.
+- Automatic patching function for tx_search.js: After successfully detecting a transmitter, the plugin automatically determines the TX data and transfers it at high speed to the main user interface's data pipeline and the WebSocket.
+- Fixed an issue with passing raw RDS data to the WebSocket when RDS Follow is active.
+
+### Important note: After installing this version for the first time, the web server must be restarted twice!
 
 ## Installation notes:
 
@@ -26,11 +28,6 @@ A demo video can be viewed [here](https://highpoint.fmdx.org/videos/RDS-AI-Decod
 A live demo with the RDS Follow function activated is available [here](http://highpoint2000.selfhost.de:8080)
 Recorded Raw RDS data can be analyzed and validated using this [web tool](https://highpoint.fmdx.org/webtools/rds-raw-decoder.html)
 
-## Notes: 
-
-- All data is cached in the file rdsm_memory.json in the specific plugin folder. Different retention periods apply to the data
-- Once activated, Follow Mode remains active even after a restart, as long as the file rdsm_memory.json is not deleted
-
 ## Contact
 
 If you have any questions, would like to report problems, or have suggestions for improvement, please feel free to contact me! You can reach me by email at highpoint2000@googlemail.com. I look forward to hearing from you!
@@ -39,6 +36,11 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 3.0a (Hotfix Version)
+
+- ECC Country Flag Fix: Restored the legacy country-mapping logic. The server now explicitly sets country_iso to 'UN' (Unknown) when no Extended Country Code (ECC) is received, preventing the web server from incorrectly guessing a country flag based solely on the PI code.  
+- Admin UI Restoration: Implemented the Admin Padlock (🔒/🔓) UI and logic into the client-side plugin, enabling guest users to toggle the RDS Follow feature when unlocked by an administrator.
 
 ### Version 3.0
 

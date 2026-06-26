@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.0)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.1)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-25      //
+//  by Highpoint                last update: 2026-06-26      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -18,7 +18,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '3.6',
+    version:      '3.1',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -323,16 +323,20 @@ function buildFmdxIndex(raw) {
             azimuth = calculateBearing(ownLat, ownLon, txLat, txLon);
         }
 
-        for (const st of txData.stations) {
+         for (const st of txData.stations) {
             if (!st.pi || !st.freq) continue;
             const f = roundFreq(String(st.freq));
             
             const entry = {
-                pi: st.pi.toUpperCase(), pireg: st.pireg ? st.pireg.toUpperCase() : null,
+                id: st.id,
+                pi: st.pi.toUpperCase(),
+                pireg: st.pireg ? st.pireg.toUpperCase() : null,
                 psVariants: parsePSVariants(st.ps),
                 station: st.station || txName,
-                txName: txName, itu: txItu,
-                distKm: distKm, azimuth: azimuth,
+                txName: txName,
+                itu: txItu,
+                distKm: distKm,
+                azimuth: azimuth,
                 erp: st.erp !== undefined ? st.erp : null, 
                 pol: st.pol ? st.pol.toUpperCase() : null
             };
@@ -404,43 +408,6 @@ function countCleanRawPositions() {
     return n;
 }
 
-function calculatePropagationScore(ref) {
-    if (!ref) return 0;
-    const distKm = ref.distKm || 9999;
-    let distScore = 0;
-    
-    if (distKm <= 100) distScore = 100;
-    else if (distKm <= 300) distScore = 80;
-    else if (distKm <= 800) distScore = 40; 
-    else if (distKm <= 2500) {
-        distScore = mufTriggeredRecord ? 60 : 20; 
-    }
-    else distScore = 5;
-    
-    const erp = ref.erp || 0.1; 
-    const pwrScore = Math.min(50, Math.log10(Math.max(1, erp * 10)) * 15);
-    
-    let siteBonus = 0;
-    if (ref.txName) {
-        let sharedSites = 0;
-        for (const f of currentState.afSet) {
-            const freqRefs = fmdxByFreq[parseFloat(f).toFixed(2)] || [];
-            if (freqRefs.some(r => r.txName === ref.txName)) {
-                sharedSites++;
-            }
-        }
-        siteBonus = Math.min(30, sharedSites * 10);
-    }
-    
-    let spEBonus = 0;
-    if (distKm > 800 && distKm < 2500) {
-        const cleanCount = countCleanRawPositions();
-        if (cleanCount >= 4) spEBonus = mufTriggeredRecord ? 40 : 20; 
-    }
-    
-    return distScore + pwrScore + siteBonus + spEBonus;
-}
-
 async function runLocalAiPrediction(pi) {
     if (!currentState.freq || currentState.freq === '-') return;
 
@@ -466,6 +433,60 @@ async function runLocalAiPrediction(pi) {
             st.possiblePS = possiblePS;
             matchingStations.push(st);
         }
+    }
+
+    if (matchingStations.length > 0) {
+        let distantCount = 0;
+        let localCount = 0;
+        let maxLocalErp = 0;
+
+        for (const loc of matchingStations) {
+            if (loc.distKm > 900) {
+                distantCount++;
+            } else if (loc.distKm < 600) {
+                localCount++;
+                if (loc.erp && loc.erp > maxLocalErp) {
+                    maxLocalErp = loc.erp;
+                }
+            }
+        }
+
+        let dynErp = 10;
+        let dynDist = 400;
+        let esMode = false;
+        const totalLocs = matchingStations.length;
+
+        if (distantCount > totalLocs * 0.3) {
+            esMode = true;
+            dynErp = 1;
+            dynDist = 2000;
+        } else if (localCount > 0 && maxLocalErp >= 10) {
+            esMode = false;
+            dynErp = 30;
+            dynDist = 700;
+        } else {
+            esMode = false;
+            dynErp = 5;
+            dynDist = 800;
+        }
+
+        for (let loc of matchingStations) {
+            let weightDistance = loc.distKm || 9999;
+            if (esMode && weightDistance > 700 && weightDistance !== 9999) {
+                weightDistance = Math.abs(weightDistance - 1500) + 200;
+            }
+            let erp = loc.erp && loc.erp > 0 ? loc.erp : 1;
+            let extraWeight = (erp >= dynErp && loc.distKm <= dynDist) ? 0.3 : 0;
+            let score = 0;
+            if (erp === 0.001) {
+                score = erp / weightDistance;
+            } else {
+                score = ((10 * (Math.log10(erp * 1000))) / weightDistance) + extraWeight;
+            }
+            loc.score = score;
+        }
+
+        matchingStations.sort((a, b) => b.score - a.score);
     }
 
     if (matchingStations.length === 0) {
@@ -528,19 +549,6 @@ async function runLocalAiPrediction(pi) {
         if (uniqueItus.length === 1) candidateStations = [candidateStations[0]];
     }
     
-    if (candidateStations.length > 1) {
-        let highestScore = -1;
-        let bestCandidate = candidateStations[0];
-        for (const cand of candidateStations) {
-            const score = calculatePropagationScore(cand.station);
-            if (score > highestScore) {
-                highestScore = score;
-                bestCandidate = cand;
-            }
-        }
-        candidateStations = [bestCandidate];
-    }
-
     let currentReason = "", currentColor = "", psRes = null, confRes = 0, fmdxRes = '', ituRes = '';
     let refTxName = null, refErp = null, refPol = null, refDistKm = null, refAzimuth = null;
 
@@ -549,6 +557,15 @@ async function runLocalAiPrediction(pi) {
         psRes = best.possiblePS[0]; confRes = 100; fmdxRes = best.station; ituRes = best.itu;
         refTxName = best.txName; refErp = best.erp; refPol = best.pol; refDistKm = best.distKm; refAzimuth = best.azimuth;
         currentReason = `Only 1 station in DB for PI ${pi}. Using primary frame.`; currentColor = "#28a745";
+        
+    } else if (matchingStations.length > 1 && decodedCharCount === 0) {
+        let rawPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
+                    currentState.rawAccumulatedPS : 
+                    currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : '_').join('');
+        psRes = rawPS; confRes = 0;
+        currentReason = `Ambiguous PI ${pi} (${matchingStations.length} DB matches). Waiting for clean PS blocks.`; 
+        currentColor = "#fd7e14";
+        
     } else if (candidateStations.length === 1) {
         const candidate = candidateStations[0];
         fmdxRes = candidate.station.station; ituRes = candidate.station.itu;
@@ -576,11 +593,15 @@ async function runLocalAiPrediction(pi) {
             currentReason = candidate.perfectFrames.length > 0 ? `Unambiguous station match! Building PS.` : `Unambiguous station match! Building PS (Chimera).`;
             currentColor = "#28a745";
         }
+        
     } else if (candidateStations.length > 1) {
-        const first = candidateStations[0].station;
-        psRes = first.possiblePS[0]; confRes = 50; fmdxRes = first.station; ituRes = first.itu;
-        refTxName = first.txName; refErp = first.erp; refPol = first.pol; refDistKm = first.distKm; refAzimuth = first.azimuth;
-        currentReason = `Ambiguous! Decoded pairs fit multiple DIFFERENT stations. Waiting for more data.`; currentColor = "#fd7e14";
+        let rawPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
+                    currentState.rawAccumulatedPS : 
+                    currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : '_').join('');
+        psRes = rawPS; confRes = 0;
+        currentReason = `Ambiguous! ${candidateStations.length} stations match the decoded PS segments. Waiting for more data.`; 
+        currentColor = "#fd7e14";
+        
     } else {
         const validItus = matchingStations.map(s => s.itu).filter(i => i !== undefined && i !== "");
         const uniqueItus = [...new Set(validItus)];
@@ -600,7 +621,7 @@ async function runLocalAiPrediction(pi) {
         } else {
             let rawPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
                         currentState.rawAccumulatedPS : 
-                        currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
+                        currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : '_').join('');
             if (currentState.frozenPs) {
                 psRes = currentState.frozenPs; confRes = 100;
                 currentReason = `Signal mismatch detected. Ignoring errors and holding frozen frame '${currentState.frozenPs}'.`; currentColor = "#28a745"; 
@@ -614,24 +635,113 @@ async function runLocalAiPrediction(pi) {
     currentState.latestAi = { 
         ps: psRes, conf: confRes, fmdx: fmdxRes, itu: ituRes, 
         reason: currentReason, statusColor: currentColor,
-        refTxName, refErp, refPol, refDistKm, refAzimuth
+        refTxName, refErp, refPol, refDistKm, refAzimuth,
+        refId: candidateStations.length === 1 ? candidateStations[0].station.id : null // Add ID here
     };
 }
 
 let dataHandler = null;
 try { dataHandler = require('../../server/datahandler'); } catch(e) {}
 
+let txSearch = null;
+try { txSearch = require('../../server/tx_search'); } catch(e) {}
+
+// Auto-Patching mechanism for tx_search.js
+function autoPatchTxSearch() {
+    const txSearchPath = path.join(__dirname, '../../server/tx_search.js');
+    if (!fs.existsSync(txSearchPath)) {
+        logError(`[${PLUGIN_NAME}] tx_search.js not found at ${txSearchPath}. Cannot apply auto-patch.`);
+        return;
+    }
+
+    let content = fs.readFileSync(txSearchPath, 'utf8');
+
+    // Check if the file has already been patched
+    if (content.includes('aiOverride') || content.includes('setAiOverride')) {
+        logInfo(`[${PLUGIN_NAME}] tx_search.js is already patched for AI Override.`);
+        return;
+    }
+
+    logInfo(`[${PLUGIN_NAME}] Applying AI Override patch to tx_search.js...`);
+
+    // Create a backup of the original file
+    try {
+        fs.writeFileSync(txSearchPath + '.bak', content, 'utf8');
+        logInfo(`[${PLUGIN_NAME}] Backup created at tx_search.js.bak`);
+    } catch(e) {
+        logError(`[${PLUGIN_NAME}] Could not create backup for tx_search.js. Aborting patch.`);
+        return;
+    }
+
+    // 1. Inject the aiOverride variable near the top
+    if(!content.includes('let aiOverride = null;')) {
+        content = content.replace(/(const consoleCmd = require\('\.\/console'\);)/, "$1\n\n// --- AI DECODER OVERRIDE VARIABLE ---\nlet aiOverride = null;\n// ------------------------------------");
+    }
+
+    // 2. Inject the override logic into the fetchTx function
+    const fetchTxSignature = "async function fetchTx(freq, piCode, rdsPs) {";
+    const overrideLogic = `
+    // --- AI DECODER OVERRIDE LOGIC ---
+    if (aiOverride && aiOverride.pi === piCode.toUpperCase() && aiOverride.fmdx) {
+        return Promise.resolve({
+            station: aiOverride.fmdx,
+            pol: aiOverride.refPol || '',
+            erp: aiOverride.refErp ?? '?',
+            city: aiOverride.refTxName || '',
+            itu: aiOverride.itu || '',
+            distance: aiOverride.refDistKm !== null && aiOverride.refDistKm !== undefined ? aiOverride.refDistKm.toFixed(0) : '',
+            azimuth: aiOverride.refAzimuth !== null && aiOverride.refAzimuth !== undefined ? aiOverride.refAzimuth.toFixed(0) : '',
+            id: aiOverride.id || '',
+            pi: piCode.toUpperCase(),
+            foundStation: true,
+            reg: false,
+            score: 100,
+            others: []
+        });
+    }
+    // ---------------------------------`;  
+    
+    if (content.includes(fetchTxSignature)) {
+        content = content.replace(fetchTxSignature, fetchTxSignature + overrideLogic);
+    } else {
+        logError(`[${PLUGIN_NAME}] Auto-patch failed: Could not find 'async function fetchTx(freq, piCode, rdsPs) {' signature.`);
+        return;
+    }
+
+    // 3. Export the setter in module.exports
+    const exportsSignature = "module.exports = {";
+    const exportsInjection = "module.exports = {\n    setAiOverride: (data) => { aiOverride = data; },";
+    
+    if (content.includes(exportsSignature)) {
+        content = content.replace(exportsSignature, exportsInjection);
+    } else {
+        logError(`[${PLUGIN_NAME}] Auto-patch failed: Could not find 'module.exports' signature.`);
+        return;
+    }
+
+    // Save the patched file
+    try {
+        fs.writeFileSync(txSearchPath, content, 'utf8');
+        logInfo(`[${PLUGIN_NAME}] >>> SUCCESS: tx_search.js has been successfully patched! <<<`);
+        logWarn(`[${PLUGIN_NAME}] !!! IMPORTANT: You MUST restart the Webserver for the patch to take effect !!!`);
+    } catch(e) {
+        logError(`[${PLUGIN_NAME}] Failed to write patch to tx_search.js: ${e.message}`);
+    }
+}
+
 function clearRDSInDataHandler() {
     if (!dataHandler) return;
-    const rdsFields = { pi: '?', ps: '        ', ps_errors: '0,0,0,0,0,0,0,0', pty: 0, tp: 0, ta: 0, ms: -1, rt0: '', rt1: '', rt0_errors: '', rt1_errors: '', rt_flag: '', rds: false, ecc: null, country_name: '', country_iso: 'UN', lic: 0, lang: '' };
+    const rdsFields = { 
+        pi: '?', ps: '        ', ps_errors: '0,0,0,0,0,0,0,0', pty: 0, tp: 0, ta: 0, ms: -1, 
+        rt0: '', rt1: '', rt0_errors: '', rt1_errors: '', rt_flag: '', rds: false, 
+        ecc: null, country_name: '', country_iso: 'UN', lic: 0, lang: ''
+    };
     Object.assign(dataHandler.dataToSend,  rdsFields);
     Object.assign(dataHandler.initialData, rdsFields);
-    if (Array.isArray(dataHandler.dataToSend.af))  dataHandler.dataToSend.af.length  = 0;
-    if (Array.isArray(dataHandler.initialData.af)) dataHandler.initialData.af.length = 0;
     
-    if (currentState.freq) {
-        const freqFmt = parseFloat(currentState.freq).toFixed(3);
-        dataHandler.dataToSend.freq  = freqFmt; dataHandler.initialData.freq = freqFmt;
+    // Clear the AI override when RDS is lost
+    if (txSearch && typeof txSearch.setAiOverride === 'function') {
+        txSearch.setAiOverride(null);
     }
 }
 
@@ -705,8 +815,20 @@ function applyFollowToDataHandler() {
 
     dataHandler.dataToSend.lic = 0;
     dataHandler.dataToSend.lang = '';
-    
     dataHandler.dataToSend.rds = true;
+
+    // Send the current AI match to the patched tx_search.js
+    if (txSearch && typeof txSearch.setAiOverride === 'function') {
+        if (currentState.latestAi && currentState.latestAi.fmdx) {
+            txSearch.setAiOverride({
+                ...currentState.latestAi,
+                pi: pi,
+                id: currentState.latestAi.refId
+            });
+        } else {
+            txSearch.setAiOverride(null);
+        }
+    }
 
     if (!Array.isArray(dataHandler.dataToSend.af)) dataHandler.dataToSend.af = [];
     dataHandler.dataToSend.af.length = 0;
@@ -776,7 +898,6 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
             const eccStr = eccByte.toString(16).toUpperCase().padStart(2, '0');
             
             if (currentState.ecc !== eccStr) {
-                logInfo(`[${PLUGIN_NAME}] 📥 Received ECC from RDS Signal: 0x${eccStr}`);
                 currentState.ecc = eccStr;
             }
 
@@ -824,7 +945,9 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
             af: Array.from(currentState.afSet),
             altFreqs: altFreqs,
             psLocked: psLocked,
-            psLockReason: psLockReason
+            psLockReason: psLockReason,
+            nativeWebserverPI: nativePI,
+            nativeWebserverPS: nativePS
         });
 
         if (rdsFollowMode) applyFollowToDataHandler();
@@ -853,7 +976,7 @@ function parseAndDispatch(raw) {
     if (isRecording && recordStream && !noPayload && !badPI) {
         let aiPs = '________', aiConf = 0, fmdx = '', itu = '';
         if (currentState.latestAi && currentState.latestAi.ps) {
-            aiPs = currentState.latestAi.ps.padEnd(8, '_').replace(/ /g, '_'); // Force underscores
+            aiPs = currentState.latestAi.ps.padEnd(8, '_').replace(/ /g, '_');
             aiConf = currentState.latestAi.conf;
             fmdx = currentState.latestAi.fmdx ? currentState.latestAi.fmdx.replace(/,/g, '') : '';
             itu = currentState.latestAi.itu ? currentState.latestAi.itu.replace(/,/g, '') : '';
@@ -917,6 +1040,7 @@ function interceptLines(data) {
 function hookDataHandler(dh) {
     if (!dh || typeof dh.handleData !== 'function') return;
     const orig = dh.handleData.bind(dh);
+
     dh.handleData = function(wss, receivedData, rdsWss) {
         if (!pluginsMainWss && wss) pluginsMainWss = wss;
         interceptLines(receivedData);
@@ -931,7 +1055,9 @@ function hookDataHandler(dh) {
                 Object.defineProperty(dh.dataToSend, f, { get: () => lockedData[f], set: (val) => { if (f === 'pi') nativePI = val; if (f === 'ps') nativePS = val; }, configurable: true, enumerable: true });
                 Object.defineProperty(dh.initialData, f, { get: () => lockedInit[f], set: () => {}, configurable: true, enumerable: true });
             });
+
             const result = orig.call(this, wss, receivedData, rdsWss);
+            
             fields.forEach(f => {
                 lockedData[f] = dh.dataToSend[f]; lockedInit[f] = dh.initialData[f];
                 Object.defineProperty(dh.dataToSend, f, { get: () => lockedData[f], set: (val) => { lockedData[f] = val; }, configurable: true, enumerable: true });
@@ -939,11 +1065,12 @@ function hookDataHandler(dh) {
             });
             return result;
         }
+        
         const result = orig.call(this, wss, receivedData, rdsWss);
         nativePI = dh.dataToSend.pi; nativePS = dh.dataToSend.ps;
         return result;
     };
-    logInfo(`[${PLUGIN_NAME}] datahandler hooked`);
+    logInfo(`[${PLUGIN_NAME}] Datahandler hooked securely`);
 }
 
 function handlePluginMessage(ws, raw) {
@@ -987,12 +1114,15 @@ function init() {
         }
     }
 
+    autoPatchTxSearch();
     loadOwnLocation();
     startGpsWsListener();
     if (dataHandler) hookDataHandler(dataHandler);
+    
     pluginsWss = pluginsApi.getPluginsWss();
     pluginsMainWss = pluginsApi.getWss();
     if (pluginsWss) pluginsWss.on('connection', ws => ws.on('message', raw => handlePluginMessage(ws, raw)));
+    
     loadFmdxBulk();
     logInfo(`[${PLUGIN_NAME}] v${pluginConfig.version} initialised`);
 }
