@@ -2,11 +2,11 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="2315" height="773" alt="image" src="https://github.com/user-attachments/assets/fd315024-af0d-4032-9879-a066759ceedd" />
 
+## Version 3.1a (Hotfix Version)
 
-## Version 3.1
+- Fixed a critical race condition where changing frequencies or receiving a new PI code via Sporadic-E would temporarily inject the previous station's AI metadata into the native webserver logs
+- Empty PS string is now explicitly passed to the WebSocket and Webserver as exactly 8 spaces (" ") instead of a null or empty string
 
-- Automatic patching function for tx_search.js: After successfully detecting a transmitter, the plugin automatically determines the TX data and transfers it at high speed to the main user interface's data pipeline and the WebSocket.
-- Fixed an issue with passing raw RDS data to the WebSocket when RDS Follow is active.
 
 ### Important note: After installing this version for the first time, the web server must be restarted twice!
 
@@ -36,6 +36,11 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 3.1
+
+- Automatic patching function for tx_search.js: After successfully detecting a transmitter, the plugin automatically determines the TX data and transfers it at high speed to the main user interface's data pipeline and the WebSocket.
+- Fixed an issue with passing raw RDS data to the WebSocket when RDS Follow is active.
 
 ### Version 3.0a (Hotfix Version)
 

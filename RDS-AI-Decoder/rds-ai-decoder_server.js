@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.1)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.1a) //
 //                                                           //
-//  by Highpoint                last update: 2026-06-26      //
+//  by Highpoint                last update: 2026-06-27      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -18,7 +18,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '3.1',
+    version:      '3.1a',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -732,7 +732,7 @@ function autoPatchTxSearch() {
 function clearRDSInDataHandler() {
     if (!dataHandler) return;
     const rdsFields = { 
-        pi: '?', ps: '        ', ps_errors: '0,0,0,0,0,0,0,0', pty: 0, tp: 0, ta: 0, ms: -1, 
+        pi: '?', ps: '', ps_errors: '', pty: 0, tp: 0, ta: 0, ms: -1, 
         rt0: '', rt1: '', rt0_errors: '', rt1_errors: '', rt_flag: '', rds: false, 
         ecc: null, country_name: '', country_iso: 'UN', lic: 0, lang: ''
     };
@@ -765,9 +765,17 @@ function applyFollowToDataHandler() {
                    currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
     }
 
-    dataHandler.dataToSend.ps = targetPS.replace(/_/g, ' '); 
-    dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
-    dataHandler.initialData.ps = dataHandler.dataToSend.ps;
+const cleanPS = targetPS.replace(/_/g, ' '); 
+    
+    if (cleanPS === '        ') {
+        dataHandler.dataToSend.ps = '';
+        dataHandler.dataToSend.ps_errors = '';
+        dataHandler.initialData.ps = '';
+    } else {
+        dataHandler.dataToSend.ps = cleanPS;
+        dataHandler.dataToSend.ps_errors = '0,0,0,0,0,0,0,0';
+        dataHandler.initialData.ps = cleanPS;
+    }
     
     dataHandler.dataToSend.tp = currentState.tp ? 1 : 0;
     dataHandler.dataToSend.ta = currentState.ta ? 1 : 0;
@@ -956,8 +964,10 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
 
 function parseAndDispatch(raw) {
     let dataHex, errorHex;
-    if (raw.length >= 18) { dataHex = raw.slice(0, 16); errorHex = raw.slice(16, 18); } 
-    else if (raw.length === 14) {
+    if (raw.length >= 18) { 
+        dataHex = raw.slice(0, 16); 
+        errorHex = raw.slice(16, 18); 
+    } else if (raw.length === 14) {
         if (!legacyPiCache || legacyPiCache.length < 4) return;
         const legacyErr = parseInt(raw.slice(12), 16);
         let errNew = (legacyPiCache.length - 4) << 6 | (legacyErr & 0x03) << 4 | (legacyErr & 0x0C) | (legacyErr & 0x30) >> 4;
@@ -992,12 +1002,17 @@ function parseAndDispatch(raw) {
         lastLoggedECC = null;
         lastLoggedISO = null;
 
-        currentState.psBuf.fill(' '); currentState.psErrBuf.fill(3);
+        currentState.psBuf.fill(' '); 
+        currentState.psErrBuf.fill(3);
         currentState.psSegsSeen.clear();
         currentState.rawAccumulatedPS = '        ';
         currentState.rtSlots = Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 }));
-        currentState.rtAB = -1; currentState.afSet.clear(); currentState.frozenPs = null;
+        currentState.rtAB = -1; 
+        currentState.afSet.clear(); 
+        currentState.frozenPs = null;
         currentState.ecc = null;
+        
+        currentState.latestAi = { ps: null, conf: 0, fmdx: '', itu: '', reason: '', statusColor: '#6c757d' };
     }
 
     decodeGroup(piRawUpper, b2hex, b3hex, b4hex, errB);
@@ -1014,26 +1029,37 @@ function broadcast(payload) {
 function interceptLines(data) {
     for (const line of data.split('\n')) {
         const l = line.trim();
-        if (l.startsWith('P') && l.length >= 5) legacyPiCache = l.slice(1).trim();
-        else if (l.startsWith('T') && l.length >= 2) {
+        if (l.startsWith('P') && l.length >= 5) {
+            legacyPiCache = l.slice(1).trim();
+        } else if (l.startsWith('T') && l.length >= 2) {
             const freq = (parseFloat(l.slice(1)) / 1000).toFixed(3);
             if (freq !== currentState.freq) {
-                currentState.freq = freq; currentState.pi = null;
+                currentState.freq = freq; 
+                currentState.pi = null;
                 nativePI = '?';
                 
                 lastLoggedECC = null;
                 lastLoggedISO = null;
 
-                currentState.psBuf.fill(' '); currentState.psErrBuf.fill(3);
+                currentState.psBuf.fill(' '); 
+                currentState.psErrBuf.fill(3);
                 currentState.psSegsSeen.clear();
                 currentState.rawAccumulatedPS = '        ';
                 currentState.rtSlots = Array.from({ length: 64 }, () => ({ char: ' ', conf: 0 }));
-                currentState.rtAB = -1; currentState.afSet.clear(); currentState.frozenPs = null;
+                currentState.rtAB = -1; 
+                currentState.afSet.clear(); 
+                currentState.frozenPs = null;
                 currentState.ecc = null;
-                legacyPiCache = null; clearRDSInDataHandler();
+                
+                currentState.latestAi = { ps: null, conf: 0, fmdx: '', itu: '', reason: '', statusColor: '#6c757d' };
+
+                legacyPiCache = null; 
+                clearRDSInDataHandler();
                 broadcast({ type: 'rdsm_freq', freq, reset: true });
             }
-        } else if (l.startsWith('R') && l.length >= 14) parseAndDispatch(l.slice(1).trim());
+        } else if (l.startsWith('R') && l.length >= 14) {
+            parseAndDispatch(l.slice(1).trim());
+        }
     }
 }
 
