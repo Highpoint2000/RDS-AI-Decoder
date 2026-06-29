@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.1a) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.2)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-27      //
+//  by Highpoint                last update: 2026-06-29      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -18,7 +18,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '3.1a',
+    version:      '3.2',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -26,6 +26,7 @@ module.exports = { pluginConfig };
 const PLUGIN_NAME          = 'RDS AI Decoder';
 const FMDX_BULK_FILE       = path.join(__dirname, 'rdsm_fmdx_cache.json');
 const OLD_MEMORY_FILE      = path.join(__dirname, 'rdsm_memory.json');
+const RDSM_CONFIG_FILE     = path.join(__dirname, 'rdsm_config.json');
 
 // 7 Days Cache for FMDX Database (No Radius Limits)
 const FMDX_BULK_TTL_MS     = 7 * 24 * 60 * 60 * 1000; 
@@ -45,6 +46,11 @@ let recordFileName = '';
 let mufMode = 'OFF'; 
 let mufCheckInterval = null;
 let mufTriggeredRecord = false;
+
+// ── Sporadic-E Cluster Tracking ──────────────────────────────
+let esAnchors = [];
+const ES_ANCHOR_TTL_MS = 10 * 60 * 1000; // Anchors expire after 10 minutes
+const ES_CLUSTER_RADIUS_KM = 250;        // Max. 250km radius around an anchor
 
 // ── Module-level state ───────────────────────────────────────
 let aiExclusiveMode    = false;
@@ -84,7 +90,7 @@ let currentState = {
     tp: false, ta: false, ms: -1, stereo: false, pty: 0,
     afSet: new Set(),
     ecc: null,
-    latestAi: { ps: null, conf: 0, fmdx: '', itu: '', reason: '', statusColor: '#6c757d' },
+    latestAi: { ps: null, conf: 0, fmdx: '', itu: '', reason: '', statusColor: '#6c757d', isEsAnchor: false },
     frozenPs: null,
     rawAccumulatedPS: '        '
 };
@@ -125,6 +131,48 @@ const RDS_COUNTRY = (() => {
     };
     return { T, NAMES };
 })();
+
+// ── Persistent State Management ──────────────────────────────
+function savePluginState() {
+    const state = {
+        rdsFollowMode: rdsFollowMode,
+        rdsFollowLocked: rdsFollowLocked,
+        mufMode: mufMode
+    };
+    try {
+        fs.writeFileSync(RDSM_CONFIG_FILE, JSON.stringify(state, null, 2), 'utf8');
+    } catch (e) {
+        logError(`[${PLUGIN_NAME}] Failed to save config: ${e.message}`);
+    }
+}
+
+function loadPluginState() {
+    if (fs.existsSync(RDSM_CONFIG_FILE)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(RDSM_CONFIG_FILE, 'utf8'));
+            
+            if (data.rdsFollowMode !== undefined) {
+                rdsFollowMode = data.rdsFollowMode;
+                nativeRDSDisabled = rdsFollowMode;
+            }
+            if (data.rdsFollowLocked !== undefined) {
+                rdsFollowLocked = data.rdsFollowLocked;
+            }
+            if (data.mufMode !== undefined) {
+                mufMode = data.mufMode;
+                if (mufMode !== 'OFF') {
+                    if (mufCheckInterval) clearInterval(mufCheckInterval);
+                    mufCheckInterval = setInterval(checkMUFStatus, 60000);
+                    checkMUFStatus();
+                }
+            }
+            logInfo(`[${PLUGIN_NAME}] Restored state: Follow=${rdsFollowMode}, Locked=${rdsFollowLocked}, MUF=${mufMode}`);
+        } catch (e) {
+            logError(`[${PLUGIN_NAME}] Failed to load config: ${e.message}`);
+        }
+    }
+}
+// ─────────────────────────────────────────────────────────────
 
 function lookupCountry(pi, eccByte) {
     if (!pi || pi === '?' || pi === '----') return null;
@@ -338,7 +386,9 @@ function buildFmdxIndex(raw) {
                 distKm: distKm,
                 azimuth: azimuth,
                 erp: st.erp !== undefined ? st.erp : null, 
-                pol: st.pol ? st.pol.toUpperCase() : null
+                pol: st.pol ? st.pol.toUpperCase() : null,
+                lat: txLat,
+                lon: txLon
             };
             
             if (!byFreq[f]) byFreq[f] = [];
@@ -383,11 +433,13 @@ async function fetchFmdxForFreq(freq) {
                 azimuth = calculateBearing(ownLat, ownLon, txLat, txLon);
             }
             
-            loc.stations.forEach(st => {
+		    loc.stations.forEach(st => {
                 liveEntries.push({
+                    id: st.id,
                     pi: st.pi.toUpperCase(), pireg: st.pireg ? st.pireg.toUpperCase() : null,
                     psVariants: parsePSVariants(st.ps), station: st.station, txName: loc.name || locKey, itu: loc.itu || '',
-                    distKm: distKm, azimuth: azimuth, erp: st.erp !== undefined ? st.erp : null, pol: st.pol ? st.pol.toUpperCase() : null
+                    distKm: distKm, azimuth: azimuth, erp: st.erp !== undefined ? st.erp : null, pol: st.pol ? st.pol.toUpperCase() : null,
+                    lat: txLat, lon: txLon
                 });
             });
         }
@@ -413,7 +465,7 @@ async function runLocalAiPrediction(pi) {
 
     if (isSpecialPI(pi)) {
         let rawPS = currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
-        currentState.latestAi = { ps: rawPS, conf: 100, fmdx: 'Special PI', itu: '', reason: `DB bypassed for special PI ${pi}.`, statusColor: '#6c757d' };
+        currentState.latestAi = { ps: rawPS, conf: 100, fmdx: 'Special PI', itu: '', reason: `DB bypassed for special PI ${pi}.`, statusColor: '#6c757d', isEsAnchor: false };
         return;
     }
 
@@ -476,14 +528,39 @@ async function runLocalAiPrediction(pi) {
                 weightDistance = Math.abs(weightDistance - 1500) + 200;
             }
             let erp = loc.erp && loc.erp > 0 ? loc.erp : 1;
-            let extraWeight = (erp >= dynErp && loc.distKm <= dynDist) ? 0.3 : 0;
+            
+            let extraWeight = 0;
+            if (loc.distKm <= dynDist) {
+                extraWeight = (erp / 100) * (100 / weightDistance) * 0.1;
+            }
+            
             let score = 0;
+            
             if (erp === 0.001) {
                 score = erp / weightDistance;
             } else {
                 score = ((10 * (Math.log10(erp * 1000))) / weightDistance) + extraWeight;
             }
-            loc.score = score;
+            
+            let clusterBonus = 0;
+            if (esMode && loc.lat && loc.lon && esAnchors.length > 0) {
+                const now = Date.now();
+
+                esAnchors = esAnchors.filter(a => (now - a.ts) < ES_ANCHOR_TTL_MS);
+                
+                for (const anchor of esAnchors) {
+
+                    if (anchor.pi !== pi) {
+                        const distToAnchor = haversineKm(loc.lat, loc.lon, anchor.lat, anchor.lon);
+                        if (distToAnchor <= ES_CLUSTER_RADIUS_KM) {
+                            clusterBonus = Math.max(clusterBonus, 100 - (distToAnchor * 0.2));
+                        }
+                    }
+                }
+            }
+            loc.score = score + clusterBonus;
+            loc.clusterBonusApplied = clusterBonus > 0;
+            // -------------------------------------
         }
 
         matchingStations.sort((a, b) => b.score - a.score);
@@ -499,7 +576,8 @@ async function runLocalAiPrediction(pi) {
             fmdx: '', 
             itu: '', 
             reason: `No DB entry found for PI ${pi}. Falling back to raw data.`, 
-            statusColor: '#6c757d' 
+            statusColor: '#6c757d',
+            isEsAnchor: false
         };
         return;
     }
@@ -550,12 +628,17 @@ async function runLocalAiPrediction(pi) {
     }
     
     let currentReason = "", currentColor = "", psRes = null, confRes = 0, fmdxRes = '', ituRes = '';
-    let refTxName = null, refErp = null, refPol = null, refDistKm = null, refAzimuth = null;
+    let refTxName = null, refErp = null, refPol = null, refDistKm = null, refAzimuth = null, refLat = null, refLon = null;
+    let usedClusterBonus = false;
+	let resolvedId = null;
 
     if (matchingStations.length === 1 && decodedCharCount === 0) {
         const best = matchingStations[0];
         psRes = best.possiblePS[0]; confRes = 100; fmdxRes = best.station; ituRes = best.itu;
         refTxName = best.txName; refErp = best.erp; refPol = best.pol; refDistKm = best.distKm; refAzimuth = best.azimuth;
+        refLat = best.lat; refLon = best.lon;
+		resolvedId = best.id;
+        if (best.clusterBonusApplied) usedClusterBonus = true;
         currentReason = `Only 1 station in DB for PI ${pi}. Using primary frame.`; currentColor = "#28a745";
         
     } else if (matchingStations.length > 1 && decodedCharCount === 0) {
@@ -570,6 +653,9 @@ async function runLocalAiPrediction(pi) {
         const candidate = candidateStations[0];
         fmdxRes = candidate.station.station; ituRes = candidate.station.itu;
         refTxName = candidate.station.txName; refErp = candidate.station.erp; refPol = candidate.station.pol; refDistKm = candidate.station.distKm; refAzimuth = candidate.station.azimuth;
+        refLat = candidate.station.lat; refLon = candidate.station.lon;
+		resolvedId = candidate.station.id;
+        if (candidate.station.clusterBonusApplied) usedClusterBonus = true;
         
         let bestCurrentFrame = candidate.station.possiblePS[0];
         let maxScore = -1, perfectScoreFrame = null;
@@ -610,6 +696,9 @@ async function runLocalAiPrediction(pi) {
             const fallbackMatch = matchingStations[0]; 
             fmdxRes = fallbackMatch.station; ituRes = fallbackMatch.itu || uniqueItus[0];
             refTxName = fallbackMatch.txName; refErp = fallbackMatch.erp; refPol = fallbackMatch.pol; refDistKm = fallbackMatch.distKm; refAzimuth = fallbackMatch.azimuth;
+            refLat = fallbackMatch.lat; refLon = fallbackMatch.lon;
+			resolvedId = fallbackMatch.id;
+            if (fallbackMatch.clusterBonusApplied) usedClusterBonus = true;
             
             if (currentState.frozenPs) {
                 psRes = currentState.frozenPs; confRes = 100;
@@ -632,11 +721,25 @@ async function runLocalAiPrediction(pi) {
         }
     }
 
+
+    let isEsAnchor = false;
+
+    if (matchingStations.length === 1 && confRes === 100 && refDistKm > 800 && refLat !== null && refLon !== null) {
+
+        const isDuplicate = esAnchors.some(a => a.pi === pi && (Date.now() - a.ts) < 60000);
+        if (!isDuplicate) {
+            esAnchors.push({ ts: Date.now(), lat: refLat, lon: refLon, pi: pi });
+        }
+        isEsAnchor = true;
+    }
+
     currentState.latestAi = { 
         ps: psRes, conf: confRes, fmdx: fmdxRes, itu: ituRes, 
         reason: currentReason, statusColor: currentColor,
         refTxName, refErp, refPol, refDistKm, refAzimuth,
-        refId: candidateStations.length === 1 ? candidateStations[0].station.id : null // Add ID here
+        refId: resolvedId,
+        usedClusterBonus: usedClusterBonus,
+        isEsAnchor: isEsAnchor
     };
 }
 
@@ -656,7 +759,6 @@ function autoPatchTxSearch() {
 
     let content = fs.readFileSync(txSearchPath, 'utf8');
 
-    // Check if the file has already been patched
     if (content.includes('aiOverride') || content.includes('setAiOverride')) {
         logInfo(`[${PLUGIN_NAME}] tx_search.js is already patched for AI Override.`);
         return;
@@ -664,7 +766,6 @@ function autoPatchTxSearch() {
 
     logInfo(`[${PLUGIN_NAME}] Applying AI Override patch to tx_search.js...`);
 
-    // Create a backup of the original file
     try {
         fs.writeFileSync(txSearchPath + '.bak', content, 'utf8');
         logInfo(`[${PLUGIN_NAME}] Backup created at tx_search.js.bak`);
@@ -673,12 +774,10 @@ function autoPatchTxSearch() {
         return;
     }
 
-    // 1. Inject the aiOverride variable near the top
     if(!content.includes('let aiOverride = null;')) {
         content = content.replace(/(const consoleCmd = require\('\.\/console'\);)/, "$1\n\n// --- AI DECODER OVERRIDE VARIABLE ---\nlet aiOverride = null;\n// ------------------------------------");
     }
 
-    // 2. Inject the override logic into the fetchTx function
     const fetchTxSignature = "async function fetchTx(freq, piCode, rdsPs) {";
     const overrideLogic = `
     // --- AI DECODER OVERRIDE LOGIC ---
@@ -708,7 +807,6 @@ function autoPatchTxSearch() {
         return;
     }
 
-    // 3. Export the setter in module.exports
     const exportsSignature = "module.exports = {";
     const exportsInjection = "module.exports = {\n    setAiOverride: (data) => { aiOverride = data; },";
     
@@ -719,7 +817,6 @@ function autoPatchTxSearch() {
         return;
     }
 
-    // Save the patched file
     try {
         fs.writeFileSync(txSearchPath, content, 'utf8');
         logInfo(`[${PLUGIN_NAME}] >>> SUCCESS: tx_search.js has been successfully patched! <<<`);
@@ -739,7 +836,6 @@ function clearRDSInDataHandler() {
     Object.assign(dataHandler.dataToSend,  rdsFields);
     Object.assign(dataHandler.initialData, rdsFields);
     
-    // Clear the AI override when RDS is lost
     if (txSearch && typeof txSearch.setAiOverride === 'function') {
         txSearch.setAiOverride(null);
     }
@@ -765,7 +861,7 @@ function applyFollowToDataHandler() {
                    currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
     }
 
-const cleanPS = targetPS.replace(/_/g, ' '); 
+    const cleanPS = targetPS.replace(/_/g, ' '); 
     
     if (cleanPS === '        ') {
         dataHandler.dataToSend.ps = '';
@@ -825,7 +921,6 @@ const cleanPS = targetPS.replace(/_/g, ' ');
     dataHandler.dataToSend.lang = '';
     dataHandler.dataToSend.rds = true;
 
-    // Send the current AI match to the patched tx_search.js
     if (txSearch && typeof txSearch.setAiOverride === 'function') {
         if (currentState.latestAi && currentState.latestAi.fmdx) {
             txSearch.setAiOverride({
@@ -946,7 +1041,8 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
                 refErp: currentState.latestAi.refErp,
                 refPol: currentState.latestAi.refPol,
                 refDistKm: currentState.latestAi.refDistKm,
-                refAzimuth: currentState.latestAi.refAzimuth
+                refAzimuth: currentState.latestAi.refAzimuth,
+                refId: currentState.latestAi.refId
             },
             aiReason: currentState.latestAi.reason, aiColor: currentState.latestAi.statusColor,
             aiConf: currentState.latestAi.conf,
@@ -955,7 +1051,11 @@ function decodeGroup(pi, b2hex, b3hex, b4hex, errB) {
             psLocked: psLocked,
             psLockReason: psLockReason,
             nativeWebserverPI: nativePI,
-            nativeWebserverPS: nativePS
+            nativeWebserverPS: nativePS,
+            esClusterMatch: currentState.latestAi.usedClusterBonus,
+            isEsAnchor: currentState.latestAi.isEsAnchor,
+            qthLat: ownLat,
+            qthLon: ownLon
         });
 
         if (rdsFollowMode) applyFollowToDataHandler();
@@ -1012,7 +1112,7 @@ function parseAndDispatch(raw) {
         currentState.frozenPs = null;
         currentState.ecc = null;
         
-        currentState.latestAi = { ps: null, conf: 0, fmdx: '', itu: '', reason: '', statusColor: '#6c757d' };
+        currentState.latestAi = { ps: null, conf: 0, fmdx: '', itu: '', reason: '', statusColor: '#6c757d', isEsAnchor: false };
     }
 
     decodeGroup(piRawUpper, b2hex, b3hex, b4hex, errB);
@@ -1051,7 +1151,7 @@ function interceptLines(data) {
                 currentState.frozenPs = null;
                 currentState.ecc = null;
                 
-                currentState.latestAi = { ps: null, conf: 0, fmdx: '', itu: '', reason: '', statusColor: '#6c757d' };
+                currentState.latestAi = { ps: null, conf: 0, fmdx: '', itu: '', reason: '', statusColor: '#6c757d', isEsAnchor: false };
 
                 legacyPiCache = null; 
                 clearRDSInDataHandler();
@@ -1102,17 +1202,19 @@ function hookDataHandler(dh) {
 function handlePluginMessage(ws, raw) {
     let msg; try { msg = JSON.parse(raw); } catch(e) { return; }
     if (msg.type === 'rdsm_get_rds_follow') {
-        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode })); } catch(e) {}
+        try { ws.send(JSON.stringify({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode, qthLat: ownLat, qthLon: ownLon })); } catch(e) {}
         return;
     }
     if (msg.type === 'rdsm_set_rds_follow') {
         rdsFollowMode = !!msg.enabled; nativeRDSDisabled = rdsFollowMode;
         if (!rdsFollowMode) clearRDSInDataHandler(); else if (currentState.pi) applyFollowToDataHandler();
+        savePluginState();
         broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode });
         return;
     }
     if (msg.type === 'rdsm_set_rds_lock') {
         rdsFollowLocked = !!msg.locked;
+        savePluginState();
         broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode });
         return;
     }
@@ -1125,6 +1227,7 @@ function handlePluginMessage(ws, raw) {
         if (mufCheckInterval) { clearInterval(mufCheckInterval); mufCheckInterval = null; }
         if (mufMode !== 'OFF') { mufCheckInterval = setInterval(checkMUFStatus, 60000); checkMUFStatus(); } 
         else { if (isRecording && mufTriggeredRecord) stopServerRecording(true); mufTriggeredRecord = false; }
+        savePluginState();
         broadcast({ type: 'rdsm_rds_follow_state', enabled: rdsFollowMode, locked: rdsFollowLocked, isRecording, mufMode });
         return;
     }
@@ -1140,6 +1243,7 @@ function init() {
         }
     }
 
+    loadPluginState();
     autoPatchTxSearch();
     loadOwnLocation();
     startGpsWsListener();

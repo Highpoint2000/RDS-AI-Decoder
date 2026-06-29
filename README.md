@@ -2,10 +2,13 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="2315" height="773" alt="image" src="https://github.com/user-attachments/assets/fd315024-af0d-4032-9879-a066759ceedd" />
 
-## Version 3.1a (Hotfix Version)
+## Version 3.2
 
-- Fixed a critical race condition where changing frequencies or receiving a new PI code via Sporadic-E would temporarily inject the previous station's AI metadata into the native webserver logs
-- Empty PS string is now explicitly passed to the WebSocket and Webserver as exactly 8 spaces (" ") instead of a null or empty string
+- Sporadic-E Tracking & Clustering: A new geographic anchor system tracks strong signals (>800 km) for 10 minutes and forms a cluster within a 250 km radius. This allows for more precise identification of transmitter locations with ambiguous PI codes.
+- Interactive DX Map (Leaflet): A fully integrated real-time map within the client, featuring a filter bar for signal age and a dynamic dropdown menu that automatically populates with currently received ITU country codes.
+- Real-Time Station List: A new, live-sortable table view displaying stations organized chronologically or by distance, status, or PI code.
+- UI State Persistence: Open windows (log, map, list)—including their positions and sizes—as well as selected options (such as "Auto TX") are restored after a page reload.
+- Dynamic ERP/Distance Scoring: Hard-coded power thresholds have been replaced by a proportional scoring system that dynamically relates transmission power (ERP) to exact distance, significantly improving the accuracy of local DX matches.
 
 
 ### Important note: After installing this version for the first time, the web server must be restarted twice!
@@ -24,8 +27,8 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 ## How to use:     
                                          
 Detailed documentation on how the plugin works can be found [here](https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation.html)
-A demo video can be viewed [here](https://highpoint.fmdx.org/videos/RDS-AI-Decoder-Demo.mp4)
-A live demo with the RDS Follow function activated is available [here](http://highpoint2000.selfhost.de:8080)
+Demo videos can be viewed [here](https://highpoint.fmdx.org/videos/RDS-AI-Decoder-Demo.mp4) and [here](https://highpoint.fmdx.org/videos/RDS-AI-Decoder-SpE.mp4)
+A live demo with the RDS Follow function activated is available [here](http://highpoint2000.selfhost.de:8080) and [here](http://highpoint2000.selfhost.de:9080)
 Recorded Raw RDS data can be analyzed and validated using this [web tool](https://highpoint.fmdx.org/webtools/rds-raw-decoder.html)
 
 ## Contact
@@ -36,6 +39,12 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 3.1a (Hotfix Version)
+
+- Fixed a critical race condition where changing frequencies or receiving a new PI code via Sporadic-E would temporarily inject the previous station's AI metadata into the native webserver logs
+- Empty PS string is now explicitly passed to the WebSocket and Webserver as exactly 8 spaces (" ") instead of a null or empty string
+
 
 ### Version 3.1
 

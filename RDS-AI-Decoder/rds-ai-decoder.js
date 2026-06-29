@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V3.1a) //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V3.2)  //
 //                                                           //
-//  by Highpoint                last update: 2026-06-27      //
+//  by Highpoint                last update: 2026-06-29      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -10,7 +10,7 @@
 
 (() => {
 
-    const pluginVersion         = '3.1a';
+    const pluginVersion         = '3.2';
     const pluginName            = 'RDS AI Decoder';
     const pluginManualUrl       = 'https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation.html';
 
@@ -45,26 +45,122 @@
         rdsFollow:false, rdsFollowLocked:true,
         psName: null, refItu: null, aiReason: null, aiColor: '#6c757d', aiConf: 0,
         rawGroups: [], mufMode: 'OFF', af: [], altFreqs: [],
-        psLocked: false, psLockReason: '',
-        refTxName: null, refDistKm: null, refAzimuth: null, refErp: null, refPol: null
+        psLocked: false, psLockReason: '', esClusterMatch: false, isEsAnchor: false,
+        refTxName: null, refDistKm: null, refAzimuth: null, refErp: null, refPol: null,
+        myLat: null, myLon: null
     };
 
     let rtSlots = [mkRT(64), mkRT(64)];
     let rtAB = -1;
     let logPaused = false;
+    let mapOpen = false;
+	let logOpen = false;
+    let listOpen = false;
+    let mapPoints = new Map(); 
+    let lMap = null;
+    let lLayer = null;
+    let leafletLoading = false;
+    let autoTx = false;
 
-    // --- State for Log Filters ---
+    // Filter state for Map and List
+    let viewFilters = { t10m: true, t1h: true, tOld: true, itu: 'ALL' };
+
+    function saveWindowState() {
+        localStorage.setItem('rdsm_main_open', panelVis);
+        localStorage.setItem('rdsm_log_open', logOpen);
+        localStorage.setItem('rdsm_map_open', mapOpen);
+        localStorage.setItem('rdsm_list_open', listOpen);
+        localStorage.setItem('rdsm_auto_tx', autoTx); 
+    }
+
+    // Helper to get only the points that match the filters
+    function getFilteredPoints() {
+        const now = Date.now();
+        let filtered = [];
+        
+        mapPoints.forEach(p => {
+            const ageMs = now - p.ts;
+            let passTime = false;
+            
+            if (ageMs < 10 * 60 * 1000) { if (viewFilters.t10m) passTime = true; }
+            else if (ageMs < 60 * 60 * 1000) { if (viewFilters.t1h) passTime = true; }
+            else { if (viewFilters.tOld) passTime = true; }
+
+            let passItu = false;
+            if (viewFilters.itu === 'ALL' || (p.itu && p.itu.toUpperCase() === viewFilters.itu)) {
+                passItu = true;
+            }
+
+            if (passTime && passItu) filtered.push(p);
+        });
+        return filtered;
+    }
+
+    // Helper to dynamically update the ITU dropdown
+    function updateItuDropdown() {
+        const sel = document.getElementById('mf-itu');
+        if (!sel) return;
+        
+        const currentVal = sel.value;
+        let itus = new Set();
+        
+        mapPoints.forEach(p => {
+            if (p.itu && p.itu.trim() !== '') itus.add(p.itu.toUpperCase());
+        });
+        
+        let html = '<option value="ALL">ALL ITUs</option>';
+        Array.from(itus).sort().forEach(itu => {
+            html += `<option value="${itu}">${itu}</option>`;
+        });
+        
+        sel.innerHTML = html;
+        if (itus.has(currentVal) || currentVal === 'ALL') {
+            sel.value = currentVal;
+        } else {
+            sel.value = 'ALL';
+            viewFilters.itu = 'ALL';
+        }
+    }
+
+    // Sorting state for the realtime list
+    let listSortCol = 'ts';
+    let listSortDir = -1; // -1 for descending, 1 for ascending
+
     let logFilters = { err: true, ps: true, rt: true, af: true, ecc: true, tp: true, ta: true, ms: true, other: true };
     try {
         const savedFilters = localStorage.getItem('rdsm_log_filters');
         if (savedFilters) logFilters = Object.assign(logFilters, JSON.parse(savedFilters));
     } catch(e) {}
+    
+    let autoCenterMap = true;
+    let renderMapTimeout = null;
+
+    function doCenterMap(animate = true) {
+        if (!lMap || st.myLat === null) return;
+        const bounds = L.latLngBounds([[st.myLat, st.myLon]]);
+        let hasPoints = false;
+        
+        getFilteredPoints().forEach(p => {
+            if (p.az !== undefined && p.dist !== undefined && p.az !== null && p.dist !== null) {
+                const dest = getDest(st.myLat, st.myLon, p.az, p.dist);
+                if (!isNaN(dest[0]) && !isNaN(dest[1])) {
+                    bounds.extend(dest);
+                    hasPoints = true;
+                }
+            }
+        });
+
+        if (hasPoints) {
+            lMap.fitBounds(bounds, { padding: [30, 30], maxZoom: 10, animate: animate, duration: animate ? 0.5 : 0 });
+        } else {
+            lMap.setView([st.myLat, st.myLon], 5, { animate: animate });
+        }
+    }
 
     function saveFilters() {
         try { localStorage.setItem('rdsm_log_filters', JSON.stringify(logFilters)); } catch(e) {}
         renderRealtimeLog();
     }
-    // -----------------------------
 
     function fuseRT(ab, i, char, conf) {
         if (i < 0 || i >= rtSlots[ab].length) return;
@@ -151,7 +247,7 @@
         if (st.mufMode === 'OFF') btn.classList.remove('on'); else btn.classList.add('on');
     }
 
-    let ws = null, reconn = null, panelVis = false, logOpen = false;
+    let ws = null, reconn = null, panelVis = false;
 
     function onMessage(data) {
         let d; try { d = JSON.parse(data); } catch(e) { return; }
@@ -168,6 +264,9 @@
         if (d.locked !== undefined) st.rdsFollowLocked = !!d.locked;
         if (d.isRecording !== undefined) updateRecordUI(d.isRecording, d.downloadUrl, d.silentStop);
         if (d.mufMode !== undefined) updateMufUI(d.mufMode);
+        if (d.qthLat !== undefined && d.qthLon !== undefined && d.qthLat !== null) {
+            st.myLat = d.qthLat; st.myLon = d.qthLon;
+        }
         syncFollowUI(); 
     }
 
@@ -177,7 +276,7 @@
         setEl('rdsm-freq', st.freq !== '-' ? st.freq + ' MHz' : '-');
     }
 
-function onRaw(d) {
+    function onRaw(d) {
         if (d.freq && d.freq !== st.freq) { st.freq = d.freq; setEl('rdsm-freq', d.freq + ' MHz'); }
 
         if (d.pi && d.pi !== '----' && d.pi !== '?') {
@@ -209,7 +308,6 @@ function onRaw(d) {
             const ptyEl = document.getElementById('rdsm-pty');
             if (ptyEl) ptyEl.innerHTML = `${PTY[st.pty]||'?'} <span class="pty-badge">${st.pty}</span>`;
             
-            // Store flags modularly
             actions.flags.tp = st.tp ? 1 : 0;
             if (gT === 0 || (gT === 15 && vB === 1)) {
                 st.ta = !!((g2 >> 4) & 0x1);
@@ -357,6 +455,8 @@ function onRaw(d) {
         
         if (d.psLocked !== undefined) st.psLocked = d.psLocked;
         if (d.psLockReason !== undefined) st.psLockReason = d.psLockReason;
+        if (d.esClusterMatch !== undefined) st.esClusterMatch = d.esClusterMatch;
+        if (d.isEsAnchor !== undefined) st.isEsAnchor = d.isEsAnchor;
         if (d.aiConf !== undefined) st.aiConf = d.aiConf;
         if (d.altFreqs && Array.isArray(d.altFreqs)) st.altFreqs = d.altFreqs;
 
@@ -371,6 +471,40 @@ function onRaw(d) {
         
         if (d.af && Array.isArray(d.af)) st.af = d.af;
 
+        if (d.qthLat !== undefined && d.qthLon !== undefined && d.qthLat !== null) {
+            st.myLat = d.qthLat; st.myLon = d.qthLon;
+        }
+
+        if (d.pi && d.pi !== '----' && d.pi !== '?' && d.stats && d.stats.refDistKm != null && d.stats.refAzimuth != null) {
+            const piUpper = d.pi.toUpperCase();
+            
+            const fallbackFreq = parseFloat(st.freq).toFixed(1);
+            const mapKey = d.stats.refId ? String(d.stats.refId) : `${piUpper}_${fallbackFreq}`;
+            
+            let p = mapPoints.get(mapKey) || {};
+            p.pi = piUpper;
+            p.freq = st.freq;
+            p.ps = d.psName || st.aiPs.join('').replace(/_/g,' ').trim() || d.pi;
+            p.txName = d.stats.refTxName || 'Unknown Tx';
+            p.itu = d.stats.refItu ? d.stats.refItu.toUpperCase() : '';
+            p.dist = d.stats.refDistKm;
+            p.az = d.stats.refAzimuth;
+            
+            if (d.isEsAnchor) {
+                p.isAnchor = true;
+                p.wasAnchor = true; 
+            }
+            if (d.esClusterMatch) p.isCluster = true;
+            
+            p.ts = Date.now();
+            mapPoints.set(mapKey, p);
+            
+            updateItuDropdown();
+            
+            if (mapOpen) scheduleMapRender();
+            if (listOpen) renderRealtimeList();
+        }
+
         renderStatus();
         renderPS();
         renderHeader();
@@ -379,19 +513,384 @@ function onRaw(d) {
         if (logOpen) renderRealtimeLog();
     }
 
+    // ---------------------------------------------------------
+    // MAP & LIST LOGIC
+    // ---------------------------------------------------------
+    function loadLeaflet(callback) {
+        if (typeof L !== 'undefined') { callback(); return; }
+        if (leafletLoading) return;
+        leafletLoading = true;
+        
+        const css = document.createElement('link');
+        css.rel = 'stylesheet';
+        css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+        document.head.appendChild(css);
+
+        const js = document.createElement('script');
+        js.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+        js.onload = () => { leafletLoading = false; callback(); };
+        document.head.appendChild(js);
+    }
+
+    function getDest(lat, lon, brng, dist) {
+        const R = 6371, rLat = lat * Math.PI/180, rLon = lon * Math.PI/180, rBrng = brng * Math.PI/180;
+        const dLat = Math.asin(Math.sin(rLat)*Math.cos(dist/R) + Math.cos(rLat)*Math.sin(dist/R)*Math.cos(rBrng));
+        const dLon = rLon + Math.atan2(Math.sin(rBrng)*Math.sin(dist/R)*Math.cos(rLat), Math.cos(dist/R)-Math.sin(rLat)*Math.sin(dLat));
+        return [dLat * 180/Math.PI, dLon * 180/Math.PI];
+    }
+
+    function getGreatCirclePath(lat1, lon1, lat2, lon2, segments = 40) {
+        const points = [];
+        const d2r = Math.PI / 180;
+        const r2d = 180 / Math.PI;
+        
+        const phi1 = lat1 * d2r;
+        const lam1 = lon1 * d2r;
+        const phi2 = lat2 * d2r;
+        const lam2 = lon2 * d2r;
+        
+        const deltaLam = lam2 - lam1;
+        const sinPhi1 = Math.sin(phi1), cosPhi1 = Math.cos(phi1);
+        const sinPhi2 = Math.sin(phi2), cosPhi2 = Math.cos(phi2);
+        const cosDeltaLam = Math.cos(deltaLam);
+        
+        const d = Math.acos(sinPhi1 * sinPhi2 + cosPhi1 * cosPhi2 * cosDeltaLam);
+        
+        if (d === 0 || isNaN(d)) return [[lat1, lon1], [lat2, lon2]];
+        
+        for (let i = 0; i <= segments; i++) {
+            const f = i / segments;
+            const A = Math.sin((1 - f) * d) / Math.sin(d);
+            const B = Math.sin(f * d) / Math.sin(d);
+            
+            const x = A * cosPhi1 * Math.cos(lam1) + B * cosPhi2 * Math.cos(lam2);
+            const y = A * cosPhi1 * Math.sin(lam1) + B * cosPhi2 * Math.sin(lam2);
+            const z = A * sinPhi1 + B * sinPhi2;
+            
+            const phi3 = Math.atan2(z, Math.sqrt(x * x + y * y));
+            const lam3 = Math.atan2(y, x);
+            
+            points.push([phi3 * r2d, lam3 * r2d]);
+        }
+        return points;
+    }
+
+    function scheduleMapRender() {
+        if (!mapOpen) return;
+        
+        if (renderMapTimeout) clearTimeout(renderMapTimeout);
+        renderMapTimeout = setTimeout(() => {
+            if (typeof L === 'undefined') {
+                const container = document.getElementById('rdsm-map-canvas');
+                if (container && !leafletLoading) {
+                    container.innerHTML = '<div style="color:#ffaa00; padding:20px;">Downloading Leaflet Map Library...</div>';
+                }
+                loadLeaflet(() => { setTimeout(drawMap, 50); });
+            } else {
+                drawMap();
+            }
+        }, 250); 
+    }
+
+    function drawMap() {
+        const container = document.getElementById('rdsm-map-canvas');
+        if (!container || typeof L === 'undefined') return;
+
+        const qLat = st.myLat !== null ? st.myLat : 51.0;
+        const qLon = st.myLon !== null ? st.myLon : 10.0;
+
+        if (!lMap) {
+            container.innerHTML = '';
+            container.style.background = '#e5e5e5';
+            
+            lMap = L.map('rdsm-map-canvas', { attributionControl: false }).setView([qLat, qLon], 5);
+            lMap.on('zoomend', drawMap);
+            
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19
+            }).addTo(lMap);
+            
+            lLayer = L.layerGroup().addTo(lMap);
+            
+            new ResizeObserver(() => lMap.invalidateSize()).observe(document.getElementById('rdsm-map-pan'));
+
+            const legend = L.control({position: 'bottomleft'});
+            legend.onAdd = function () {
+                const div = L.DomUtil.create('div', 'info legend');
+                div.style.background = 'rgba(0,0,0,0.8)';
+                div.style.padding = '8px';
+                div.style.borderRadius = '5px';
+                div.style.color = '#fff';
+                div.style.fontSize = '10px';
+                div.style.lineHeight = '1.6';
+                div.style.fontFamily = '"Titillium Web", Calibri, sans-serif';
+                div.innerHTML = `
+                    <div style="display:flex; gap: 15px;">
+                        <div>
+                            <div style="margin-bottom:4px; font-weight:bold; color:var(--color-main-bright, #4a90d9);">Lines</div>
+                            <div><span style="display:inline-block; width:12px; height:2px; background:#ff4444; margin-right:6px; vertical-align:middle;"></span> &lt; 10 min</div>
+                            <div><span style="display:inline-block; width:12px; height:2px; background:#ffaa00; margin-right:6px; vertical-align:middle;"></span> &lt; 1 hour</div>
+                            <div><span style="display:inline-block; width:12px; height:2px; background:#28a745; margin-right:6px; vertical-align:middle;"></span> &gt; 1 hour</div>
+                        </div>
+                        <div>
+                            <div style="margin-bottom:4px; font-weight:bold; color:var(--color-main-bright, #4a90d9);">Points</div>
+                            <div><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#28a745; margin-right:6px; vertical-align:middle; box-sizing:border-box;"></span> Standard</div>
+                            <div><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#4488ff; margin-right:6px; vertical-align:middle; box-sizing:border-box;"></span> Cluster</div>
+                            <div><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ffaa00; border:2px solid #ff4444; margin-right:6px; vertical-align:middle; box-sizing:border-box;"></span> Active Anchor</div>
+                            <div><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ffaa00; margin-right:6px; vertical-align:middle; box-sizing:border-box;"></span> Expired Anchor</div>
+                            <div><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#000000; border:1px solid #fff; margin-right:6px; vertical-align:middle; box-sizing:border-box;"></span> QTH</div>
+                        </div>
+                    </div>
+                `;
+                return div;
+            };
+            legend.addTo(lMap);
+        }
+        
+        lLayer.clearLayers();
+        const now = Date.now();
+        
+        mapPoints.forEach(p => { 
+            if (p.isAnchor && (now - p.ts > 10 * 60 * 1000)) p.isAnchor = false; 
+        });
+
+        const filteredPoints = getFilteredPoints();
+
+        const groupedPoints = {};
+        filteredPoints.forEach(p => {
+            const exactDest = getDest(qLat, qLon, p.az, p.dist);
+            
+            if (isNaN(exactDest[0]) || isNaN(exactDest[1])) {
+                p.displayDest = [qLat, qLon];
+                p.exactDest = [qLat, qLon];
+                return;
+            }
+            
+            p.exactDest = [exactDest[0], exactDest[1]];
+            
+            const key = exactDest[0].toFixed(3) + '_' + exactDest[1].toFixed(3);
+            if (!groupedPoints[key]) groupedPoints[key] = [];
+            groupedPoints[key].push(p);
+        });
+
+        const currentZoom = lMap.getZoom();
+        const clusterZoomThreshold = 9; 
+
+        Object.values(groupedPoints).forEach(group => {
+            const count = group.length;
+            
+            if (count === 1 || currentZoom < clusterZoomThreshold) {
+                group.forEach(p => { p.displayDest = p.exactDest; });
+            } else {
+                const centerLat = group[0].exactDest[0];
+                const centerLon = group[0].exactDest[1];
+                const radius = 0.015 + (count * 0.001);
+
+                group.forEach((p, index) => {
+                    const angle = index * ((2 * Math.PI) / count); 
+                    const dLat = centerLat + Math.sin(angle) * radius;
+                    const dLon = centerLon + (Math.cos(angle) * radius) / Math.cos(centerLat * Math.PI / 180);
+                    p.displayDest = [dLat, dLon];
+                });
+            }
+        });
+
+        filteredPoints.forEach(p => {
+            const ageMs = now - p.ts;
+            let lineColor = '#28a745'; 
+            if (ageMs < 10 * 60 * 1000) lineColor = '#ff4444'; 
+            else if (ageMs < 60 * 60 * 1000) lineColor = '#ffaa00'; 
+
+            const curvePoints = getGreatCirclePath(qLat, qLon, p.exactDest[0], p.exactDest[1]);
+            L.polyline(curvePoints, { color: lineColor, weight: 1.5, opacity: 0.8 }).addTo(lLayer);
+        });
+
+        Object.values(groupedPoints).forEach(group => {
+            const count = group.length;
+            if (count > 1 && currentZoom >= clusterZoomThreshold) {
+                const centerDest = group[0].exactDest;
+                for (let i = 0; i < count; i++) {
+                    L.polyline([centerDest, group[i].displayDest], { color: '#000', weight: 1.0, opacity: 0.6 }).addTo(lLayer);
+                }
+                L.circleMarker(centerDest, { radius: 1, color: '#000', fillOpacity: 1, weight: 1 }).addTo(lLayer);
+            }
+        });
+
+        const latestTs = filteredPoints.length > 0 ? Math.max(...filteredPoints.map(p => p.ts)) : 0;
+
+        filteredPoints.forEach(p => {
+            const dest = p.displayDest;
+            const dt = new Date(p.ts);
+            const timeStr = dt.toLocaleDateString() + ' ' + dt.toLocaleTimeString();
+            
+            const locStr = p.txName + (p.itu ? ` (${p.itu})` : '');
+            const tipText = `<b>${p.ps}</b> [${p.pi}]<br>${locStr}<br>${p.freq} MHz | ${p.dist} km | ${p.az}&deg;<br><span style="color:#666;font-size:10px;">Last seen: ${timeStr}</span>`;
+            
+            let fillColor = '#28a745'; 
+            if (p.wasAnchor || p.isAnchor) fillColor = '#ffaa00'; 
+            else if (p.isCluster) fillColor = '#4488ff';
+
+            let hasStroke = p.isAnchor ? true : false;
+            let radius = p.isAnchor ? 5 : 4; 
+            
+            const isNewest = p.ts === latestTs;
+
+            L.circleMarker(dest, { 
+                radius: radius, 
+                stroke: hasStroke, 
+                color: '#ff4444', 
+                fill: true,
+                fillColor: fillColor, 
+                fillOpacity: 1, 
+                weight: 2 
+            })
+            .bindTooltip(tipText, { 
+                direction: 'top',
+                permanent: (autoTx && isNewest),
+                opacity: 0.9
+            })
+            .addTo(lLayer);
+            
+            if (isNewest) {
+                const layers = lLayer.getLayers();
+                if (layers.length > 0) layers[layers.length - 1].bringToFront();
+            }
+        });
+
+        const qthText = st.myLat !== null ? `QTH | Lat: ${st.myLat.toFixed(4)}, Lon: ${st.myLon.toFixed(4)}` : `QTH | Unknown Coordinates (Waiting for Server...)`;
+        L.circleMarker([qLat, qLon], { 
+            radius: 4, 
+            stroke: true,
+            color: '#fff', 
+            fill: true,
+            fillColor: '#000', 
+            fillOpacity: 1, 
+            weight: 1 
+        })
+        .bindTooltip(qthText, { direction: 'top', className: 'rdsm-tooltip' })
+        .addTo(lLayer);
+
+        if (autoCenterMap) {
+            doCenterMap(false); 
+        }
+    }
+
+    function renderRealtimeList() {
+        if (!listOpen) return;
+        const tbody = document.getElementById('rdsm-list-body');
+        const container = document.getElementById('rdsm-list-container');
+        if (!tbody || !container) return;
+
+        const scrollPos = container.scrollTop;
+
+        let points = getFilteredPoints();
+
+        points.sort((a, b) => {
+            let valA = a[listSortCol];
+            let valB = b[listSortCol];
+
+            if (listSortCol === 'status') {
+                valA = a.isAnchor ? 3 : (a.wasAnchor ? 2 : (a.isCluster ? 1 : 0));
+                valB = b.isAnchor ? 3 : (b.wasAnchor ? 2 : (b.isCluster ? 1 : 0));
+            }
+
+            if (valA === undefined || valA === null) valA = '';
+            if (valB === undefined || valB === null) valB = '';
+
+            if (typeof valA === 'string' && listSortCol !== 'freq') valA = valA.toLowerCase();
+            if (typeof valB === 'string' && listSortCol !== 'freq') valB = valB.toLowerCase();
+            if (listSortCol === 'freq') {
+                valA = parseFloat(valA) || 0;
+                valB = parseFloat(valB) || 0;
+            }
+
+            if (valA < valB) return -1 * listSortDir;
+            if (valA > valB) return 1 * listSortDir;
+            return 0;
+        });
+
+        let html = '';
+        points.forEach(p => {
+            const dt = new Date(p.ts);
+            const timeStr = dt.toLocaleTimeString();
+            
+            let statusBadge = '<span style="color:#28a745; font-weight:bold; font-size:10px;">STANDARD</span>';
+            if (p.isAnchor) statusBadge = '<span style="color:#ffaa00; font-weight:bold; font-size:10px;">ACT ANCHOR</span>';
+            else if (p.wasAnchor) statusBadge = '<span style="color:#ffaa00; opacity:0.65; font-weight:bold; font-size:10px;">EXP ANCHOR</span>';
+            else if (p.isCluster) statusBadge = '<span style="color:#4488ff; font-weight:bold; font-size:10px;">CLUSTER</span>';
+
+            let txHtml = p.txName || '-';
+            if (p.itu) {
+                txHtml += ` <span style="color:#666; font-size:10px;">(${p.itu.trim().toUpperCase()})</span>`;
+            }
+
+            let flagHtml = '';
+            if (p.itu) {
+                const safeItu = p.itu.trim().toUpperCase();
+                let flagSrc = `https://tef.noobish.eu/logos/images/${safeItu}.png`; 
+                if (typeof countryList !== 'undefined' && Array.isArray(countryList)) {
+                    const cEntry = countryList.find(c => c && c.itu_code && c.itu_code.trim().toUpperCase() === safeItu);
+                    if (cEntry && cEntry.country_code && cEntry.country_code.trim() !== "") {
+                        flagSrc = `https://flagcdn.com/w40/${cEntry.country_code.trim().toLowerCase()}.png`;
+                    }
+                }
+                flagHtml = `<img src="${flagSrc}" style="height:12px; vertical-align:middle; border-radius:2px;" onerror="this.style.display='none';">`;
+            }
+
+            html += `
+                <tr>
+                    <td style="color:#777;">${timeStr}</td>
+                    <td style="color:var(--color-main-bright, #4a90d9); font-weight:bold;">${parseFloat(p.freq).toFixed(1)}</td>
+                    <td style="font-family:monospace; color:#ccc;">${p.pi}</td>
+                    <td style="font-weight:bold; color:#fff;">${p.ps}</td>
+                    <td style="color:#aaa;">${txHtml}</td>
+                    <td style="text-align:center; padding-right: 20px;">${flagHtml}</td>
+                    <td style="color:#aaa;">${p.dist !== undefined ? p.dist + ' km' : '-'}</td>
+                    <td style="color:#aaa;">${p.az !== undefined ? p.az + '&deg;' : '-'}</td>
+                    <td>${statusBadge}</td>
+                </tr>
+            `;
+        });
+
+        tbody.innerHTML = html;
+        
+        ['ts', 'freq', 'pi', 'ps', 'txName', 'itu', 'dist', 'az', 'status'].forEach(col => {
+            const th = document.getElementById('th-' + col);
+            if (th) {
+                th.innerHTML = th.innerHTML.replace(/ [▲▼]/, '');
+                if (listSortCol === col) {
+                    th.innerHTML += listSortDir === 1 ? ' ▲' : ' ▼';
+                }
+            }
+        });
+
+        container.scrollTop = scrollPos;
+    }
+    
     function renderStatus() {
         const el = document.getElementById('rdsm-status');
         if (!el) return;
 
+        let badgeHtml = '';
         if (st.psLocked) {
-            el.innerHTML = `<span class="rf on" style="background:#1b3b2a;color:#44ff88;border:1px solid #44ff88;padding:3px 7px;">LOCKED</span> <span style="color:#777;font-size:11px;">- ${st.psLockReason || 'DB verified'}</span>`;
+            badgeHtml = `<span class="rf on" style="background:#1b3b2a;color:#44ff88;border:1px solid #44ff88;padding:3px 7px;">LOCKED</span> <span style="color:#777;font-size:11px;">- ${st.psLockReason || 'DB verified'}</span>`;
         } else if (st.psName && st.aiConf >= 50) {
-            el.innerHTML = `<span class="rf on" style="background:#2a2331;color:#c8a020;border:1px solid #c8a020;padding:3px 7px;">PROVISIONAL</span> <span style="color:#888;font-size:11px;">- ${st.aiConf}% match</span>`;
+            badgeHtml = `<span class="rf on" style="background:#2a2331;color:#c8a020;border:1px solid #c8a020;padding:3px 7px;">PROVISIONAL</span> <span style="color:#888;font-size:11px;">- ${st.aiConf}% match</span>`;
         } else if (st.psName && st.aiConf > 0) {
-            el.innerHTML = `<span class="rf" style="border:1px solid #2a2a2a;padding:3px 7px;">WAIT</span> <span style="color:#555;font-size:11px;">- collecting...</span>`;
+            badgeHtml = `<span class="rf" style="border:1px solid #2a2a2a;padding:3px 7px;">WAIT</span> <span style="color:#555;font-size:11px;">- collecting...</span>`;
         } else {
-            el.innerHTML = `<span class="rf" style="border:1px solid #2a2a2a;padding:3px 7px;">WAIT</span> <span style="color:#555;font-size:11px;">collecting...</span>`;
+            badgeHtml = `<span class="rf" style="border:1px solid #2a2a2a;padding:3px 7px;">WAIT</span> <span style="color:#555;font-size:11px;">collecting...</span>`;
         }
+
+        if (st.esClusterMatch) {
+            badgeHtml += ` <span class="rf on" style="background:#0d1a44;color:#4488ff;border-color:#4488ff;margin-left:4px;" title="Sporadic-E Anchor tracking successfully applied">☁️ CLUSTER</span>`;
+        }
+        
+        if (st.isEsAnchor) {
+            badgeHtml += ` <span class="rf on" style="background:#3b2a0d;color:#ffaa00;border-color:#ffaa00;margin-left:4px;" title="This station acts as an active Sporadic-E Anchor">⚓ ANCHOR</span>`;
+        }
+
+        el.innerHTML = badgeHtml;
     }
 
     function renderAF() {
@@ -547,7 +1046,7 @@ function onRaw(d) {
         }
     }
 
-function renderRealtimeLog() {
+    function renderRealtimeLog() {
         if (logPaused) return; 
 
         const tbody = document.getElementById('rdsm-log-body');
@@ -568,7 +1067,6 @@ function renderRealtimeLog() {
                 if (acts.err && logFilters.err) actParts.push(acts.err);
                 else if (logFilters.err) actParts.push(`<span style="color:#ff4444;">Block Error</span>`);
             } else {
-                // Only push the specific components that the user wants to see
                 if (logFilters.ps && acts.ps) actParts.push(acts.ps);
                 if (logFilters.rt && acts.rt) actParts.push(acts.rt);
                 if (logFilters.af && acts.af) actParts.push(acts.af);
@@ -579,7 +1077,6 @@ function renderRealtimeLog() {
 
             let flagParts = [];
             if (!isErr && acts.flags) {
-                // Only push the specific flags the user wants to see
                 if (logFilters.tp && acts.flags.tp !== undefined) flagParts.push(`TP:${acts.flags.tp}`);
                 if (logFilters.ta && acts.flags.ta !== undefined) flagParts.push(`TA:${acts.flags.ta}`);
                 if (logFilters.ms && acts.flags.ms !== undefined) flagParts.push(`MS:${acts.flags.ms}`);
@@ -589,7 +1086,6 @@ function renderRealtimeLog() {
                 actParts.push(`<span style="color:#888; font-family:monospace; font-size:10px;">[${flagParts.join(' ')}]</span>`);
             }
 
-            // Determine if the row has any content left to show after filtering
             let showRow = false;
             if (isErr && logFilters.err) showRow = true;
             if (!isErr && actParts.length > 0) showRow = true;
@@ -666,8 +1162,7 @@ function renderRealtimeLog() {
         st.psBuf.fill(' '); st.psErrBuf.fill(3); st.aiPs.fill('_');
         st.grpTotal = 0; st.ber = []; st.rawGroups = []; st.freq = '-';
         st.psName = null; st.refItu = null; st.aiReason = null; st.aiConf = 0;
-        st.af = []; st.altFreqs = []; st.psLocked = false; st.psLockReason = '';
-        
+        st.af = []; st.altFreqs = []; st.psLocked = false; st.psLockReason = ''; st.esClusterMatch = false; st.isEsAnchor = false;
         st.refTxName = null; st.refDistKm = null; st.refAzimuth = null; st.refErp = null; st.refPol = null;
         
         rtSlots = [mkRT(64), mkRT(64)]; rtAB = -1;
@@ -712,15 +1207,17 @@ function renderRealtimeLog() {
         #rdsm-panel { position:fixed; top:70px; right:20px; z-index:999999; pointer-events:auto; width:420px; background:var(--color-bg-1,#13151f); border:1px solid var(--color-main-bright, #4a90d9); border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6); font-family:"Titillium Web",Calibri,sans-serif; color:#e0e0e0;display:none;user-select:none; flex-direction:column;}
         #rdsm-panel-container.vis #rdsm-panel {display:flex;}
         
-        #rdsm-log-pan { position:fixed; top:70px; right:460px; z-index:999999; pointer-events:auto; width:750px; height:500px; min-width:450px; min-height:250px; resize:both; overflow:hidden; background:var(--color-bg-1,#13151f); border:1px solid var(--color-main-bright, #4a90d9); border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6); font-family:"Titillium Web",Calibri,sans-serif; color:#e0e0e0;display:none; flex-direction:column; padding:12px; }
+        #rdsm-log-pan, #rdsm-map-pan, #rdsm-list-pan { position:fixed; top:70px; left:10px; z-index:999999; pointer-events:auto; width:750px; height:500px; min-width:450px; min-height:250px; resize:both; overflow:hidden; background:var(--color-bg-1,#13151f); border:1px solid var(--color-main-bright, #4a90d9); border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6); font-family:"Titillium Web",Calibri,sans-serif; color:#e0e0e0;display:none; flex-direction:column; padding:12px; }
         #rdsm-panel-container.vis.log-open #rdsm-log-pan {display:flex;}
+        #rdsm-panel-container.vis.map-open #rdsm-map-pan {display:flex;}
+        #rdsm-panel-container.vis.list-open #rdsm-list-pan {display:flex;}
 
         #rdsm-hdr{display:flex;align-items:center;justify-content:space-between; padding:10px 14px 8px;background:#11141e;cursor:move; border-bottom: 1px solid rgba(255,255,255,0.07); border-radius:11px 11px 0 0;}
         .rdsm-ht{font-size:14px;font-weight:700;color:var(--color-main-bright,#4a90d9);text-transform:uppercase; letter-spacing:1px; white-space:nowrap;}
         #rdsm-dot{display:inline-block;width:16px;height:6px;border-radius:50%; background:#ff4444;transition:background .4s;vertical-align:middle;margin-right:10px;}
         #rdsm-dot.ok{background:#44ff88;}
-        #rdsm-close{background:none;border:none;color:#fff;font-size:16px;cursor:pointer; opacity:.6; transition:opacity .2s;}
-        #rdsm-close:hover{opacity:1;}
+        #rdsm-close { background:#ff4444; border:none; border-radius:4px; color:#fff; font-size:10px; cursor:pointer; padding:4px 2px; margin-left:5px; transition:opacity .2s; }
+        #rdsm-close:hover { opacity:0.8; }
         #rdsm-body{padding:11px 14px;}
         .rr{display:flex;align-items:center;margin-bottom:8px;gap:8px;}
         .rl{font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase; color:#777;min-width:62px;}
@@ -736,9 +1233,8 @@ function renderRealtimeLog() {
         #rdsm-bp{display:inline-block;min-width:3.2ch;text-align:right;}
         .rdiv{border:none;border-top:1px solid rgba(255,255,255,.07);margin:7px 0;}
         
-        #rdsm-panel.drag {opacity:.85;}
-        #rdsm-log-pan.drag {opacity:.85;}
-        .rdsm-log-title { cursor: move; }
+        #rdsm-panel.drag, #rdsm-log-pan.drag, #rdsm-map-pan.drag, #rdsm-list-pan.drag {opacity:.85;}
+        .rdsm-pan-title { cursor: move; font-size:12px;font-weight:700;color:var(--color-main-bright,#4a90d9); text-transform:uppercase;letter-spacing:1px; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,.1); padding-bottom:4px; display:flex; justify-content:space-between; align-items:center;}
 
         #rdsm-record-btn { background: none; border: none; color: #ff4444; font-size: 16px; cursor: pointer; opacity: 0.8; padding: 0 4px; transition: transform 0.2s, opacity 0.2s; }
         #rdsm-record-btn:hover { opacity: 1; transform: scale(1.1); }
@@ -764,18 +1260,24 @@ function renderRealtimeLog() {
         #rdsm-lock-btn { background:none;border:none;font-size:14px;cursor:pointer; margin-left:6px;padding:0;transition:transform 0.2s; user-select:none; filter: grayscale(20%); }
         #rdsm-lock-btn:hover { transform: scale(1.1); }
 
-        #rdsm-log-btn{font-size:10px;font-weight:700;color:#777; text-transform:uppercase;letter-spacing:1px; cursor:pointer; display:flex; align-items:center; gap:4px; margin-left:auto;}
-        #rdsm-log-btn:hover{color:#fff;}
-        #rdsm-log-arrow{font-size:8px;transition:transform .2s; display:inline-block; transform:rotate(-90deg);}
+        .btn-toggle{font-size:10px;font-weight:700;color:#777; text-transform:uppercase;letter-spacing:1px; cursor:pointer; display:flex; align-items:center; gap:4px; margin-left:auto;}
+        .btn-toggle:hover{color:#fff;}
+        .btn-arrow{font-size:8px;transition:transform .2s; display:inline-block; transform:rotate(-90deg);}
         .log-open #rdsm-log-arrow{transform:rotate(0deg);}
+        .map-open #rdsm-map-arrow{transform:rotate(0deg);}
+        .list-open #rdsm-list-arrow{transform:rotate(0deg);}
 
-        #rdsm-log-pause-btn { background:#1c1c1c; border:1px solid #333; color:#888; border-radius:4px; padding:3px 12px; font-size:10px; font-weight:bold; cursor:pointer; transition:all 0.2s; letter-spacing:0.5px; width: max-content; flex-shrink: 0; margin-left: auto; display: inline-block; }
-        #rdsm-log-pause-btn.paused { background:#3a1818; border-color:#ff4444; color:#ff4444; }
+        .sub-btn { background:#1c1c1c; border:1px solid #333; color:#888; border-radius:4px; padding:3px 12px; font-size:10px; font-weight:bold; cursor:pointer; transition:all 0.2s; letter-spacing:0.5px; width: max-content; flex-shrink: 0; margin-left: 8px; display: inline-block; }
+        .sub-btn:hover { color:#fff; border-color:#666; }
+        .sub-btn.active { background:#0d1a33; border-color:var(--color-main-bright, #4a90d9); color:var(--color-main-bright, #4a90d9); }
 
-        .rdsm-log-title{font-size:12px;font-weight:700;color:var(--color-main-bright,#4a90d9); text-transform:uppercase;letter-spacing:1px; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,.1); padding-bottom:4px; display:flex; justify-content:space-between; align-items:center;}
-        #rdsm-log-container table { width: 100%; border-collapse: collapse; text-align: left; font-size: 11px; }
-        #rdsm-log-container table th { padding-bottom: 4px; color: #888; border-bottom: 1px solid #333; text-transform: uppercase; }
-        #rdsm-log-container table td { padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        #rdsm-log-container table, #rdsm-list-container table { width: 100%; border-collapse: collapse; text-align: left; font-size: 11px; }
+        #rdsm-log-container table th { padding: 0 12px 4px 0; color: #888; border-bottom: 1px solid #333; text-transform: uppercase; }
+        #rdsm-log-container table td, #rdsm-list-container table td { padding: 4px 12px 4px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+
+        #rdsm-list-container table th { padding: 0 12px 4px 0; color: #888; border-bottom: 1px solid #333; text-transform: uppercase; cursor: pointer; user-select: none; transition: color 0.2s; }
+        #rdsm-list-container table th:hover { color: #fff; }
+        #rdsm-list-container table td { padding: 4px 12px 4px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
 
         #rdsm-rt-wrap{flex:1;min-width:0;}
         .rt-line-label{font-size:9px;color:#3a4a5a;display:block;margin-bottom:1px;line-height:1;}
@@ -791,6 +1293,12 @@ function renderRealtimeLog() {
         .log-filter-lbl { font-size: 10px; font-weight: 700; color: #aaa; display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; letter-spacing: 0.5px; transition: color 0.2s; }
         .log-filter-lbl input { margin: 0; cursor: pointer; accent-color: var(--color-main-bright, #4a90d9); }
         .log-filter-lbl:hover { color: #fff; }
+
+        .map-filters { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.05); align-items: center; }
+        .map-filter-lbl { font-size: 10px; font-weight: 700; color: #aaa; display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; transition: color 0.2s;}
+        .map-filter-lbl:hover { color: #fff; }
+        .map-filter-select { background: #1c1c1c; color: #fff; border: 1px solid #333; border-radius: 4px; font-size: 10px; padding: 0 4px; height: 18px; outline: none; cursor: pointer; font-weight: bold; }
+        .map-filter-select:hover { border-color: var(--color-main-bright, #4a90d9); }
         `;
         document.head.appendChild(s);
     }
@@ -812,7 +1320,7 @@ function renderRealtimeLog() {
             <span style="display:flex;align-items:center;gap:5px">
               <span id="rdsm-dot" title="Connection status"></span>
               <a href="${pluginManualUrl}" target="_blank" title="Manual" style="color:#fff; opacity:0.6; text-decoration:none; padding:0 4px;">?</a>
-              <button id="rdsm-close">✕</button>
+              <button id="rdsm-close" title="Close Panel">✖</button>
             </span>
           </div>
           <div id="rdsm-body">
@@ -820,11 +1328,23 @@ function renderRealtimeLog() {
               <span class="rl">Freq</span>
               <span class="rv">
                 <span id="rdsm-freq">-</span>
-                <span id="rdsm-log-btn"><span id="rdsm-log-arrow">▶</span> REALTIME LOG</span>
+                <span id="rdsm-log-btn" class="btn-toggle"><span id="rdsm-log-arrow" class="btn-arrow">▶</span> REALTIME LOG</span>
               </span>
             </div>
-            <div class="rr"><span class="rl">PI Code</span><span class="rv" id="rdsm-pi">?</span></div>
-            <div class="rr"><span class="rl">Status</span><span class="rv" id="rdsm-status"></span></div>
+            <div class="rr">
+              <span class="rl">PI Code</span>
+              <span class="rv">
+                 <span id="rdsm-pi">?</span>
+                 <span id="rdsm-map-btn" class="btn-toggle"><span id="rdsm-map-arrow" class="btn-arrow">▶</span> REALTIME MAP</span>
+              </span>
+            </div>
+            <div class="rr">
+              <span class="rl">Status</span>
+              <span class="rv">
+                <span id="rdsm-status"></span>
+                <span id="rdsm-list-btn" class="btn-toggle"><span id="rdsm-list-arrow" class="btn-arrow">▶</span> REALTIME LIST</span>
+              </span>
+            </div>
             <hr class="rdiv">
             <div class="rr" style="align-items:flex-start">
               <span class="rl" style="margin-top:3px">PS</span>
@@ -896,9 +1416,12 @@ function renderRealtimeLog() {
         </div>
 
         <div id="rdsm-log-pan">
-            <div class="rdsm-log-title" id="rdsm-log-hdr">
-                <span>REALTIME DECODER LOG (LAST 50 GROUPS)</span>
-                <button id="rdsm-log-pause-btn" title="Freeze log updating">PAUSE</button>
+            <div class="rdsm-pan-title" id="rdsm-log-hdr">
+                <span>REALTIME DECODER LOG</span>
+                <div style="display:flex;">
+                    <button class="sub-btn" id="rdsm-log-pause-btn" title="Freeze log updating">PAUSE</button>
+                    <button id="rdsm-log-close" class="rdsm-btn" style="background:#ff4444; color:#fff; border:none; border-radius:4px; margin-left:5px; padding:2px 6px; cursor:pointer;" title="Close Panel">✖</button>
+                </div>
             </div>
             <div class="log-filters" id="rdsm-log-filters">
                 <label class="log-filter-lbl"><input type="checkbox" id="lf-ps" ${logFilters.ps?'checked':''}> PS</label>
@@ -919,9 +1442,79 @@ function renderRealtimeLog() {
                 </table>
             </div>
         </div>
+
+        <div id="rdsm-map-pan">
+            <div class="rdsm-pan-title" id="rdsm-map-hdr">
+                <span>REALTIME DX MAP</span>
+                <div style="display:flex;">
+                    <button class="sub-btn active" id="rdsm-map-center-btn" title="Auto-Center is ON (Click to manual center, Hold to disable)">AUTO</button>
+                    <button class="sub-btn" id="rdsm-map-clear-btn" title="Clear all points">CLEAR</button>
+                    <button id="rdsm-map-close" class="rdsm-btn" style="background:#ff4444; color:#fff; border:none; border-radius:4px; margin-left:5px; padding:2px 6px; cursor:pointer;" title="Close Panel">✖</button>
+                </div>
+            </div>
+            <div class="map-filters" id="rdsm-map-filters">
+                <label class="map-filter-lbl"><input type="checkbox" id="mf-10m" checked> &lt; 10 MIN (Red)</label>
+                <label class="map-filter-lbl"><input type="checkbox" id="mf-1h" checked> &lt; 1 HOUR (Orange)</label>
+                <label class="map-filter-lbl"><input type="checkbox" id="mf-old" checked> &gt; 1 HOUR (Green)</label>
+                <span style="color:#333; margin:0 4px;">|</span>
+                <label class="map-filter-lbl">FILTER ITU: 
+                    <select id="mf-itu" class="map-filter-select"><option value="ALL">ALL ITUs</option></select>
+                </label>
+                <span style="color:#333; margin:0 4px;">|</span>
+                <label class="map-filter-lbl" title="Show tooltip for the most recently received station"><input type="checkbox" id="mf-autotx"> AUTO TX</label>
+            </div>
+            <div style="flex: 1; position: relative; overflow: hidden; border: 1px solid rgba(255,255,255,0.1); border-radius: 4px; background: radial-gradient(circle at center, #1a202c 0%, #0d1117 100%);">
+                <div id="rdsm-map-canvas" style="display:block; width:100%; height:100%; background:#000; z-index:1;"></div>
+            </div>
+        </div>
+
+        <div id="rdsm-list-pan">
+            <div class="rdsm-pan-title" id="rdsm-list-hdr">
+                <span>REALTIME STATION LIST</span>
+                <div style="display:flex;">
+                    <button class="sub-btn" id="rdsm-list-clear-btn" title="Clear all points">CLEAR</button>
+                    <button id="rdsm-list-close" class="rdsm-btn" style="background:#ff4444; color:#fff; border:none; border-radius:4px; margin-left:5px; padding:2px 6px; cursor:pointer;" title="Close Panel">✖</button>
+                </div>
+            </div>
+            <div id="rdsm-list-container" style="flex: 1; overflow-y: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th id="th-ts" title="Sort by Time">TIME</th>
+                            <th id="th-freq" title="Sort by Frequency">FREQ</th>
+                            <th id="th-pi" title="Sort by PI Code">PI</th>
+                            <th id="th-ps" title="Sort by Station Name">STATION (PS)</th>
+                            <th id="th-txName" title="Sort by Transmitter">TRANSMITTER</th>
+                            <th id="th-itu" title="Sort by Country" style="text-align: center; padding-right: 20px;">FLAG</th>
+                            <th id="th-dist" title="Sort by Distance">DIST</th>
+                            <th id="th-az" title="Sort by Azimuth">AZ</th>
+                            <th id="th-status" title="Sort by Status">STATUS</th>
+                        </tr>
+                    </thead>
+                    <tbody id="rdsm-list-body"></tbody>
+                </table>
+            </div>
+        </div>
         `;
         document.body.appendChild(c);
         
+        panelVis = localStorage.getItem('rdsm_main_open') === 'true';
+        logOpen = localStorage.getItem('rdsm_log_open') === 'true';
+        mapOpen = localStorage.getItem('rdsm_map_open') === 'true';
+        listOpen = localStorage.getItem('rdsm_list_open') === 'true';
+        autoTx = localStorage.getItem('rdsm_auto_tx') === 'true'; 
+        
+        const autoTxCb = document.getElementById('mf-autotx');
+        if (autoTxCb) autoTxCb.checked = autoTx;
+
+        if (panelVis) {
+            c.style.display = 'flex';
+            c.classList.add('vis');
+        }
+        if (logOpen) c.classList.add('log-open');
+        if (mapOpen) c.classList.add('map-open');
+        if (listOpen) c.classList.add('list-open');
+
         ['ps','rt','af','ecc','tp','ta','ms','other','err'].forEach(f => {
             const cb = document.getElementById(`lf-${f}`);
             if (cb) cb.addEventListener('change', (e) => {
@@ -930,7 +1523,46 @@ function renderRealtimeLog() {
             });
         });
 
+        ['10m', '1h', 'old'].forEach(f => {
+            document.getElementById(`mf-${f}`).addEventListener('change', (e) => {
+                viewFilters[`t${f}`] = e.target.checked;
+                if (mapOpen) scheduleMapRender();
+                if (listOpen) renderRealtimeList();
+            });
+        });
+
+        document.getElementById('mf-itu').addEventListener('change', (e) => {
+            viewFilters.itu = e.target.value;
+            if (mapOpen) scheduleMapRender();
+            if (listOpen) renderRealtimeList();
+        });
+
+        document.getElementById('mf-autotx').addEventListener('change', (e) => {
+            autoTx = e.target.checked;
+            saveWindowState(); 
+            if (mapOpen) scheduleMapRender(); 
+        });
+
         document.getElementById('rdsm-close').addEventListener('click', hidePanel);
+        
+        document.getElementById('rdsm-log-close').addEventListener('click', () => {
+            const container = document.getElementById('rdsm-panel-container');
+            logOpen = false; saveWindowState();
+            container.classList.remove('log-open');
+        });
+
+        document.getElementById('rdsm-map-close').addEventListener('click', () => {
+            const container = document.getElementById('rdsm-panel-container');
+            mapOpen = false; saveWindowState();
+            container.classList.remove('map-open');
+        });
+
+        document.getElementById('rdsm-list-close').addEventListener('click', () => {
+            const container = document.getElementById('rdsm-panel-container');
+            listOpen = false; saveWindowState();
+            container.classList.remove('list-open');
+        });
+
         document.getElementById('rdsm-record-btn').addEventListener('click', () => {
             if (!isAdmin) return sendToast('warning', pluginName, 'Administrator login required to record RDS data.');
             if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'rdsm_toggle_record', isAdmin: true }));
@@ -956,9 +1588,15 @@ function renderRealtimeLog() {
         });
 
         document.getElementById('rdsm-log-btn').addEventListener('click', () => {
-            logOpen = !logOpen;
+            logOpen = !logOpen; saveWindowState();
             c.classList.toggle('log-open', logOpen);
             if (logOpen) renderRealtimeLog();
+        });
+
+        document.getElementById('rdsm-list-btn').addEventListener('click', () => {
+            listOpen = !listOpen; saveWindowState();
+            c.classList.toggle('list-open', listOpen);
+            if (listOpen) renderRealtimeList();
         });
 
         document.getElementById('rdsm-log-pause-btn').addEventListener('click', function() {
@@ -967,12 +1605,85 @@ function renderRealtimeLog() {
             this.textContent = logPaused ? 'RESUME' : 'PAUSE';
             if (!logPaused) renderRealtimeLog(); 
         });
+
+        document.getElementById('rdsm-map-btn').addEventListener('click', () => {
+            mapOpen = !mapOpen; saveWindowState();
+            c.classList.toggle('map-open', mapOpen);
+            if (mapOpen) scheduleMapRender();
+        });
         
+        document.getElementById('rdsm-map-clear-btn').addEventListener('click', () => { 
+            mapPoints.clear(); 
+            scheduleMapRender(); 
+            if (listOpen) renderRealtimeList();
+        });
+
+        document.getElementById('rdsm-list-clear-btn').addEventListener('click', () => { 
+            mapPoints.clear(); 
+            scheduleMapRender(); 
+            if (listOpen) renderRealtimeList();
+        });
+
+        ['ts', 'freq', 'pi', 'ps', 'txName', 'itu', 'dist', 'az', 'status'].forEach(col => {
+            const th = document.getElementById('th-' + col);
+            if (th) {
+                th.addEventListener('click', () => {
+                    if (listSortCol === col) {
+                        listSortDir *= -1;
+                    } else {
+                        listSortCol = col;
+                        listSortDir = (col === 'ts') ? -1 : 1; 
+                    }
+                    renderRealtimeList();
+                });
+            }
+        });
+        
+        const centerBtn = document.getElementById('rdsm-map-center-btn');
+        let centerPressTimer = null;
+        let centerLongPress = false;
+
+        const startCenterPress = (e) => {
+            if (e.type === 'mousedown' && e.button !== 0) return; 
+            centerLongPress = false;
+            centerPressTimer = setTimeout(() => {
+                centerLongPress = true;
+                autoCenterMap = !autoCenterMap;
+                
+                centerBtn.classList.toggle('active', autoCenterMap);
+                centerBtn.textContent = autoCenterMap ? 'AUTO' : 'CENTER';
+                
+                centerBtn.title = autoCenterMap ? "Auto-Center is ON (Click to manual center, Hold to disable)" : "Reset view (Hold for Auto-Center)";
+                
+                if (autoCenterMap) doCenterMap(true);
+                sendToast('info', pluginName, `Map Auto-Center: ${autoCenterMap ? 'ON' : 'OFF'}`);
+            }, 500); 
+        };
+
+        const cancelCenterPress = () => { if (centerPressTimer) clearTimeout(centerPressTimer); };
+
+        centerBtn.addEventListener('mousedown', startCenterPress);
+        centerBtn.addEventListener('touchstart', startCenterPress, { passive: true });
+        centerBtn.addEventListener('mouseup', cancelCenterPress);
+        centerBtn.addEventListener('mouseleave', cancelCenterPress);
+        centerBtn.addEventListener('touchend', cancelCenterPress);
+
+        centerBtn.addEventListener('click', (e) => {
+            if (centerLongPress) { e.preventDefault(); return; }
+            doCenterMap(true); 
+        });
+
         makeDrag(document.getElementById('rdsm-panel'), document.getElementById('rdsm-hdr'), 'rdsm_panel_pos', false);
         makeDrag(document.getElementById('rdsm-log-pan'), document.getElementById('rdsm-log-hdr'), 'rdsm_log_pos', true);
+        makeDrag(document.getElementById('rdsm-map-pan'), document.getElementById('rdsm-map-hdr'), 'rdsm_map_pos', true);
+        makeDrag(document.getElementById('rdsm-list-pan'), document.getElementById('rdsm-list-hdr'), 'rdsm_list_pos', true);
+
+        if (mapOpen) scheduleMapRender();
+        if (logOpen) renderRealtimeLog();
+        if (listOpen) renderRealtimeList();
     }
 
-function makeDrag(el, h, storageKey, isResizable = false) {
+    function makeDrag(el, h, storageKey, isResizable = false) {
         let sx, sy, sl, st2, dr = false;
         
         try {
@@ -992,7 +1703,7 @@ function makeDrag(el, h, storageKey, isResizable = false) {
         } catch(e) {}
 
         h.addEventListener('mousedown', e => {
-            if (['rdsm-close', 'rdsm-record-btn', 'rdsm-muf-btn', 'rdsm-log-btn', 'rdsm-log-pause-btn', 'rdsm-lock-btn'].includes(e.target.id)) return;
+            if (['rdsm-close', 'rdsm-log-close', 'rdsm-map-close', 'rdsm-list-close', 'rdsm-record-btn', 'rdsm-muf-btn', 'rdsm-log-btn', 'rdsm-list-btn', 'rdsm-log-pause-btn', 'rdsm-lock-btn', 'rdsm-map-btn', 'rdsm-map-clear-btn', 'rdsm-list-clear-btn', 'rdsm-map-center-btn', 'mf-autotx'].includes(e.target.id)) return;
             dr = true; el.classList.add('drag');
             sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect(); sl = r.left; st2 = r.top;
@@ -1017,7 +1728,7 @@ function makeDrag(el, h, storageKey, isResizable = false) {
                 for (let mutation of mutations) {
                     if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
                         clearTimeout(el.resizeTimer);
-                        el.resizeTimer = setTimeout(saveState, 500);
+                        el.resizeTimer = setTimeout(() => { saveState(); if(el.id === 'rdsm-map-pan') scheduleMapRender(); }, 500);
                     }
                 }
             });
@@ -1048,6 +1759,8 @@ function makeDrag(el, h, storageKey, isResizable = false) {
                 if (!btn) return;
                 o2.disconnect();
                 
+                if (panelVis) btn.classList.add('active'); 
+                
                 let pressTimer = null, wasLongPress = false;
                 const startPress = (e) => {
                     if (e.type === 'mousedown' && e.button !== 0) return; 
@@ -1075,6 +1788,7 @@ function makeDrag(el, h, storageKey, isResizable = false) {
                     const c = document.getElementById('rdsm-panel-container');
                     if (!panelVis) {
                         panelVis = true; btn.classList.add('active');
+                        saveWindowState(); 
                         $(c).stop(true, true).fadeIn(400, () => { c.classList.add('vis'); });
                     } else { hidePanel(); }
                 });
@@ -1087,6 +1801,7 @@ function makeDrag(el, h, storageKey, isResizable = false) {
 
     function hidePanel() {
         panelVis = false;
+        saveWindowState(); 
         const btn = document.getElementById('rdsm-btn'), c = document.getElementById('rdsm-panel-container');
         if (btn) btn.classList.remove('active');
         if (c) $(c).stop(true, true).fadeOut(400, () => { c.classList.remove('vis'); c.style.display = ''; });
@@ -1109,7 +1824,40 @@ function makeDrag(el, h, storageKey, isResizable = false) {
     function init() {
         if (window.location.pathname === '/setup') return;
         injectCSS(); createPanel(); addBtn(); connect();
-        fetch('/api').then(r => r.json()).then(d => { if (d.freq) { st.freq = d.freq; setEl('rdsm-freq', d.freq + ' MHz'); } }).catch(() => {});
+        
+        if (localStorage.getItem('rdsm_qth_lat')) {
+            st.myLat = parseFloat(localStorage.getItem('rdsm_qth_lat'));
+            st.myLon = parseFloat(localStorage.getItem('rdsm_qth_lon'));
+        }
+
+        const parseCoords = (obj) => {
+            if (!obj) return null;
+            let lat = obj.lat ?? obj.latitude ?? obj.receiver?.lat ?? obj.identification?.lat;
+            let lon = obj.lon ?? obj.longitude ?? obj.receiver?.lon ?? obj.identification?.lon;
+            if (lat !== undefined && lon !== undefined && !isNaN(parseFloat(lat))) {
+                return { lat: parseFloat(lat), lon: parseFloat(lon) };
+            }
+            return null;
+        };
+
+        let found = parseCoords(window.config) || parseCoords(window.ui_config) || parseCoords(window.settings);
+        if (found && st.myLat === null) { st.myLat = found.lat; st.myLon = found.lon; }
+
+        fetch('/api').then(r => r.json()).then(d => { 
+            if (d.freq) { st.freq = d.freq; setEl('rdsm-freq', d.freq + ' MHz'); } 
+            let c = parseCoords(d);
+            if (c && st.myLat === null) { st.myLat = c.lat; st.myLon = c.lon; if(mapOpen) scheduleMapRender(); }
+        }).catch(() => {});
+
+        fetch('/api/config').then(r => r.json()).then(d => {
+            let c = parseCoords(d);
+            if (c && st.myLat === null) { st.myLat = c.lat; st.myLon = c.lon; if(mapOpen) scheduleMapRender(); }
+        }).catch(() => {});
+
+        fetch('/config.json').then(r => r.json()).then(d => {
+            let c = parseCoords(d);
+            if (c && st.myLat === null) { st.myLat = c.lat; st.myLon = c.lon; if(mapOpen) scheduleMapRender(); }
+        }).catch(() => {});
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => setTimeout(init, 900));
