@@ -12,7 +12,7 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 - Dynamic ERP/Distance Scoring: Hard-coded power thresholds have been replaced by a proportional scoring system that dynamically relates transmission power (ERP) to exact distance, significantly improving the accuracy of local DX matches.
 
 
-### Important note: After installing this version for the first time, the web server must be restarted twice!
+### Important note: After installing this version or version 3.1 for the first time, the web server must be restarted twice!
 
 ## Installation notes:
 
