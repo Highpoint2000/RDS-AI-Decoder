@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.2)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.2a) //
 //                                                           //
-//  by Highpoint                last update: 2026-06-29      //
+//  by Highpoint                last update: 2026-07-01      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -18,7 +18,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '3.2',
+    version:      '3.2a',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -542,18 +542,32 @@ async function runLocalAiPrediction(pi) {
                 score = ((10 * (Math.log10(erp * 1000))) / weightDistance) + extraWeight;
             }
             
+            // --- TEMPORAL DECAY CLUSTER BONUS LOGIC ---
             let clusterBonus = 0;
             if (esMode && loc.lat && loc.lon && esAnchors.length > 0) {
                 const now = Date.now();
 
+                // Remove expired anchor points
                 esAnchors = esAnchors.filter(a => (now - a.ts) < ES_ANCHOR_TTL_MS);
                 
                 for (const anchor of esAnchors) {
-
                     if (anchor.pi !== pi) {
                         const distToAnchor = haversineKm(loc.lat, loc.lon, anchor.lat, anchor.lon);
+                        
                         if (distToAnchor <= ES_CLUSTER_RADIUS_KM) {
-                            clusterBonus = Math.max(clusterBonus, 100 - (distToAnchor * 0.2));
+                            // 1. Calculate base bonus purely based on distance
+                            const baseBonus = 100 - (distToAnchor * 0.2);
+                            
+                            // 2. Determine the age of the anchor in milliseconds
+                            const ageMs = now - anchor.ts;
+                            
+                            // 3. Calculate time multiplier (gentle decay: scales down to 0.5 at max TTL)
+                            const timeMultiplier = 1 - ((ageMs / ES_ANCHOR_TTL_MS) * 0.5);
+                            
+                            // 4. Apply temporal decay to the distance bonus
+                            const decayedBonus = baseBonus * timeMultiplier;
+                            
+                            clusterBonus = Math.max(clusterBonus, decayedBonus);
                         }
                     }
                 }

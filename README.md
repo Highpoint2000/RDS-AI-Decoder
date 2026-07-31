@@ -3,14 +3,9 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 <img width="2548" height="868" alt="image" src="https://github.com/user-attachments/assets/47faa360-411f-4144-b1e2-e02ca7e0485d" />
 
 
-## Version 3.2
+## Version 3.2a
 
-- Sporadic-E Tracking & Clustering: A new geographic anchor system tracks strong signals (>800 km) for 10 minutes and forms a cluster within a 250 km radius. This allows for more precise identification of transmitter locations with ambiguous PI codes.
-- Interactive DX Map (Leaflet): A fully integrated real-time map within the client, featuring a filter bar for signal age and a dynamic dropdown menu that automatically populates with currently received ITU country codes.
-- Real-Time Station List: A new, live-sortable table view displaying stations organized chronologically or by distance, status, or PI code.
-- UI State Persistence: Open windows (log, map, list)—including their positions and sizes—as well as selected options (such as "Auto TX") are restored after a page reload.
-- Dynamic ERP/Distance Scoring: Hard-coded power thresholds have been replaced by a proportional scoring system that dynamically relates transmission power (ERP) to exact distance, significantly improving the accuracy of local DX matches.
-
+- Improves the tracking of Sporadic-E clusters by introducing a temporal decay mechanism that gradually reduces the geographic scoring bonus of active anchor points over their ten-minute lifespan, thereby prioritizing fresher signal reflections.
 
 ### Important note: After installing this version or version 3.1 for the first time, the web server must be restarted twice!
 
@@ -40,6 +35,15 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+## Version 3.2
+
+- Sporadic-E Tracking & Clustering: A new geographic anchor system tracks strong signals (>800 km) for 10 minutes and forms a cluster within a 250 km radius. This allows for more precise identification of transmitter locations with ambiguous PI codes.
+- Interactive DX Map (Leaflet): A fully integrated real-time map within the client, featuring a filter bar for signal age and a dynamic dropdown menu that automatically populates with currently received ITU country codes.
+- Real-Time Station List: A new, live-sortable table view displaying stations organized chronologically or by distance, status, or PI code.
+- UI State Persistence: Open windows (log, map, list)—including their positions and sizes—as well as selected options (such as "Auto TX") are restored after a page reload.
+- Dynamic ERP/Distance Scoring: Hard-coded power thresholds have been replaced by a proportional scoring system that dynamically relates transmission power (ERP) to exact distance, significantly improving the accuracy of local DX matches.
+
 
 ### Version 3.1a (Hotfix Version)
 
