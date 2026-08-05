@@ -3,9 +3,18 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 <img width="2548" height="868" alt="image" src="https://github.com/user-attachments/assets/47faa360-411f-4144-b1e2-e02ca7e0485d" />
 
 
-## Version 3.2a
+## Version 3.3
 
-- Improves the tracking of Sporadic-E clusters by introducing a temporal decay mechanism that gradually reduces the geographic scoring bonus of active anchor points over their ten-minute lifespan, thereby prioritizing fresher signal reflections.
+- Strict Positional Matching: Requires at least one exact over-the-air PS pair (content & position) to lock; removes blind "Unique ITU" guesses.
+- Wildcard Support: Treats spaces and underscores as wildcards to properly match partial decodes.
+- Rolling PS Protection: Safely passes raw dynamic texts (e.g., scrolling phone numbers) to the UI instead of overwriting them.
+- Anti-Jitter Scanner Fix: Stabilizes raw output during weak reception to ensure the scanner's 2-second ScanHoldTime triggers and reliably logs the station.
+- Dynamic PS Parsing: Splits database entries by spaces to support multi-frame PS but strictly preserves underscores (e.g., RMF_MAXX).
+- Rigorous Full Lock: Freezes the PS lock only if all 8 characters are received error-free and perfectly match the database.
+- Dynamic ERP Sanity Check: Penalizes distant low-power transmitters if a massive local station is present on the exact same frequency, preventing illogical overrides.
+- Continuous CSV Export: A new export button provides a running history of your DX session, logging every frequency or state change alongside explicit algorithmic status codes (A, C, S).
+- Map Auto-Center Fix: Gracefully disables the map's auto-center feature the moment you manually interact (click, pan, scroll) with it.
+- UTC Timestamps: All timestamps across the UI, Map, and List are now strictly formatted in UTC for easier post-reception analysis.
 
 ### Important note: After installing this version or version 3.1 for the first time, the web server must be restarted twice!
 
@@ -36,7 +45,12 @@ If you have any questions, would like to report problems, or have suggestions fo
 <details>
 <summary>History</summary>
 
-## Version 3.2
+### Version 3.2a
+
+- Improves the tracking of Sporadic-E clusters by introducing a temporal decay mechanism that gradually reduces the geographic scoring bonus of active anchor points over their ten-minute lifespan, thereby prioritizing fresher signal reflections.
+
+
+### Version 3.2
 
 - Sporadic-E Tracking & Clustering: A new geographic anchor system tracks strong signals (>800 km) for 10 minutes and forms a cluster within a 250 km radius. This allows for more precise identification of transmitter locations with ambiguous PI codes.
 - Interactive DX Map (Leaflet): A fully integrated real-time map within the client, featuring a filter bar for signal age and a dynamic dropdown menu that automatically populates with currently received ITU country codes.

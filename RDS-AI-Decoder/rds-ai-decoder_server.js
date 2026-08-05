@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.2a) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.3)  //
 //                                                           //
-//  by Highpoint                last update: 2026-07-01      //
+//  by Highpoint                last update: 2026-08-05      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -18,7 +18,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '3.2a',
+    version:      '3.3',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -268,10 +268,26 @@ function roundFreq(freqStr) {
 
 function parsePSVariants(psRaw) {
     if (!psRaw || typeof psRaw !== 'string') return [];
-    const variants = [];
-    psRaw.split(' ').forEach(t => { if (t.trim()) variants.push(t.slice(0, 8).padEnd(8, '_').replace(/ /g, '_')); });
-    if (variants.length === 0) variants.push(psRaw.replace(/ /g, '_').trim().slice(0, 8).padEnd(8, '_'));
-    return variants;
+    const variants = new Set();
+    
+    // Split on spaces to allow dynamic multi-frame PS processing
+    // Underscores are intentionally preserved to protect single-word setups like RMF_MAXX
+    const frames = psRaw.split(' ');
+
+    for (const frame of frames) {
+        if (!frame) continue;
+        
+        variants.add(frame.slice(0, 8).padEnd(8, ' '));
+        
+        if (frame.length < 8) {
+            const padL = Math.floor((8 - frame.length) / 2);
+            variants.add(frame.padStart(frame.length + padL, ' ').padEnd(8, ' '));
+        }
+    }
+
+    variants.add(psRaw.slice(0, 8).padEnd(8, ' '));
+
+    return [...variants];
 }
 
 function nodeHttpGetJSON(url) {
@@ -522,6 +538,9 @@ async function runLocalAiPrediction(pi) {
             dynDist = 800;
         }
 
+        // SANITY CHECK: Detect if a massive local station is present to protect it from distant weak overlaps
+        const hasLocalElephant = matchingStations.some(loc => loc.distKm < 500 && loc.erp >= 50);
+
         for (let loc of matchingStations) {
             let weightDistance = loc.distKm || 9999;
             if (esMode && weightDistance > 700 && weightDistance !== 9999) {
@@ -540,6 +559,11 @@ async function runLocalAiPrediction(pi) {
                 score = erp / weightDistance;
             } else {
                 score = ((10 * (Math.log10(erp * 1000))) / weightDistance) + extraWeight;
+            }
+            
+            // Apply massive sanity penalty for distant mosquitos if a local elephant shares this exact frequency
+            if (hasLocalElephant && loc.distKm > 1000 && erp < 0.1) {
+                score *= 0.01;
             }
             
             // --- TEMPORAL DECAY CLUSTER BONUS LOGIC ---
@@ -598,14 +622,14 @@ async function runLocalAiPrediction(pi) {
 
     const decodedPairs = [];
     for (let i = 0; i < 8; i += 2) {
-        if ((currentState.psErrBuf[i] <= 1 && currentState.psBuf[i] !== ' ') || (currentState.psErrBuf[i+1] <= 1 && currentState.psBuf[i+1] !== ' ')) {
-            const c0 = (currentState.psErrBuf[i] <= 1 && currentState.psBuf[i] !== ' ') ? currentState.psBuf[i].toUpperCase() : null;
-            const c1 = (currentState.psErrBuf[i+1] <= 1 && currentState.psBuf[i+1] !== ' ') ? currentState.psBuf[i+1].toUpperCase() : null;
+        if (currentState.psErrBuf[i] <= 1 || currentState.psErrBuf[i+1] <= 1) {
+            const c0 = (currentState.psErrBuf[i] <= 1) ? currentState.psBuf[i].toUpperCase() : null;
+            const c1 = (currentState.psErrBuf[i+1] <= 1) ? currentState.psBuf[i+1].toUpperCase() : null;
             decodedPairs.push({ index: i, c0, c1 });
         }
     }
 
-    const decodedCharCount = currentState.psBuf.filter((c, i) => c !== ' ' && currentState.psErrBuf[i] <= 1).length;
+    const decodedCharCount = currentState.psBuf.filter((c, i) => c !== ' ' && c !== '_' && currentState.psErrBuf[i] <= 1).length;
     let candidateStations = [];
 
     for (const s of matchingStations) {
@@ -614,8 +638,9 @@ async function runLocalAiPrediction(pi) {
             const psUpper = dbPs.toUpperCase();
             let matchesThisFrame = true;
             for (const pair of decodedPairs) {
-                if (pair.c0 !== null && psUpper[pair.index] !== pair.c0) matchesThisFrame = false;
-                if (pair.c1 !== null && psUpper[pair.index + 1] !== pair.c1) matchesThisFrame = false;
+                // Spaces and underscores act as wildcards during verification
+                if (pair.c0 !== null && pair.c0 !== ' ' && pair.c0 !== '_' && psUpper[pair.index] !== pair.c0) matchesThisFrame = false;
+                if (pair.c1 !== null && pair.c1 !== ' ' && pair.c1 !== '_' && psUpper[pair.index + 1] !== pair.c1) matchesThisFrame = false;
             }
             if (matchesThisFrame) perfectFrames.push(dbPs);
         }
@@ -626,8 +651,9 @@ async function runLocalAiPrediction(pi) {
             for (const dbPs of s.possiblePS) {
                 const psUpper = dbPs.toUpperCase();
                 let pairMatches = true;
-                if (pair.c0 !== null && psUpper[pair.index] !== pair.c0) pairMatches = false;
-                if (pair.c1 !== null && psUpper[pair.index + 1] !== pair.c1) pairMatches = false;
+
+                if (pair.c0 !== null && pair.c0 !== ' ' && pair.c0 !== '_' && psUpper[pair.index] !== pair.c0) pairMatches = false;
+                if (pair.c1 !== null && pair.c1 !== ' ' && pair.c1 !== '_' && psUpper[pair.index + 1] !== pair.c1) pairMatches = false;
                 if (pairMatches) { pairFound = true; break; }
             }
             if (!pairFound) { isChimera = false; break; } 
@@ -644,23 +670,15 @@ async function runLocalAiPrediction(pi) {
     let currentReason = "", currentColor = "", psRes = null, confRes = 0, fmdxRes = '', ituRes = '';
     let refTxName = null, refErp = null, refPol = null, refDistKm = null, refAzimuth = null, refLat = null, refLon = null;
     let usedClusterBonus = false;
-	let resolvedId = null;
+    let resolvedId = null;
 
-    if (matchingStations.length === 1 && decodedCharCount === 0) {
-        const best = matchingStations[0];
-        psRes = best.possiblePS[0]; confRes = 100; fmdxRes = best.station; ituRes = best.itu;
-        refTxName = best.txName; refErp = best.erp; refPol = best.pol; refDistKm = best.distKm; refAzimuth = best.azimuth;
-        refLat = best.lat; refLon = best.lon;
-		resolvedId = best.id;
-        if (best.clusterBonusApplied) usedClusterBonus = true;
-        currentReason = `Only 1 station in DB for PI ${pi}. Using primary frame.`; currentColor = "#28a745";
-        
-    } else if (matchingStations.length > 1 && decodedCharCount === 0) {
-        let rawPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
-                    currentState.rawAccumulatedPS : 
-                    currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : '_').join('');
+    let rawPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
+                currentState.rawAccumulatedPS : 
+                currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : '_').join('');
+
+    if (decodedCharCount === 0) {
         psRes = rawPS; confRes = 0;
-        currentReason = `Ambiguous PI ${pi} (${matchingStations.length} DB matches). Waiting for clean PS blocks.`; 
+        currentReason = `Found ${matchingStations.length} DB match(es) for PI ${pi}. Waiting for at least one valid PS pair to verify.`; 
         currentColor = "#fd7e14";
         
     } else if (candidateStations.length === 1) {
@@ -668,18 +686,24 @@ async function runLocalAiPrediction(pi) {
         fmdxRes = candidate.station.station; ituRes = candidate.station.itu;
         refTxName = candidate.station.txName; refErp = candidate.station.erp; refPol = candidate.station.pol; refDistKm = candidate.station.distKm; refAzimuth = candidate.station.azimuth;
         refLat = candidate.station.lat; refLon = candidate.station.lon;
-		resolvedId = candidate.station.id;
+        resolvedId = candidate.station.id;
         if (candidate.station.clusterBonusApplied) usedClusterBonus = true;
         
         let bestCurrentFrame = candidate.station.possiblePS[0];
         let maxScore = -1, perfectScoreFrame = null;
         
+        let fullyReceived = true;
+        for (let i = 0; i < 8; i++) { if (currentState.psErrBuf[i] > 1) fullyReceived = false; }
+        let receivedStr = currentState.psBuf.join('').toUpperCase();
+        
         for (const dbPs of candidate.station.possiblePS) {
             const psUpper = dbPs.toUpperCase();
             let score = 0;
-            for (let i = 0; i < 8; i++) if (currentState.psErrBuf[i] <= 1 && currentState.psBuf[i] !== ' ' && psUpper[i] === currentState.psBuf[i].toUpperCase()) score++;
+            for (let i = 0; i < 8; i++) {
+                if (currentState.psErrBuf[i] <= 1 && currentState.psBuf[i] !== ' ' && currentState.psBuf[i] !== '_' && psUpper[i] === currentState.psBuf[i].toUpperCase()) score++;
+            }
             if (score > maxScore) { maxScore = score; bestCurrentFrame = dbPs; }
-            if (score === 8) perfectScoreFrame = dbPs; 
+            if (fullyReceived && receivedStr === psUpper) perfectScoreFrame = dbPs; 
         }
         
         if (perfectScoreFrame) currentState.frozenPs = perfectScoreFrame;
@@ -690,51 +714,26 @@ async function runLocalAiPrediction(pi) {
             currentColor = "#28a745";
         } else {
             psRes = bestCurrentFrame; confRes = 100; 
-            currentReason = candidate.perfectFrames.length > 0 ? `Unambiguous station match! Building PS.` : `Unambiguous station match! Building PS (Chimera).`;
+            currentReason = candidate.perfectFrames.length > 0 ? `Station verified by PS match! Building PS.` : `Station verified by PS match! Building PS (Chimera).`;
             currentColor = "#28a745";
         }
         
     } else if (candidateStations.length > 1) {
-        let rawPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
-                    currentState.rawAccumulatedPS : 
-                    currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : '_').join('');
         psRes = rawPS; confRes = 0;
         currentReason = `Ambiguous! ${candidateStations.length} stations match the decoded PS segments. Waiting for more data.`; 
         currentColor = "#fd7e14";
         
     } else {
-        const validItus = matchingStations.map(s => s.itu).filter(i => i !== undefined && i !== "");
-        const uniqueItus = [...new Set(validItus)];
-        
-        if (uniqueItus.length === 1) {
-            const fallbackMatch = matchingStations[0]; 
-            fmdxRes = fallbackMatch.station; ituRes = fallbackMatch.itu || uniqueItus[0];
-            refTxName = fallbackMatch.txName; refErp = fallbackMatch.erp; refPol = fallbackMatch.pol; refDistKm = fallbackMatch.distKm; refAzimuth = fallbackMatch.azimuth;
-            refLat = fallbackMatch.lat; refLon = fallbackMatch.lon;
-			resolvedId = fallbackMatch.id;
-            if (fallbackMatch.clusterBonusApplied) usedClusterBonus = true;
-            
-            if (currentState.frozenPs) {
-                psRes = currentState.frozenPs; confRes = 100;
-                currentReason = `Signal mismatch detected. Ignoring errors and holding frozen frame '${currentState.frozenPs}'.`; currentColor = "#28a745"; 
-            } else {
-                psRes = fallbackMatch.possiblePS[0]; confRes = 100; 
-                currentReason = `Unique ITU Match! All valid DB entries belong to '${uniqueItus[0]}'. Using primary frame.`; currentColor = "#28a745";
-            }
+        if (currentState.frozenPs) {
+            psRes = currentState.frozenPs; confRes = 100;
+            currentReason = `Signal mismatch detected. Ignoring errors and holding frozen frame '${currentState.frozenPs}'.`; 
+            currentColor = "#28a745"; 
         } else {
-            let rawPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
-                        currentState.rawAccumulatedPS : 
-                        currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : '_').join('');
-            if (currentState.frozenPs) {
-                psRes = currentState.frozenPs; confRes = 100;
-                currentReason = `Signal mismatch detected. Ignoring errors and holding frozen frame '${currentState.frozenPs}'.`; currentColor = "#28a745"; 
-            } else {
-                psRes = rawPS; confRes = 0;
-                currentReason = `Mismatch Error! Decoded chars conflict with known frames. Passing raw data.`; currentColor = "#dc3545";
-            }
+            psRes = rawPS; confRes = 0;
+            currentReason = `Mismatch Error! Decoded PS pairs contradict DB entries. Passing raw data.`; 
+            currentColor = "#dc3545";
         }
     }
-
 
     let isEsAnchor = false;
 
@@ -870,9 +869,13 @@ function applyFollowToDataHandler() {
     } else if (currentState.latestAi && currentState.latestAi.ps && currentState.latestAi.conf > 0 && currentState.latestAi.ps.trim().length > 0) {
         targetPS = currentState.latestAi.ps;
     } else {
+        // ANTI-JITTER FIX: 
+        // Prevents partial updates from resetting the native scanner's ScanHoldTime.
+        // Until the RAW PS is fully decoded, we pass a blank string to ensure
+        // the scanner hits its 2-second stability requirement and logs the PI code.
         targetPS = currentState.rawAccumulatedPS.trim().length > 0 ? 
                    currentState.rawAccumulatedPS : 
-                   currentState.psBuf.map((c, i) => currentState.psErrBuf[i] <= 1 ? c : ' ').join('');
+                   '        ';
     }
 
     const cleanPS = targetPS.replace(/_/g, ' '); 

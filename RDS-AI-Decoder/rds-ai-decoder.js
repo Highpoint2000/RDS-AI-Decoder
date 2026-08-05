@@ -1,16 +1,18 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V3.2a) //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V3.3) //
 //                                                           //
-//  by Highpoint                last update: 2026-07-01      //
+//  by Highpoint                last update: 2026-08-05      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
 ///////////////////////////////////////////////////////////////
 
+// oberere Schaltflächen in den Realtime Fenstern zentriert 
+
 (() => {
 
-    const pluginVersion         = '3.2a';
+    const pluginVersion         = '3.3';
     const pluginName            = 'RDS AI Decoder';
     const pluginManualUrl       = 'https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation.html';
 
@@ -56,7 +58,8 @@
     let mapOpen = false;
 	let logOpen = false;
     let listOpen = false;
-    let mapPoints = new Map(); 
+    let mapPoints = new Map();
+    let runningStationLog = [];	
     let lMap = null;
     let lLayer = null;
     let leafletLoading = false;
@@ -134,6 +137,16 @@
     
     let autoCenterMap = true;
     let renderMapTimeout = null;
+
+    // Helper function to update the Auto/Center Map button UI
+    function updateCenterBtnUI() {
+        const btn = document.getElementById('rdsm-map-center-btn');
+        if (btn) {
+            btn.classList.toggle('active', autoCenterMap);
+            btn.textContent = autoCenterMap ? 'AUTO' : 'CENTER';
+            btn.title = autoCenterMap ? "Auto-Center is ON (Click to manual center, Hold to disable)" : "Reset view (Hold for Auto-Center)";
+        }
+    }
 
     function doCenterMap(animate = true) {
         if (!lMap || st.myLat === null) return;
@@ -497,6 +510,15 @@
             if (d.esClusterMatch) p.isCluster = true;
             
             p.ts = Date.now();
+            
+            const currentStateStr = `${p.freq}_${p.ps}_${p.pi}_${p.txName}_${p.itu}_${p.dist}_${p.az}_${p.isAnchor}_${p.isCluster}`;
+            
+            if (window._lastGlobalLogState !== currentStateStr) {
+                window._lastGlobalLogState = currentStateStr;
+                runningStationLog.push(JSON.parse(JSON.stringify(p)));
+                if (runningStationLog.length > 30000) runningStationLog.shift();
+            }
+
             mapPoints.set(mapKey, p);
             
             updateItuDropdown();
@@ -605,6 +627,11 @@
             
             lMap = L.map('rdsm-map-canvas', { attributionControl: false }).setView([qLat, qLon], 5);
             lMap.on('zoomend', drawMap);
+            
+            // Auto-Center Map-Problem fix: Disable auto-center gracefully on manual interaction
+            lMap.on('mousedown', () => { autoCenterMap = false; updateCenterBtnUI(); });
+            lMap.on('wheel', () => { autoCenterMap = false; updateCenterBtnUI(); });
+            lMap.on('touchstart', () => { autoCenterMap = false; updateCenterBtnUI(); });
             
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
                 maxZoom: 19
@@ -721,7 +748,7 @@
         filteredPoints.forEach(p => {
             const dest = p.displayDest;
             const dt = new Date(p.ts);
-            const timeStr = dt.toLocaleDateString() + ' ' + dt.toLocaleTimeString();
+            const timeStr = dt.toUTCString().replace('GMT', 'UTC'); // Format update to UTC string
             
             const locStr = p.txName + (p.itu ? ` (${p.itu})` : '');
             const tipText = `<b>${p.ps}</b> [${p.pi}]<br>${locStr}<br>${p.freq} MHz | ${p.dist} km | ${p.az}&deg;<br><span style="color:#666;font-size:10px;">Last seen: ${timeStr}</span>`;
@@ -812,7 +839,7 @@
         let html = '';
         points.forEach(p => {
             const dt = new Date(p.ts);
-            const timeStr = dt.toLocaleTimeString();
+            const timeStr = dt.toUTCString().replace('GMT', 'UTC'); // Format update to UTC string
             
             let statusBadge = '<span style="color:#28a745; font-weight:bold; font-size:10px;">STANDARD</span>';
             if (p.isAnchor) statusBadge = '<span style="color:#ffaa00; font-weight:bold; font-size:10px;">ACT ANCHOR</span>';
@@ -1094,7 +1121,8 @@
 
             let finalActionStr = actParts.join(' <span style="color:#555; margin: 0 4px;">|</span> ');
 
-            const timeStr = g.ts ? g.ts.split('T')[1].slice(0, -1) : '';
+            const dt = new Date(g.ts);
+            const timeStr = dt.toUTCString().substring(17, 25); // Keeps log extremely compact, showing explicit UTC hour/min/sec
             const errColor = g.errB[0] <= 1 ? '#44ff88' : '#ff4444';
             const displayPi = g.errB[0] <= 1 ? g.pi : `<span style="color:#dc3545; text-decoration:line-through;">${g.pi}</span>`;
             
@@ -1416,10 +1444,12 @@
         </div>
 
         <div id="rdsm-log-pan">
-            <div class="rdsm-pan-title" id="rdsm-log-hdr">
+            <div class="rdsm-pan-title" id="rdsm-log-hdr" style="position: relative;">
                 <span>REALTIME DECODER LOG</span>
-                <div style="display:flex;">
+                <div style="position: absolute; left: 50%; transform: translateX(-50%); display:flex;">
                     <button class="sub-btn" id="rdsm-log-pause-btn" title="Freeze log updating">PAUSE</button>
+                </div>
+                <div>
                     <button id="rdsm-log-close" class="rdsm-btn" style="background:#ff4444; color:#fff; border:none; border-radius:4px; margin-left:5px; padding:2px 6px; cursor:pointer;" title="Close Panel">✖</button>
                 </div>
             </div>
@@ -1444,11 +1474,13 @@
         </div>
 
         <div id="rdsm-map-pan">
-            <div class="rdsm-pan-title" id="rdsm-map-hdr">
+            <div class="rdsm-pan-title" id="rdsm-map-hdr" style="position: relative;">
                 <span>REALTIME DX MAP</span>
-                <div style="display:flex;">
+                <div style="position: absolute; left: 50%; transform: translateX(-50%); display:flex;">
                     <button class="sub-btn active" id="rdsm-map-center-btn" title="Auto-Center is ON (Click to manual center, Hold to disable)">AUTO</button>
                     <button class="sub-btn" id="rdsm-map-clear-btn" title="Clear all points">CLEAR</button>
+                </div>
+                <div>
                     <button id="rdsm-map-close" class="rdsm-btn" style="background:#ff4444; color:#fff; border:none; border-radius:4px; margin-left:5px; padding:2px 6px; cursor:pointer;" title="Close Panel">✖</button>
                 </div>
             </div>
@@ -1469,10 +1501,13 @@
         </div>
 
         <div id="rdsm-list-pan">
-            <div class="rdsm-pan-title" id="rdsm-list-hdr">
+            <div class="rdsm-pan-title" id="rdsm-list-hdr" style="position: relative;">
                 <span>REALTIME STATION LIST</span>
-                <div style="display:flex;">
+                <div style="position: absolute; left: 50%; transform: translateX(-50%); display:flex;">
+                    <button class="sub-btn" id="rdsm-list-csv-btn" title="Export list to CSV">EXPORT CSV</button>
                     <button class="sub-btn" id="rdsm-list-clear-btn" title="Clear all points">CLEAR</button>
+                </div>
+                <div>
                     <button id="rdsm-list-close" class="rdsm-btn" style="background:#ff4444; color:#fff; border:none; border-radius:4px; margin-left:5px; padding:2px 6px; cursor:pointer;" title="Close Panel">✖</button>
                 </div>
             </div>
@@ -1483,7 +1518,7 @@
                             <th id="th-ts" title="Sort by Time">TIME</th>
                             <th id="th-freq" title="Sort by Frequency">FREQ</th>
                             <th id="th-pi" title="Sort by PI Code">PI</th>
-                            <th id="th-ps" title="Sort by Station Name">STATION (PS)</th>
+                            <th id="th-ps" title="Sort by Station Name">STATION</th>
                             <th id="th-txName" title="Sort by Transmitter">TRANSMITTER</th>
                             <th id="th-itu" title="Sort by Country" style="text-align: center; padding-right: 20px;">FLAG</th>
                             <th id="th-dist" title="Sort by Distance">DIST</th>
@@ -1614,14 +1649,40 @@
         
         document.getElementById('rdsm-map-clear-btn').addEventListener('click', () => { 
             mapPoints.clear(); 
+            runningStationLog = [];
             scheduleMapRender(); 
             if (listOpen) renderRealtimeList();
         });
 
         document.getElementById('rdsm-list-clear-btn').addEventListener('click', () => { 
             mapPoints.clear(); 
+            runningStationLog = [];
             scheduleMapRender(); 
             if (listOpen) renderRealtimeList();
+        });
+
+        // Event listener for the new CSV export button
+        document.getElementById('rdsm-list-csv-btn').addEventListener('click', () => {
+            let csvContent = "Time(UTC),Freq,PI,Station,Transmitter,ITU,Dist(km),Az(deg),Status\n";
+            
+            // Export the continuous history instead of just the current filtered view
+            runningStationLog.forEach(p => {
+                const dt = new Date(p.ts).toUTCString().replace('GMT', 'UTC');
+                let statStr = 'S'; // Standard
+                if (p.isAnchor) statStr = 'A'; // Active Anchor
+                else if (p.wasAnchor) statStr = 'EXP_A'; // Expired Anchor
+                else if (p.isCluster) statStr = 'C'; // Cluster
+                
+                csvContent += `"${dt}",${parseFloat(p.freq).toFixed(1)},${p.pi},"${p.ps}","${p.txName}","${p.itu || ''}",${p.dist !== undefined ? p.dist : ''},${p.az !== undefined ? p.az : ''},${statStr}\n`;
+            });
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.setAttribute("href", url);
+            link.setAttribute("download", `RDS_Running_Log_${new Date().toISOString().slice(0,10)}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
         });
 
         ['ts', 'freq', 'pi', 'ps', 'txName', 'itu', 'dist', 'az', 'status'].forEach(col => {
@@ -1650,11 +1711,7 @@
                 centerLongPress = true;
                 autoCenterMap = !autoCenterMap;
                 
-                centerBtn.classList.toggle('active', autoCenterMap);
-                centerBtn.textContent = autoCenterMap ? 'AUTO' : 'CENTER';
-                
-                centerBtn.title = autoCenterMap ? "Auto-Center is ON (Click to manual center, Hold to disable)" : "Reset view (Hold for Auto-Center)";
-                
+                updateCenterBtnUI();
                 if (autoCenterMap) doCenterMap(true);
                 sendToast('info', pluginName, `Map Auto-Center: ${autoCenterMap ? 'ON' : 'OFF'}`);
             }, 500); 
@@ -1703,7 +1760,7 @@
         } catch(e) {}
 
         h.addEventListener('mousedown', e => {
-            if (['rdsm-close', 'rdsm-log-close', 'rdsm-map-close', 'rdsm-list-close', 'rdsm-record-btn', 'rdsm-muf-btn', 'rdsm-log-btn', 'rdsm-list-btn', 'rdsm-log-pause-btn', 'rdsm-lock-btn', 'rdsm-map-btn', 'rdsm-map-clear-btn', 'rdsm-list-clear-btn', 'rdsm-map-center-btn', 'mf-autotx'].includes(e.target.id)) return;
+            if (['rdsm-close', 'rdsm-log-close', 'rdsm-map-close', 'rdsm-list-close', 'rdsm-record-btn', 'rdsm-muf-btn', 'rdsm-log-btn', 'rdsm-list-btn', 'rdsm-list-csv-btn', 'rdsm-log-pause-btn', 'rdsm-lock-btn', 'rdsm-map-btn', 'rdsm-map-clear-btn', 'rdsm-list-clear-btn', 'rdsm-map-center-btn', 'mf-autotx'].includes(e.target.id)) return;
             dr = true; el.classList.add('drag');
             sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect(); sl = r.left; st2 = r.top;
