@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.3)  //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.3a) //
 //                                                           //
-//  by Highpoint                last update: 2026-08-05      //
+//  by Highpoint                last update: 2026-10-23      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -18,7 +18,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '3.3',
+    version:      '3.3a',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -490,6 +490,12 @@ async function runLocalAiPrediction(pi) {
 
     let matchingStations = [];
     for (const st of freqRefs) {
+		
+		// Ignore any transmitter that is greater than 0.000 kW but less than 0.003 kW (TUNNEL TRANSMITTER FILTER)
+        if (st.erp !== null && st.erp > 0.000 && st.erp < 0.003) {
+            continue;
+        }
+		
         let piMatch = false;
         if (st.pi && st.pi === pi) piMatch = true;
         else if (st.pireg) {
@@ -538,8 +544,12 @@ async function runLocalAiPrediction(pi) {
             dynDist = 800;
         }
 
-        // SANITY CHECK: Detect if a massive local station is present to protect it from distant weak overlaps
-        const hasLocalElephant = matchingStations.some(loc => loc.distKm < 500 && loc.erp >= 50);
+// SANITY CHECK: Detect if a local station is present (dynamic elephant detection)
+        const hasLocalElephant = matchingStations.some(loc => 
+            (loc.distKm < 50 && loc.erp >= 2) ||    // Local transmitter
+            (loc.distKm < 200 && loc.erp >= 20) ||  // Strong regional transmitter
+            (loc.distKm < 500 && loc.erp >= 50)     // Classic massive distant transmitter
+        );
 
         for (let loc of matchingStations) {
             let weightDistance = loc.distKm || 9999;
@@ -561,9 +571,16 @@ async function runLocalAiPrediction(pi) {
                 score = ((10 * (Math.log10(erp * 1000))) / weightDistance) + extraWeight;
             }
             
-            // Apply massive sanity penalty for distant mosquitos if a local elephant shares this exact frequency
-            if (hasLocalElephant && loc.distKm > 1000 && erp < 0.1) {
-                score *= 0.01;
+            // Dynamic ERP Sanity Check: Apply penalties for distant low-power mosquitos
+            if (erp < 0.1 && loc.distKm > 600) {
+                if (hasLocalElephant) {
+                    // Massive penalty if the frequency is occupied locally
+                    score *= 0.001; 
+                } else if (loc.distKm > 800) {
+                    // General penalty for extreme low-power transmitters at a distance
+                    // (This implicitly catches tunnel transmitters without strict hardcoding)
+                    score *= 0.1;
+                }
             }
             
             // --- TEMPORAL DECAY CLUSTER BONUS LOGIC ---

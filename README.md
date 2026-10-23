@@ -3,18 +3,11 @@ An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data
 <img width="2548" height="868" alt="image" src="https://github.com/user-attachments/assets/47faa360-411f-4144-b1e2-e02ca7e0485d" />
 
 
-## Version 3.3
+## Version 3.3a
 
-- Strict Positional Matching: Requires at least one exact over-the-air PS pair (content & position) to lock; removes blind "Unique ITU" guesses.
-- Wildcard Support: Treats spaces and underscores as wildcards to properly match partial decodes.
-- Rolling PS Protection: Safely passes raw dynamic texts (e.g., scrolling phone numbers) to the UI instead of overwriting them.
-- Anti-Jitter Scanner Fix: Stabilizes raw output during weak reception to ensure the scanner's 2-second ScanHoldTime triggers and reliably logs the station.
-- Dynamic PS Parsing: Splits database entries by spaces to support multi-frame PS but strictly preserves underscores.
-- Rigorous Full Lock: Freezes the PS lock only if all 8 characters are received error-free and perfectly match the database.
-- Dynamic ERP Sanity Check: Penalizes distant low-power transmitters if a massive local station is present on the exact same frequency, preventing illogical overrides.
-- Continuous CSV Export: A new export button provides a running history of your DX session, logging every frequency or state change alongside explicit algorithmic status codes (A, C, S).
-- Map Auto-Center Fix: Gracefully disables the map's auto-center feature the moment you manually interact (click, pan, scroll) with it.
-- UTC Timestamps: All timestamps across the UI, Map, and List are now strictly formatted in UTC for easier post-reception analysis.
+- Exclude all ultra-low-power transmitters (between 0.000 and 0.003 kW) directly during the initial database fetch to instantly eliminate irrelevant micro-transmitters  
+- Replace the rigid single rule with dynamic distance-to-power tiers (e.g., ≥2 kW at <50 km, or ≥50 kW at <500 km) to correctly identify local blocking stations
+- Lower the penalty threshold for distant low-power signals (<0.1 kW) from 1000 km to 600 km, and apply severe score reductions if a local blocker is present
 
 ### Important note: After installing this version or version 3.1 for the first time, the web server must be restarted twice!
 
@@ -44,6 +37,19 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 3.3
+
+- Strict Positional Matching: Requires at least one exact over-the-air PS pair (content & position) to lock; removes blind "Unique ITU" guesses.
+- Wildcard Support: Treats spaces and underscores as wildcards to properly match partial decodes.
+- Rolling PS Protection: Safely passes raw dynamic texts (e.g., scrolling phone numbers) to the UI instead of overwriting them.
+- Anti-Jitter Scanner Fix: Stabilizes raw output during weak reception to ensure the scanner's 2-second ScanHoldTime triggers and reliably logs the station.
+- Dynamic PS Parsing: Splits database entries by spaces to support multi-frame PS but strictly preserves underscores.
+- Rigorous Full Lock: Freezes the PS lock only if all 8 characters are received error-free and perfectly match the database.
+- Dynamic ERP Sanity Check: Penalizes distant low-power transmitters if a massive local station is present on the exact same frequency, preventing illogical overrides.
+- Continuous CSV Export: A new export button provides a running history of your DX session, logging every frequency or state change alongside explicit algorithmic status codes (A, C, S).
+- Map Auto-Center Fix: Gracefully disables the map's auto-center feature the moment you manually interact (click, pan, scroll) with it.
+- UTC Timestamps: All timestamps across the UI, Map, and List are now strictly formatted in UTC for easier post-reception analysis.
 
 ### Version 3.2a
 
