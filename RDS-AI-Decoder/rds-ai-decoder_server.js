@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.3a) //
+//  RDS AI DECODER SERVER PLUGIN FOR FM-DX-WEBSERVER (V3.3b) //
 //                                                           //
-//  by Highpoint                last update: 2026-10-23      //
+//  by Highpoint                last update: 2026-11-04      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -18,7 +18,7 @@ const { logInfo, logWarn, logError } = require('../../server/console');
 
 const pluginConfig = {
     name:         'RDS AI Decoder',
-    version:      '3.3a',
+    version:      '3.3b',
     frontEndPath: 'rds-ai-decoder.js',
 };
 module.exports = { pluginConfig };
@@ -491,7 +491,7 @@ async function runLocalAiPrediction(pi) {
     let matchingStations = [];
     for (const st of freqRefs) {
 		
-		// Ignore any transmitter that is greater than 0.000 kW but less than 0.003 kW (TUNNEL TRANSMITTER FILTER)
+        // Ignore any transmitter that is greater than 0.000 kW but less than 0.003 kW (TUNNEL TRANSMITTER FILTER)
         if (st.erp !== null && st.erp > 0.000 && st.erp < 0.003) {
             continue;
         }
@@ -510,6 +510,16 @@ async function runLocalAiPrediction(pi) {
     }
 
     if (matchingStations.length > 0) {
+        // --- NEW: STRICT DISTANCE PENALTY FOR PI COLLISIONS ---
+        // If there is a local/regional station (< 500km) broadcasting this exact PI code,
+        // we forcefully drop extreme distant stations (> 1200km) on the same frequency 
+        // to prevent noise fragments from triggering intercontinental false positives.
+        const hasLocalPIMatch = matchingStations.some(loc => loc.distKm < 500);
+        if (hasLocalPIMatch) {
+            matchingStations = matchingStations.filter(loc => loc.distKm < 1200 || (esAnchors.some(a => a.pi === pi)));
+        }
+        // ------------------------------------------------------
+
         let distantCount = 0;
         let localCount = 0;
         let maxLocalErp = 0;
@@ -544,7 +554,7 @@ async function runLocalAiPrediction(pi) {
             dynDist = 800;
         }
 
-// SANITY CHECK: Detect if a local station is present (dynamic elephant detection)
+        // SANITY CHECK: Detect if a local station is present (dynamic elephant detection)
         const hasLocalElephant = matchingStations.some(loc => 
             (loc.distKm < 50 && loc.erp >= 2) ||    // Local transmitter
             (loc.distKm < 200 && loc.erp >= 20) ||  // Strong regional transmitter
@@ -676,7 +686,18 @@ async function runLocalAiPrediction(pi) {
             if (!pairFound) { isChimera = false; break; } 
         }
 
-        if (perfectFrames.length > 0 || isChimera) candidateStations.push({ station: s, perfectFrames, isChimera: perfectFrames.length === 0 && isChimera });
+        // --- NEW: STRICTER PS VERIFICATION FOR CHIMERAS ---
+        // Reject Chimera (fragmented) matches for distant DX stations (> 1000km).
+        // Distant stations MUST have at least one perfect frame to be verified,
+        // otherwise random noise pairs might falsely match a distant dynamic PS.
+        if (isChimera && perfectFrames.length === 0 && s.distKm > 1000) {
+            isChimera = false; 
+        }
+        // --------------------------------------------------
+
+        if (perfectFrames.length > 0 || isChimera) {
+            candidateStations.push({ station: s, perfectFrames, isChimera: perfectFrames.length === 0 && isChimera });
+        }
     }
 
     if (candidateStations.length > 1) {

@@ -2,12 +2,11 @@
 An intelligent RDS decoder plugin for fm-dx-webserver that reconstructs RDS data from weak or error-prone signals using weighted voting, confidence tracking and live fmdx.org reference data.
 <img width="2548" height="868" alt="image" src="https://github.com/user-attachments/assets/47faa360-411f-4144-b1e2-e02ca7e0485d" />
 
+## Version 3.3b
 
-## Version 3.3a
+- Strict Distance Penalty for PI Collisions: If a local or regional transmitter (< 500 km) exists with the exact same PI code on that frequency, ultra-distant stations (> 1200 km) are forcefully excluded from scoring, effectively preventing noise fragments or dynamic PS texts from triggering intercontinental false positives.   
+- Stricter PS Verification for Chimeras: Distant DX stations (> 1000 km) can no longer be validated exclusively through fragmented chimera matches; they now strictly require at least one complete, perfectly matching frame to establish a lock.   
 
-- Exclude all ultra-low-power transmitters (between 0.000 and 0.003 kW) directly during the initial database fetch to instantly eliminate irrelevant micro-transmitters  
-- Replace the rigid single rule with dynamic distance-to-power tiers (e.g., ≥2 kW at <50 km, or ≥50 kW at <500 km) to correctly identify local blocking stations
-- Lower the penalty threshold for distant low-power signals (<0.1 kW) from 1000 km to 600 km, and apply severe score reductions if a local blocker is present
 
 ### Important note: After installing this version or version 3.1 for the first time, the web server must be restarted twice!
 
@@ -37,6 +36,12 @@ If you have any questions, would like to report problems, or have suggestions fo
 
 <details>
 <summary>History</summary>
+
+### Version 3.3a
+
+- Exclude all ultra-low-power transmitters (between 0.000 and 0.003 kW) directly during the initial database fetch to instantly eliminate irrelevant micro-transmitters  
+- Replace the rigid single rule with dynamic distance-to-power tiers (e.g., ≥2 kW at <50 km, or ≥50 kW at <500 km) to correctly identify local blocking stations
+- Lower the penalty threshold for distant low-power signals (<0.1 kW) from 1000 km to 600 km, and apply severe score reductions if a local blocker is present
 
 ### Version 3.3
 

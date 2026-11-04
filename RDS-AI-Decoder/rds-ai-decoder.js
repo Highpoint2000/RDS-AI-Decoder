@@ -1,8 +1,8 @@
 ///////////////////////////////////////////////////////////////
 //                                                           //
-//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V3.3a) //
+//  RDS AI DECODER CLIENT PLUGIN FOR FM-DX-WEBSERVER (V3.3b) //
 //                                                           //
-//  by Highpoint                last update: 2026-08-05      //
+//  by Highpoint                last update: 2026-11-04      //
 //                                                           //
 //  https://github.com/Highpoint2000/RDS-AI-Decoder          //
 //                                                           //
@@ -12,7 +12,7 @@
 
 (() => {
 
-    const pluginVersion         = '3.3a';
+    const pluginVersion         = '3.3b';
     const pluginName            = 'RDS AI Decoder';
     const pluginManualUrl       = 'https://highpoint.fmdx.org/manuals/RDS-AI-Decoder-Documentation.html';
 
